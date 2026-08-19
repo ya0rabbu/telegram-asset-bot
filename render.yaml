@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: unified-asset-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python unified_asset_bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false

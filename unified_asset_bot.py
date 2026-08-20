@@ -1,22 +1,12 @@
-"""Unified Lummi AI + Hugeicons Telegram bot.
-
-The bot automatically detects supported URLs and returns either:
-- A full-resolution Lummi asset as a Telegram document; or
-- A Hugeicons SVG as text plus a downloadable .svg document.
-
-Configuration:
-    TELEGRAM_BOT_TOKEN=... python unified_asset_bot.py
-
-Install:
-    python -m pip install "python-telegram-bot>=21,<23" "httpx>=0.27,<1" "beautifulsoup4>=4.12,<5"
-"""
+"""Unified Lummi AI + Hugeicons Telegram bot."""
 
 from __future__ import annotations
 
-import html
 import logging
 import os
 import re
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -33,7 +23,6 @@ from telegram.ext import (
     filters,
 )
 
-# Telegram Bot API currently limits bot-uploaded files to approximately 50 MB.
 MAX_UPLOAD_BYTES = 49 * 1024 * 1024
 REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
 
@@ -59,9 +48,6 @@ LUMMI_URL_RE = re.compile(
     re.IGNORECASE,
 )
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
-
-# The CID pattern used by the original Lummi bot. The fallback pattern is
-# intentionally more permissive because pages can expose escaped JSON.
 LUMMI_CID_RE = re.compile(r"Qm[1-9A-HJ-NP-Za-km-z]{44}")
 
 WELCOME_MESSAGE = (
@@ -70,13 +56,27 @@ WELCOME_MESSAGE = (
 )
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_health_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+
 def trim_url(url: str) -> str:
-    """Remove punctuation commonly attached to URLs in chat messages."""
     return url.rstrip(".,!?;:)]}>\"'")
 
 
 def detect_platform(url: str) -> str | None:
-    """Return the supported platform for a URL, or None when unsupported."""
     host = (urlsplit(url).hostname or "").lower().removeprefix("www.")
     if host == "lummi.ai" and re.match(
         r"^/(?:photo|illustration|3d)/[^/]+", urlsplit(url).path, re.IGNORECASE
@@ -88,11 +88,7 @@ def detect_platform(url: str) -> str | None:
 
 
 def find_lummi_cid(page_html: str, slug: str) -> str | None:
-    """Extract the asset CID from page scripts or og:image metadata."""
     soup = BeautifulSoup(page_html, "html.parser")
-
-    # Prefer the script containing this page's slug, matching the original bot's
-    # strategy and avoiding unrelated assets embedded elsewhere on the page.
     scripts = [script.string or script.get_text() for script in soup.find_all("script")]
     relevant_scripts = [script for script in scripts if slug in script]
     candidates = relevant_scripts + scripts
@@ -116,7 +112,6 @@ def find_lummi_cid(page_html: str, slug: str) -> str | None:
 
 
 async def fetch_lummi_asset(url: str) -> dict[str, Any]:
-    """Resolve a Lummi page to its direct asset URL and download its bytes."""
     parsed = urlsplit(url)
     slug_match = re.match(r"^/(?:photo|illustration|3d)/([^/?#]+)", parsed.path, re.IGNORECASE)
     if not slug_match:
@@ -160,7 +155,6 @@ async def fetch_lummi_asset(url: str) -> dict[str, Any]:
 
 
 async def fetch_hugeicons_svg(url: str) -> dict[str, str]:
-    """Fetch a Hugeicons SVG from the CDN, falling back to the icon page."""
     match = re.search(r"hugeicons\.com/icon/([^?#]+)", url, re.IGNORECASE)
     if not match:
         raise ValueError("Invalid Hugeicons URL.")
@@ -191,29 +185,24 @@ async def fetch_hugeicons_svg(url: str) -> dict[str, str]:
 
 
 def format_svg(svg: str) -> str:
-    """Keep the original SVG content while making it readable in Telegram."""
     svg = re.sub(r"\s+", " ", svg)
     return svg.replace("> <", ">\n  <").strip()
 
 
 def markdown_v2_escape(text: str) -> str:
-    """Escape Telegram MarkdownV2 special characters in a label."""
     return re.sub(r"([_\*\[\]\(\)~`>#+\-=|{}.!\\])", r"\\\1", text)
 
 
 def markdown_code_escape(text: str) -> str:
-    """Escape the two characters that can terminate a MarkdownV2 code block."""
     return text.replace("\\", "\\\\").replace("`", "\\`")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start."""
     if update.message:
         await update.message.reply_text(WELCOME_MESSAGE)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /help."""
     if update.message:
         await update.message.reply_text(
             "Supported links:\n"
@@ -225,7 +214,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def process_lummi(update: Update, status_message: Any, url: str) -> None:
-    """Resolve and send a Lummi asset as a full-resolution document."""
     try:
         await status_message.edit_text("Downloading the Lummi asset…")
         result = await fetch_lummi_asset(url)
@@ -250,7 +238,6 @@ async def process_lummi(update: Update, status_message: Any, url: str) -> None:
 
 
 async def process_hugeicons(update: Update, status_message: Any, url: str) -> None:
-    """Fetch and send a Hugeicons SVG as text and a downloadable file."""
     try:
         await status_message.edit_text("Fetching the Hugeicons SVG…")
         result = await fetch_hugeicons_svg(url)
@@ -282,7 +269,6 @@ async def process_hugeicons(update: Update, status_message: Any, url: str) -> No
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Detect the platform and dispatch the request without blocking the event loop."""
     if not update.message or not update.message.text:
         return
 
@@ -318,13 +304,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def main() -> None:
-    """Start the unified bot using the Hugeicons bot token from the environment."""
-    token = os.getenv("TELEGRAM_BOT_TOKEN").strip()
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is not set. Set it to the token of the Hugeicons bot "
-            "before starting this program."
-        )
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+
+    threading.Thread(target=run_health_server, daemon=True).start()
+    logger.info("Health server started on port %s", os.getenv("PORT", 8080))
 
     application = Application.builder().token(token).concurrent_updates(True).build()
     application.add_handler(CommandHandler("start", start))

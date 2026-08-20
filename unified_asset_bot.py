@@ -319,7 +319,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def main() -> None:
     """Start the unified bot using the Hugeicons bot token from the environment."""
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "8646533018:AAFvrtNrWRH9G5QZ92jJm54BZx0OOqXuuOA").strip()
+    token = os.getenv("TELEGRAM_BOT_TOKEN").strip()
     if not token:
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN is not set. Set it to the token of the Hugeicons bot "

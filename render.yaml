@@ -5,5 +5,5 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python unified_asset_bot.py
     envVars:
-      - key: TELEGRAM_BOT_TOKEN
+      - key: 8646533018:AAFvrtNrWRH9G5QZ92jJm54BZx0OOqXuuOA
         sync: false

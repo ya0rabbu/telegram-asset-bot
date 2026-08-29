@@ -308,8 +308,8 @@ def main() -> None:
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
 
-    threading.Thread(target=run_health_server, daemon=True).start()
-    logger.info("Health server started on port %s", os.getenv("PORT", 8080))
+    webhook_url = os.getenv("WEBHOOK_URL", "").strip()
+    port = int(os.getenv("PORT", 10000))
 
     application = Application.builder().token(token).concurrent_updates(True).build()
     application.add_handler(CommandHandler("start", start))
@@ -317,8 +317,15 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Unified Lummi/Hugeicons bot is starting")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
-if __name__ == "__main__":
-    main()
+    if webhook_url:
+        logger.info("Running in webhook mode on port %s", port)
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            webhook_url=f"{webhook_url}/webhook",
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        logger.info("Running in polling mode")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)

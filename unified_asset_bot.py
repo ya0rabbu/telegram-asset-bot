@@ -318,7 +318,7 @@ def main() -> None:
 
     logger.info("Unified Lummi/Hugeicons bot is starting")
 
-        if webhook_url:
+    if webhook_url:
         logger.info("Running in webhook mode on port %s", port)
         application.run_webhook(
             listen="0.0.0.0",

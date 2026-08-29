@@ -5,8 +5,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -54,22 +52,6 @@ WELCOME_MESSAGE = (
     "Welcome. Send a Lummi.ai photo, illustration, or 3D link, or a Hugeicons "
     "icon link. I will detect the source automatically and return the asset."
 )
-
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, format, *args):
-        pass
-
-
-def run_health_server():
-    port = int(os.getenv("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    server.serve_forever()
 
 
 def trim_url(url: str) -> str:

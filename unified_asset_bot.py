@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 from io import BytesIO
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -59,6 +60,10 @@ LUMMI_URL_RE = re.compile(
 )
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 LUMMI_CID_RE = re.compile(r"Qm[1-9A-HJ-NP-Za-km-z]{44}")
+
+# Max number of pending file tokens to keep in memory at once (simple bound
+# to avoid unbounded growth if users request photos but never tap a button).
+MAX_PENDING_FILES = 500
 
 # ── 32 Effects definition ─────────────────────────────────────────────────────
 EFFECTS: list[tuple[str, str]] = [
@@ -161,12 +166,20 @@ def markdown_code_escape(text: str) -> str:
 
 # ── Effect Keyboard ──────────────────────────────────────────────────────────
 
-def build_effect_keyboard(file_id: str) -> InlineKeyboardMarkup:
-    """Build 4-column inline keyboard with all 32 effects."""
+def build_effect_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Build 4-column inline keyboard with all 32 effects.
+
+    `token` is a short opaque id referencing the photo's real file_id,
+    which is stored separately (see handle_photo). This keeps
+    callback_data well under Telegram's 64-byte limit, since raw
+    Telegram file_ids are frequently 80-100+ characters long and would
+    otherwise trigger `Button_data_invalid` once combined with an
+    effect key.
+    """
     buttons = []
     row = []
     for i, (key, label) in enumerate(EFFECTS):
-        row.append(InlineKeyboardButton(label, callback_data=f"fx|{key}|{file_id}"))
+        row.append(InlineKeyboardButton(label, callback_data=f"fx|{key}|{token}"))
         if len(row) == 4:
             buttons.append(row)
             row = []
@@ -187,9 +200,6 @@ async def apply_effect_to_image(
     Converts image bytes to RGBA, calls python_engine.py via subprocess,
     and returns BMP bytes.
     """
-    # Decode image to raw RGBA using only stdlib
-    # We use a temporary file approach with Python's imghdr + struct
-    # For simplicity and zero-dependency: call a tiny helper inline
     rgba_b64 = await _image_to_rgba_b64(image_bytes, width, height)
 
     payload = json.dumps({
@@ -232,7 +242,7 @@ async def apply_effect_to_image(
 async def _image_to_rgba_b64(image_bytes: bytes, width: int, height: int) -> str:
     """
     Use Pillow if available (most servers have it), otherwise fall back
-    to a pure-stdlib PPM/BMP reader. Returns base64-encoded raw RGBA bytes.
+    to a gradient test pattern. Returns base64-encoded raw RGBA bytes.
     """
     try:
         from PIL import Image  # type: ignore
@@ -242,8 +252,6 @@ async def _image_to_rgba_b64(image_bytes: bytes, width: int, height: int) -> str
     except ImportError:
         pass
 
-    # Fallback: generate a gradient test pattern (engine will still run)
-    import struct as _struct
     raw = bytearray(width * height * 4)
     for y in range(height):
         for x in range(width):
@@ -441,7 +449,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     photo = update.message.photo[-1]  # highest resolution
     file_id = photo.file_id
-    keyboard = build_effect_keyboard(file_id)
+
+    # Store the real (long) file_id under a short token, and only ever
+    # put the token in callback_data. This avoids Telegram's 64-byte
+    # callback_data limit, which raw file_ids blow past on their own.
+    pending: dict[str, str] = context.bot_data.setdefault("pending_files", {})
+    if len(pending) >= MAX_PENDING_FILES:
+        # Drop the oldest entry to keep memory bounded.
+        oldest_key = next(iter(pending))
+        pending.pop(oldest_key, None)
+    token = uuid.uuid4().hex[:10]
+    pending[token] = file_id
+
+    keyboard = build_effect_keyboard(token)
     await update.message.reply_text(
         "🎨 *Choose an effect to apply:*",
         parse_mode="Markdown",
@@ -455,9 +475,17 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
 
     try:
-        _, effect_key, file_id = query.data.split("|", 2)
+        _, effect_key, token = query.data.split("|", 2)
     except ValueError:
         await query.edit_message_text("❌ Invalid selection.")
+        return
+
+    pending: dict[str, str] = context.bot_data.get("pending_files", {})
+    file_id = pending.get(token)
+    if not file_id:
+        await query.edit_message_text(
+            "❌ This request has expired. Please resend the photo."
+        )
         return
 
     effect_label = EFFECT_NAMES.get(effect_key, effect_key)
@@ -490,6 +518,9 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
             caption=truncate_caption(f"✅ {effect_label} applied ({w}×{h}px)"),
         )
         await safe_edit(status_msg, f"✅ *{effect_label}* done!", parse_mode="Markdown")
+
+        # Clean up the token now that it's been used successfully.
+        pending.pop(token, None)
 
     except asyncio.TimeoutError:
         await safe_edit(status_msg, "⏱ Timed out — try a smaller image.")

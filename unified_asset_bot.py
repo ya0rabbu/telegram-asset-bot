@@ -404,6 +404,8 @@ def _get_image_dimensions(image_bytes: bytes) -> tuple[int, int]:
 # ── Background removal ────────────────────────────────────────────────────────
 
 _REMBG_SESSION = None  # lazy-loaded, shared across requests
+REMBG_MAX_DIMENSION = 1500  # downscale before inference; keeps RAM/time bounded
+REMBG_TIMEOUT_SECONDS = 90  # first call downloads the ~4MB model, so give it room
 
 
 def _get_rembg_session():
@@ -411,6 +413,11 @@ def _get_rembg_session():
 
     u2netp (~4 MB) is far cheaper on RAM/CPU than the default u2net model
     (~176 MB), which matters on small hosts like Render's free tier.
+
+    On the very first call this also downloads the model file from GitHub
+    into ~/.rembg — if that download fails (network egress blocked, DNS
+    issue on the host, etc.) it raises here, which is caught below and
+    surfaced to the user instead of failing silently.
     """
     global _REMBG_SESSION
     if _REMBG_SESSION is None:
@@ -421,13 +428,37 @@ def _get_rembg_session():
 
 async def remove_background(image_bytes: bytes) -> bytes:
     """Remove the background from an image, returning transparent PNG bytes."""
+    from PIL import Image
     from rembg import remove
 
     def _run() -> bytes:
-        session = _get_rembg_session()
-        return remove(image_bytes, session=session)
+        # Downscale very large photos first. rembg's memory/time cost scales
+        # with pixel count, and Render's free tier (~512MB RAM) can silently
+        # OOM-kill the process on a full-resolution phone photo, which looks
+        # to the user like "nothing happens" rather than a clear error.
+        img = Image.open(BytesIO(image_bytes))
+        img.load()
+        if max(img.size) > REMBG_MAX_DIMENSION:
+            img.thumbnail((REMBG_MAX_DIMENSION, REMBG_MAX_DIMENSION), Image.LANCZOS)
+            resized_buf = BytesIO()
+            img.convert("RGB").save(resized_buf, format="PNG")
+            working_bytes = resized_buf.getvalue()
+        else:
+            working_bytes = image_bytes
 
-    return await asyncio.to_thread(_run)
+        session = _get_rembg_session()
+        return remove(working_bytes, session=session)
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_run), timeout=REMBG_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            "Background removal timed out. The first request after a deploy "
+            "downloads a small AI model and can be slow — please try again."
+        ) from exc
+    except Exception as exc:
+        logger.exception("remove_background failed")
+        raise RuntimeError(f"Background removal failed: {exc}") from exc
 
 
 # ── Format conversion (JPEG/PNG/PDF) ────────────────────────────────────────

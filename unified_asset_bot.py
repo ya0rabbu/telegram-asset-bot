@@ -151,17 +151,18 @@ EFFECT_NAMES = {key: label for key, label, _ in EFFECTS}
 
 WELCOME_MESSAGE = (
     "```\n"
-    "┌───────────────────────────┐\n"
-    "│    A S S E T · E N G I N E   │\n"
-    "└───────────────────────────┘\n"
+    "┌───────────────────────────────┐\n"
+    "│    B A N G A L I · I C O N    │\n"
+    "└───────────────────────────────┘\n"
     "```\n"
-    "⚡ *System online* — all modules loaded\n\n"
+    "⚡ *@BangaliIconbot* — all modules loaded\n\n"
     "🔗 Send a *Lummi.ai* or *Hugeicons* link\n"
     "     → instant asset extraction\n"
     "🖼 Send a *photo*\n"
-    "     → 32 real-time visual effects\n"
+    "     → ✦ 32 real-time visual effects\n"
     "🧰 Or tap a tool below to get started\n\n"
-    "_Type_ `/menu` _anytime ·_ `/cancel` _to stop a task_"
+    "_Type_ `/menu` _anytime ·_ `/cancel` _to stop a task_\n\n"
+    "✦ Design and Developed By *@YA_Rabbu*"
 )
 
 MENU_INTRO = "🧰 *Select a tool*"
@@ -401,53 +402,104 @@ def _get_image_dimensions(image_bytes: bytes) -> tuple[int, int]:
         return 300, 300
 
 
-# ── Background removal ────────────────────────────────────────────────────────
+# ── Background removal (direct ONNX — no `rembg` package) ──────────────────
+#
+# We deliberately do NOT use the `rembg` package here. Importing it pulls in
+# scipy + scikit-image + pymatting + every other model's session class
+# (~270 MB of RSS) even though we only ever use one small model. On a
+# low-RAM host like Render's free tier that import alone can push the
+# process over its memory limit and get it silently OOM-killed — which is
+# exactly what was happening (status message stuck forever, no error, no
+# timeout message, because the whole process died before either could fire).
+#
+# Calling onnxruntime directly with the same u2netp model costs ~35 MB
+# instead, which comfortably fits.
 
-_REMBG_SESSION = None  # lazy-loaded, shared across requests
+_REMBG_SESSION = None  # lazy-loaded onnxruntime.InferenceSession
 REMBG_MAX_DIMENSION = 1500  # downscale before inference; keeps RAM/time bounded
-REMBG_TIMEOUT_SECONDS = 90  # first call downloads the ~4MB model, so give it room
+REMBG_TIMEOUT_SECONDS = 90  # first call downloads the ~4.5MB model, so give it room
+U2NETP_MODEL_URL = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx"
+U2NETP_MODEL_PATH = os.path.join(tempfile.gettempdir(), "u2netp.onnx")
+
+
+def _ensure_u2netp_model() -> str:
+    """Download the u2netp model once and cache it on disk."""
+    if os.path.exists(U2NETP_MODEL_PATH) and os.path.getsize(U2NETP_MODEL_PATH) > 1_000_000:
+        return U2NETP_MODEL_PATH
+    with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+        r = client.get(U2NETP_MODEL_URL)
+        r.raise_for_status()
+        tmp_path = U2NETP_MODEL_PATH + ".part"
+        with open(tmp_path, "wb") as f:
+            f.write(r.content)
+        os.replace(tmp_path, U2NETP_MODEL_PATH)
+    return U2NETP_MODEL_PATH
 
 
 def _get_rembg_session():
-    """Lazily create a rembg session using the lightweight u2netp model.
-
-    u2netp (~4 MB) is far cheaper on RAM/CPU than the default u2net model
-    (~176 MB), which matters on small hosts like Render's free tier.
-
-    On the very first call this also downloads the model file from GitHub
-    into ~/.rembg — if that download fails (network egress blocked, DNS
-    issue on the host, etc.) it raises here, which is caught below and
-    surfaced to the user instead of failing silently.
-    """
+    """Lazily create a plain onnxruntime session for the u2netp model."""
     global _REMBG_SESSION
     if _REMBG_SESSION is None:
-        from rembg import new_session
-        _REMBG_SESSION = new_session("u2netp")
+        import onnxruntime as ort
+        model_path = _ensure_u2netp_model()
+        _REMBG_SESSION = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     return _REMBG_SESSION
+
+
+def _u2netp_predict_mask(session, img):
+    """Run u2netp inference and return an 'L'-mode alpha mask the size of `img`.
+
+    This replicates rembg's own U2netpSession.predict()/normalize() logic
+    exactly, just without importing the rembg package to get it.
+    """
+    from PIL import Image
+
+    resized = img.resize((320, 320), Image.Resampling.LANCZOS)
+    arr = np.array(resized).astype(np.float32)
+    arr = arr / max(float(np.max(arr)), 1e-6)
+
+    mean = (0.485, 0.456, 0.406)
+    std = (0.229, 0.224, 0.225)
+    normed = np.zeros((320, 320, 3), dtype=np.float32)
+    for c in range(3):
+        normed[:, :, c] = (arr[:, :, c] - mean[c]) / std[c]
+    normed = normed.transpose((2, 0, 1))
+    input_tensor = np.expand_dims(normed, 0).astype(np.float32)
+
+    input_name = session.get_inputs()[0].name
+    outputs = session.run(None, {input_name: input_tensor})
+    pred = outputs[0][:, 0, :, :]
+
+    ma, mi = float(np.max(pred)), float(np.min(pred))
+    pred = (pred - mi) / max(ma - mi, 1e-6)
+    pred = np.squeeze(pred)
+
+    mask = Image.fromarray((pred * 255).astype("uint8"), mode="L")
+    return mask.resize(img.size, Image.Resampling.LANCZOS)
 
 
 async def remove_background(image_bytes: bytes) -> bytes:
     """Remove the background from an image, returning transparent PNG bytes."""
-    from PIL import Image
-    from rembg import remove
+    from PIL import Image, ImageOps
 
     def _run() -> bytes:
-        # Downscale very large photos first. rembg's memory/time cost scales
-        # with pixel count, and Render's free tier (~512MB RAM) can silently
-        # OOM-kill the process on a full-resolution phone photo, which looks
-        # to the user like "nothing happens" rather than a clear error.
         img = Image.open(BytesIO(image_bytes))
         img.load()
+        img = ImageOps.exif_transpose(img).convert("RGB")
+
+        # Downscale very large photos first — keeps RAM/time bounded on
+        # low-resource hosts.
         if max(img.size) > REMBG_MAX_DIMENSION:
             img.thumbnail((REMBG_MAX_DIMENSION, REMBG_MAX_DIMENSION), Image.LANCZOS)
-            resized_buf = BytesIO()
-            img.convert("RGB").save(resized_buf, format="PNG")
-            working_bytes = resized_buf.getvalue()
-        else:
-            working_bytes = image_bytes
 
         session = _get_rembg_session()
-        return remove(working_bytes, session=session)
+        mask = _u2netp_predict_mask(session, img)
+
+        out = img.convert("RGBA")
+        out.putalpha(mask)
+        buf = BytesIO()
+        out.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
 
     try:
         return await asyncio.wait_for(asyncio.to_thread(_run), timeout=REMBG_TIMEOUT_SECONDS)

@@ -97,80 +97,117 @@ GREETING_RE = re.compile(
     re.IGNORECASE,
 )
 
-# ── 32 Effects definition ─────────────────────────────────────────────────────
-EFFECTS: list[tuple[str, str]] = [
-    ("halftone-dots",       "🔴 Halftone"),
-    ("comic-cmyk",          "🎨 Pop-Art"),
-    ("retro-8bit",          "📺 8-Bit CRT"),
-    ("cinematic-noir",      "🎬 Noir"),
-    ("cyber-glitch",        "⚡ Cyberpunk"),
-    ("thermal-flir",        "🌡 Thermal"),
-    ("blueprint-cyan",      "📐 Blueprint"),
-    ("ascii-matrix",        "💻 ASCII"),
-    ("sobel-neon",          "✨ Neon Edge"),
-    ("risograph-duo",       "🖨 Risograph"),
-    ("crosshatch-engraving","✏️ Crosshatch"),
-    ("bayer-dither",        "🎲 Dither"),
-    ("watercolor",          "🌊 Watercolor"),
-    ("oil-paint",           "🖼 Oil Paint"),
-    ("vaporwave",           "🌈 Vaporwave"),
-    ("vhs-tape",            "🎞 VHS Tape"),
-    ("autumn-tone",         "🍂 Autumn"),
-    ("frozen-ice",          "❄️ Frozen"),
-    ("moonlight",           "🌙 Moonlight"),
-    ("duotone",             "🎭 Duotone"),
-    ("emboss",              "🪨 Emboss"),
-    ("pixelate",            "🔬 Pixelate"),
-    ("swirl-distort",       "🌀 Swirl"),
-    ("lomography",          "📸 Lomography"),
-    ("glitch-art",          "🎪 Glitch Art"),
-    ("forest-green",        "🌿 Forest"),
-    ("inferno",             "🔥 Inferno"),
-    ("horror-red",          "🩸 Horror"),
-    ("cherry-blossom",      "🌸 Cherry"),
-    ("desert-sand",         "🏜 Desert"),
-    ("neon-poster",         "🎨 Neon Poster"),
-    ("mirror-reflect",      "🪞 Mirror"),
+# ── 32 Effects definition (key, label, category) ───────────────────────────────
+EFFECT_CATEGORIES: dict[str, str] = {
+    "retro":   "Retro & Print",
+    "tone":    "Color & Tone",
+    "art":     "Artistic",
+    "digital": "Digital & Glitch",
+    "distort": "Distort & Special",
+}
+EFFECT_CATEGORY_ORDER = ["retro", "tone", "art", "digital", "distort"]
+
+EFFECTS: list[tuple[str, str, str]] = [
+    # Retro & Print
+    ("halftone-dots",        "Halftone",        "retro"),
+    ("comic-cmyk",           "Pop-Art",         "retro"),
+    ("retro-8bit",           "8-Bit CRT",       "retro"),
+    ("risograph-duo",        "Risograph",       "retro"),
+    ("crosshatch-engraving", "Crosshatch",      "retro"),
+    ("bayer-dither",         "Dither",          "retro"),
+    ("vhs-tape",             "VHS Tape",        "retro"),
+    ("lomography",           "Lomography",      "retro"),
+    # Color & Tone
+    ("duotone",              "Duotone",         "tone"),
+    ("autumn-tone",          "Autumn",          "tone"),
+    ("forest-green",         "Forest",          "tone"),
+    ("desert-sand",          "Desert",          "tone"),
+    ("cherry-blossom",       "Cherry Blossom",  "tone"),
+    ("moonlight",            "Moonlight",       "tone"),
+    ("frozen-ice",           "Frozen",          "tone"),
+    # Artistic
+    ("watercolor",           "Watercolor",      "art"),
+    ("oil-paint",            "Oil Paint",       "art"),
+    ("emboss",               "Emboss",          "art"),
+    ("cinematic-noir",       "Noir",            "art"),
+    # Digital & Glitch
+    ("cyber-glitch",         "Cyberpunk",       "digital"),
+    ("glitch-art",           "Glitch Art",      "digital"),
+    ("ascii-matrix",         "ASCII",           "digital"),
+    ("sobel-neon",           "Neon Edge",       "digital"),
+    ("vaporwave",            "Vaporwave",       "digital"),
+    ("neon-poster",          "Neon Poster",     "digital"),
+    # Distort & Special
+    ("swirl-distort",        "Swirl",           "distort"),
+    ("mirror-reflect",       "Mirror",          "distort"),
+    ("pixelate",             "Pixelate",        "distort"),
+    ("blueprint-cyan",       "Blueprint",       "distort"),
+    ("thermal-flir",         "Thermal",         "distort"),
+    ("inferno",              "Inferno",         "distort"),
+    ("horror-red",           "Horror",          "distort"),
 ]
 
-EFFECT_NAMES = {key: label for key, label in EFFECTS}
+EFFECT_NAMES = {key: label for key, label, _ in EFFECTS}
 
 WELCOME_MESSAGE = (
     "```\n"
-    "╔══════════════════════════╗\n"
-    "║   A S S E T • E N G I N E   ║\n"
-    "╚══════════════════════════╝\n"
+    "┌───────────────────────────┐\n"
+    "│    A S S E T · E N G I N E   │\n"
+    "└───────────────────────────┘\n"
     "```\n"
-    "⚡ *System online.* All modules loaded.\n\n"
-    "🔗 Drop a *Lummi.ai* or *Hugeicons* link → instant asset extraction\n"
-    "🖼 Send a *photo* → 32 real-time visual effects\n"
-    "🧰 Or tap a tool below to run a task:\n\n"
-    "_Type /menu anytime to reopen this panel • /cancel to stop a task_"
+    "⚡ *System online* — all modules loaded\n\n"
+    "🔗 Send a *Lummi.ai* or *Hugeicons* link\n"
+    "     → instant asset extraction\n"
+    "🖼 Send a *photo*\n"
+    "     → 32 real-time visual effects\n"
+    "🧰 Or tap a tool below to get started\n\n"
+    "_Type_ `/menu` _anytime ·_ `/cancel` _to stop a task_"
 )
 
-MENU_INTRO = "🧰 *Select a tool:*"
+MENU_INTRO = "🧰 *Select a tool*"
 
 
 def build_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Main feature menu shown on /start, /menu, and greetings."""
+    """Main feature menu shown on /start, /menu, and greetings.
+
+    Grouped by purpose: image ops, PDF ops, format conversion, text ops.
+    """
     rows = [
         [
             InlineKeyboardButton("🎨 Image Effects", callback_data="menu|effects"),
             InlineKeyboardButton("🧹 Remove BG", callback_data="menu|bgremove"),
         ],
         [
-            InlineKeyboardButton("🌐 Translate", callback_data="menu|translate"),
+            InlineKeyboardButton("🖼 Image → PDF", callback_data="menu|img2pdf"),
             InlineKeyboardButton("📄 PDF → Images", callback_data="menu|pdf2img"),
         ],
         [
-            InlineKeyboardButton("🖼 Image → PDF", callback_data="menu|img2pdf"),
             InlineKeyboardButton("🔁 JPEG → PNG", callback_data="menu|jpg2png"),
+            InlineKeyboardButton("🔁 PNG → JPEG", callback_data="menu|png2jpg"),
         ],
         [
-            InlineKeyboardButton("🔁 PNG → JPEG", callback_data="menu|png2jpg"),
+            InlineKeyboardButton("🌐 Translate", callback_data="menu|translate"),
             InlineKeyboardButton("📝 MD → TXT", callback_data="menu|md2txt"),
         ],
     ]
+    return InlineKeyboardMarkup(rows)
+
+
+def build_effect_categories_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Top-level effect picker: 5 categories, 2 per row."""
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for cat_key in EFFECT_CATEGORY_ORDER:
+        row.append(
+            InlineKeyboardButton(
+                EFFECT_CATEGORIES[cat_key], callback_data=f"fxcat|{cat_key}|{token}"
+            )
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     return InlineKeyboardMarkup(rows)
 
 
@@ -240,8 +277,9 @@ def markdown_code_escape(text: str) -> str:
 
 # ── Effect Keyboard ──────────────────────────────────────────────────────────
 
-def build_effect_keyboard(token: str) -> InlineKeyboardMarkup:
-    """Build 4-column inline keyboard with all 32 effects.
+def build_effect_keyboard(category: str, token: str) -> InlineKeyboardMarkup:
+    """Build a 2-column inline keyboard with the effects in one category,
+    plus a back button to return to the category picker.
 
     `token` is a short opaque id referencing the photo's real file_id,
     which is stored separately (see handle_photo). This keeps
@@ -250,15 +288,18 @@ def build_effect_keyboard(token: str) -> InlineKeyboardMarkup:
     otherwise trigger `Button_data_invalid` once combined with an
     effect key.
     """
-    buttons = []
-    row = []
-    for i, (key, label) in enumerate(EFFECTS):
+    buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for key, label, cat in EFFECTS:
+        if cat != category:
+            continue
         row.append(InlineKeyboardButton(label, callback_data=f"fx|{key}|{token}"))
-        if len(row) == 4:
+        if len(row) == 2:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
+    buttons.append([InlineKeyboardButton("◀ Categories", callback_data=f"fxback|{token}")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -310,7 +351,15 @@ async def apply_effect_to_image(
 
     data_url: str = result["bmp_data_url"]
     b64_part = data_url.split(",", 1)[1]
-    return base64.b64decode(b64_part)
+    bmp_bytes = base64.b64decode(b64_part)
+
+    # Convert the engine's raw BMP output to PNG (smaller file, lossless,
+    # and consistent with the rest of the bot's image outputs).
+    from PIL import Image  # type: ignore
+    with Image.open(BytesIO(bmp_bytes)) as bmp_img:
+        png_buf = BytesIO()
+        bmp_img.convert("RGBA").save(png_buf, format="PNG", optimize=True)
+        return png_buf.getvalue()
 
 
 async def _image_to_rgba_b64(image_bytes: bytes, width: int, height: int) -> str:
@@ -684,9 +733,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     token = uuid.uuid4().hex[:10]
     pending[token] = file_id
 
-    keyboard = build_effect_keyboard(token)
+    keyboard = build_effect_categories_keyboard(token)
     await update.message.reply_text(
-        "🎨 *Choose an effect to apply:*",
+        "🎨 *Choose a category:*",
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
@@ -863,14 +912,14 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
         image_bytes = file_bytes_io.getvalue()
 
         w, h = _get_image_dimensions(image_bytes)
-        bmp_bytes = await apply_effect_to_image(image_bytes, effect_key, w, h)
+        png_bytes = await apply_effect_to_image(image_bytes, effect_key, w, h)
 
-        document = BytesIO(bmp_bytes)
-        document.name = f"{effect_key}.bmp"
+        document = BytesIO(png_bytes)
+        document.name = f"{effect_key}.png"
 
         await query.message.reply_document(
             document=document,
-            filename=f"{effect_key}.bmp",
+            filename=f"{effect_key}.png",
             caption=truncate_caption(f"✅ {effect_label} applied ({w}×{h}px)"),
         )
         await safe_edit(status_msg, f"✅ *{effect_label}* done!", parse_mode="Markdown")
@@ -883,6 +932,53 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as exc:
         logger.warning("Effect %s failed: %s", effect_key, exc)
         await safe_edit(status_msg, f"❌ Failed to apply effect: {exc}")
+
+
+async def handle_effect_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User tapped a category button; show that category's effects."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, category, token = query.data.split("|", 2)
+    except ValueError:
+        await query.edit_message_text("❌ Invalid selection.")
+        return
+
+    pending: dict[str, str] = context.bot_data.get("pending_files", {})
+    if token not in pending:
+        await query.edit_message_text("❌ This request has expired. Please resend the photo.")
+        return
+
+    cat_label = EFFECT_CATEGORIES.get(category, category)
+    await query.edit_message_text(
+        f"🎨 *{cat_label}* — choose an effect:",
+        parse_mode="Markdown",
+        reply_markup=build_effect_keyboard(category, token),
+    )
+
+
+async def handle_effect_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User tapped '◀ Categories'; return to the top-level category picker."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, token = query.data.split("|", 1)
+    except ValueError:
+        await query.edit_message_text("❌ Invalid selection.")
+        return
+
+    pending: dict[str, str] = context.bot_data.get("pending_files", {})
+    if token not in pending:
+        await query.edit_message_text("❌ This request has expired. Please resend the photo.")
+        return
+
+    await query.edit_message_text(
+        "🎨 *Choose a category:*",
+        parse_mode="Markdown",
+        reply_markup=build_effect_categories_keyboard(token),
+    )
 
 
 async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1049,6 +1145,8 @@ def main() -> None:
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(CallbackQueryHandler(handle_effect_category_callback, pattern=r"^fxcat\|"))
+    application.add_handler(CallbackQueryHandler(handle_effect_back_callback, pattern=r"^fxback\|"))
     application.add_handler(CallbackQueryHandler(handle_effect_callback, pattern=r"^fx\|"))
     application.add_handler(CallbackQueryHandler(handle_menu_callback, pattern=r"^menu\|"))
     application.add_handler(CallbackQueryHandler(handle_translate_lang_callback, pattern=r"^trlang\|"))

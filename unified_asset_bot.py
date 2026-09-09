@@ -13,6 +13,7 @@ import httpx
 from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -22,6 +23,7 @@ from telegram.ext import (
 )
 
 MAX_UPLOAD_BYTES = 49 * 1024 * 1024
+MAX_CAPTION_LENGTH = 1024
 REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
 
 logging.basicConfig(
@@ -54,8 +56,41 @@ WELCOME_MESSAGE = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def trim_url(url: str) -> str:
     return url.rstrip(".,!?;:)]}>\"'")
+
+
+def truncate_caption(caption: str) -> str:
+    """Ensure caption does not exceed Telegram's 1024-character limit."""
+    if len(caption) <= MAX_CAPTION_LENGTH:
+        return caption
+    return caption[: MAX_CAPTION_LENGTH - 3] + "..."
+
+
+async def safe_edit(message: Any, text: str, **kwargs: Any) -> None:
+    """Edit a message, silently ignoring 'Message to edit not found' errors."""
+    try:
+        await message.edit_text(text, **kwargs)
+    except BadRequest as exc:
+        if "message to edit not found" in str(exc).lower():
+            logger.debug("Status message already gone, skipping edit: %s", exc)
+        else:
+            raise
+
+
+async def safe_delete(message: Any) -> None:
+    """Delete a message, silently ignoring errors if it no longer exists."""
+    try:
+        await message.delete()
+    except BadRequest as exc:
+        if "message to delete not found" in str(exc).lower():
+            logger.debug("Status message already gone, skipping delete: %s", exc)
+        else:
+            raise
 
 
 def detect_platform(url: str) -> str | None:
@@ -68,6 +103,10 @@ def detect_platform(url: str) -> str | None:
         return "hugeicons"
     return None
 
+
+# ---------------------------------------------------------------------------
+# Lummi
+# ---------------------------------------------------------------------------
 
 def find_lummi_cid(page_html: str, slug: str) -> str | None:
     soup = BeautifulSoup(page_html, "html.parser")
@@ -136,6 +175,10 @@ async def fetch_lummi_asset(url: str) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Hugeicons
+# ---------------------------------------------------------------------------
+
 async def fetch_hugeicons_svg(url: str) -> dict[str, str]:
     match = re.search(r"hugeicons\.com/icon/([^?#]+)", url, re.IGNORECASE)
     if not match:
@@ -179,6 +222,10 @@ def markdown_code_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("`", "\\`")
 
 
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(WELCOME_MESSAGE)
@@ -197,56 +244,66 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def process_lummi(update: Update, status_message: Any, url: str) -> None:
     try:
-        await status_message.edit_text("Downloading the Lummi asset…")
+        await safe_edit(status_message, "Downloading the Lummi asset…")
         result = await fetch_lummi_asset(url)
-        await status_message.edit_text("Sending the full-size Lummi asset…")
+        await safe_edit(status_message, "Sending the full-size Lummi asset…")
+
         document = BytesIO(result["bytes"])
         document.name = result["filename"]
+        caption = truncate_caption(
+            f"Full-size image ({result['size_mb']:.2f} MB)\n"
+            f"Direct link: {result['direct_url']}"
+        )
         await update.message.reply_document(
             document=document,
             filename=result["filename"],
-            caption=(
-                f"Full-size image ({result['size_mb']:.2f} MB)\n"
-                f"Direct link: {result['direct_url']}"
-            ),
+            caption=caption,
         )
-        await status_message.delete()
+        await safe_delete(status_message)
+
     except Exception as exc:
         logger.warning("Lummi request failed: %s", exc)
-        await status_message.edit_text(
+        await safe_edit(
+            status_message,
             "Sorry, I could not retrieve that Lummi asset. It may be unavailable, "
-            "unsupported, or larger than Telegram's upload limit."
+            "unsupported, or larger than Telegram's upload limit.",
         )
 
 
 async def process_hugeicons(update: Update, status_message: Any, url: str) -> None:
     try:
-        await status_message.edit_text("Fetching the Hugeicons SVG…")
+        await safe_edit(status_message, "Fetching the Hugeicons SVG…")
         result = await fetch_hugeicons_svg(url)
         clean_svg = format_svg(result["svg"])
         icon_name = result["icon_name"]
         style = result["style"]
         filename = f"{icon_name}-{style}.svg"
 
-        await status_message.delete()
+        await safe_delete(status_message)
+
         label = f"✅ *{markdown_v2_escape(icon_name)}* \\({markdown_v2_escape(style)}\\)"
         await update.message.reply_text(label, parse_mode="MarkdownV2")
+
         await update.message.reply_text(
             f"```xml\n{markdown_code_escape(clean_svg)}\n```",
             parse_mode="MarkdownV2",
         )
+
         document = BytesIO(clean_svg.encode("utf-8"))
         document.name = filename
+        caption = truncate_caption(f"{filename} — ready to download and use.")
         await update.message.reply_document(
             document=document,
             filename=filename,
-            caption=f"{filename} — ready to download and use.",
+            caption=caption,
         )
+
     except Exception as exc:
         logger.warning("Hugeicons request failed: %s", exc)
-        await status_message.edit_text(
+        await safe_edit(
+            status_message,
             "Sorry, I could not retrieve that Hugeicons SVG. Check that the link is "
-            "valid and that the icon still exists."
+            "valid and that the icon still exists.",
         )
 
 
@@ -285,6 +342,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await process_hugeicons(update, status_message, url)
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler — logs all unhandled exceptions."""
+    logger.error("Unhandled exception while processing update:", exc_info=context.error)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -297,6 +363,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_error_handler(error_handler)  # ← global error handler added
 
     logger.info("Unified Lummi/Hugeicons bot is starting")
 

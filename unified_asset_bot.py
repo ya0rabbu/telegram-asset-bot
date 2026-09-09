@@ -433,37 +433,64 @@ async def remove_background(image_bytes: bytes) -> bytes:
 # ── Format conversion (JPEG/PNG/PDF) ────────────────────────────────────────
 
 async def convert_image_format(image_bytes: bytes, target_format: str) -> bytes:
-    """Convert raw image bytes to JPEG or PNG bytes."""
-    from PIL import Image
+    """Convert raw image bytes to JPEG or PNG bytes, preserving original quality.
+
+    Pillow's default JPEG quality is only 75 and it silently re-samples
+    chroma unless told not to — both degrade the image. We explicitly
+    request maximum quality, disable chroma subsampling, and keep PNG
+    conversion truly lossless.
+    """
+    from PIL import Image, ImageOps
 
     def _run() -> bytes:
         img = Image.open(BytesIO(image_bytes))
+        # Respect EXIF orientation so the output isn't rotated/mirrored.
+        img = ImageOps.exif_transpose(img)
+        out = BytesIO()
+
         if target_format.upper() == "JPEG":
             img = img.convert("RGB")
+            img.save(
+                out,
+                format="JPEG",
+                quality=100,
+                subsampling=0,   # 4:4:4, no chroma downsampling
+                optimize=True,
+            )
         else:
             img = img.convert("RGBA")
-        out = BytesIO()
-        img.save(out, format=target_format.upper())
+            img.save(out, format="PNG", optimize=True)  # PNG is lossless regardless
+
         return out.getvalue()
 
     return await asyncio.to_thread(_run)
 
 
 async def image_to_pdf(image_bytes: bytes) -> bytes:
-    """Wrap a single image into a one-page PDF."""
-    from PIL import Image
+    """Wrap a single image into a one-page PDF at full quality.
+
+    Pillow embeds RGB images in PDFs as JPEG internally and — same as
+    above — defaults to quality 75 unless told otherwise. We force
+    maximum quality so the PDF doesn't visibly degrade the source image.
+    """
+    from PIL import Image, ImageOps
 
     def _run() -> bytes:
-        img = Image.open(BytesIO(image_bytes)).convert("RGB")
+        img = Image.open(BytesIO(image_bytes))
+        img = ImageOps.exif_transpose(img).convert("RGB")
         out = BytesIO()
-        img.save(out, format="PDF")
+        img.save(out, format="PDF", quality=100, resolution=300.0)
         return out.getvalue()
 
     return await asyncio.to_thread(_run)
 
 
 async def pdf_to_images(pdf_bytes: bytes, max_pages: int = PDF2IMG_MAX_PAGES) -> list[bytes]:
-    """Render each page of a PDF to PNG bytes (capped at max_pages)."""
+    """Render each page of a PDF to PNG bytes (capped at max_pages).
+
+    Rendered at 200 DPI (up from 150) for sharper, more print-quality output
+    while staying well within Telegram's per-file size limits.
+    """
     import fitz  # PyMuPDF
 
     def _run() -> list[bytes]:
@@ -473,7 +500,7 @@ async def pdf_to_images(pdf_bytes: bytes, max_pages: int = PDF2IMG_MAX_PAGES) ->
             for i, page in enumerate(doc):
                 if i >= max_pages:
                     break
-                pix = page.get_pixmap(dpi=150)
+                pix = page.get_pixmap(dpi=200)
                 pages.append(pix.tobytes("png"))
             return pages
         finally:

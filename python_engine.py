@@ -247,16 +247,42 @@ def fx_blueprint_cyan(img: Image.Image, params: dict) -> Image.Image:
 
 
 def fx_ascii_matrix(img: Image.Image, params: dict) -> Image.Image:
+    """Real character-based ASCII art (Matrix-style green-on-black),
+    not just colored noise: each cell is brightness-mapped to an actual
+    monospace character and drawn with PIL, like a true ASCII render.
+    """
+    from PIL import ImageDraw, ImageFont
+
     w, h = img.size
-    cell = max(4, int(params.get("dotPitch", 8)))
-    small = ImageOps.grayscale(img).resize((max(1, w // cell), max(1, h // cell)))
-    small = small.resize((w, h), Image.NEAREST)
-    arr = np.array(small).astype(np.float32) / 255.0
-    out = np.zeros((h, w, 3), dtype=np.uint8)
-    out[..., 1] = (arr * 255).astype(np.uint8)
-    noise = (np.random.rand(h, w) < 0.02).astype(np.uint8) * 255
-    out[..., 1] = np.clip(out[..., 1].astype(np.int16) + noise, 0, 255).astype(np.uint8)
-    return Image.fromarray(out, mode="RGB")
+    cell = max(6, int(params.get("dotPitch", 8)))
+    ramp = " .:-=+*#%@"  # dark -> light
+
+    gray = ImageOps.grayscale(img)
+    cols = max(1, w // cell)
+    rows = max(1, h // cell)
+    small = gray.resize((cols, rows), Image.BILINEAR)
+    brightness = np.array(small).astype(np.float32) / 255.0
+
+    out = Image.new("RGB", (w, h), (0, 0, 0))
+    draw = ImageDraw.Draw(out)
+    try:
+        font = ImageFont.truetype("DejaVuSansMono.ttf", size=max(8, int(cell * 1.15)))
+    except Exception:
+        font = ImageFont.load_default()
+
+    rng = np.random.default_rng()
+    for row in range(rows):
+        for col in range(cols):
+            level = brightness[row, col]
+            char = ramp[min(len(ramp) - 1, int(level * (len(ramp) - 1)))]
+            if char == " ":
+                continue
+            # slight per-character brightness jitter for a "live" matrix feel
+            g = int(np.clip(80 + level * 175 + rng.integers(-15, 15), 40, 255))
+            draw.text((col * cell, row * cell), char, font=font, fill=(0, g, 0))
+
+    return out
+
 
 
 def fx_sobel_neon(img: Image.Image, params: dict) -> Image.Image:
@@ -291,15 +317,48 @@ def fx_bayer_dither(img: Image.Image, params: dict) -> Image.Image:
 
 
 def fx_watercolor(img: Image.Image, params: dict) -> Image.Image:
-    blurred = img.convert("RGB").filter(ImageFilter.GaussianBlur(2))
-    blurred = ImageEnhance.Color(blurred).enhance(1.5)
-    edges = img.convert("L").filter(ImageFilter.FIND_EDGES).point(lambda p: 255 - min(p * 2, 255))
-    return Image.composite(blurred, Image.new("RGB", img.size, (255, 255, 255)), edges)
+    """Painterly watercolor wash with soft-bled edges and paper grain."""
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+
+    # Soften detail into color "pools" (bigger blur = more of a wash).
+    blurred = rgb.filter(ImageFilter.GaussianBlur(3.5))
+    blurred = ImageEnhance.Color(blurred).enhance(1.6)
+    blurred = ImageEnhance.Brightness(blurred).enhance(1.05)
+
+    # Soft, blurred edge-darkening (like ink bleeding at color boundaries)
+    # instead of a single hard-edged FIND_EDGES pass.
+    edges = rgb.convert("L").filter(ImageFilter.FIND_EDGES)
+    edges = edges.filter(ImageFilter.GaussianBlur(1.5))
+    edge_mask = edges.point(lambda p: min(255, int(p * 2.2)))
+    darkened = ImageEnhance.Brightness(blurred).enhance(0.75)
+    result = Image.composite(darkened, blurred, edge_mask)
+
+    # Subtle paper-grain texture for a hand-painted feel.
+    arr = np.array(result).astype(np.int16)
+    grain = (np.random.default_rng().normal(0, 6, arr.shape[:2])[..., None]).astype(np.int16)
+    arr = np.clip(arr + grain, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr, mode="RGB")
 
 
 def fx_oil_paint(img: Image.Image, params: dict) -> Image.Image:
-    rgb = img.convert("RGB").filter(ImageFilter.ModeFilter(size=5))
-    return rgb.filter(ImageFilter.SMOOTH_MORE)
+    """Chunky brush-stroke oil-paint look using a stronger mode filter
+    (clusters pixels into flat color patches like real brushwork) plus
+    light edge redraw so shapes stay readable."""
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    # Work at reduced size so ModeFilter clusters read as brush strokes
+    # rather than fine noise, then upscale back — this is what gives the
+    # "chunky paint daub" look instead of a barely-visible smooth blur.
+    small = rgb.resize((max(1, w // 2), max(1, h // 2)), Image.BILINEAR)
+    painted = small.filter(ImageFilter.ModeFilter(size=9))
+    painted = painted.filter(ImageFilter.ModeFilter(size=7))
+    painted = painted.resize((w, h), Image.BILINEAR)
+    painted = painted.filter(ImageFilter.SMOOTH_MORE)
+    painted = ImageEnhance.Color(painted).enhance(1.25)
+    painted = ImageEnhance.Contrast(painted).enhance(1.1)
+    return painted
+
 
 
 def fx_vaporwave(img: Image.Image, params: dict) -> Image.Image:
@@ -441,11 +500,16 @@ EFFECT_FUNCS = {
 }
 
 # Effects that already produce a stylized/graphic look where extra film
-# grain and vignette would just muddy the result.
-_SKIP_POSTPROCESS = {
+# grain would just muddy the result.
+_SKIP_GRAIN = {
     "halftone-dots", "ascii-matrix", "bayer-dither", "pixelate",
     "blueprint-cyan", "crosshatch-engraving", "retro-8bit", "glitch-art",
 }
+
+# Effects that already bake in their own vignette — applying the global
+# one on top double-darkens the corners (this was a real bug: horror-red
+# and lomography came out almost black at the edges).
+_SKIP_VIGNETTE = _SKIP_GRAIN | {"horror-red", "lomography"}
 
 
 def apply_effect(img: Image.Image, effect: str, params: dict) -> Image.Image:
@@ -456,8 +520,9 @@ def apply_effect(img: Image.Image, effect: str, params: dict) -> Image.Image:
     working = _apply_base_adjustments(img.convert("RGB"), params)
     result = func(working, params)
 
-    if effect not in _SKIP_POSTPROCESS:
+    if effect not in _SKIP_GRAIN:
         result = _add_grain(result, float(params.get("grainIntensity", 0)) * 0.3)
+    if effect not in _SKIP_VIGNETTE:
         result = _add_vignette(result, float(params.get("vignette", 0)) * 0.5)
 
     return result

@@ -18,7 +18,12 @@ from urllib.parse import unquote, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    Update,
+)
 from telegram.constants import ChatAction
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -65,6 +70,33 @@ LUMMI_CID_RE = re.compile(r"Qm[1-9A-HJ-NP-Za-km-z]{44}")
 # to avoid unbounded growth if users request photos but never tap a button).
 MAX_PENDING_FILES = 500
 
+# Telegram bots (standard Bot API, not a self-hosted local server) can only
+# download files up to this size via get_file(). Files larger than this
+# will fail to download even if the upload itself succeeded.
+BOT_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
+
+# Cap on how many pages of a PDF we render to images, to keep things fast
+# and avoid flooding the chat.
+PDF2IMG_MAX_PAGES = 20
+
+# Common languages offered in the /translate quick-picker.
+TRANSLATE_LANGUAGES: list[tuple[str, str]] = [
+    ("en", "🇬🇧 English"),
+    ("bn", "🇧🇩 বাংলা"),
+    ("hi", "🇮🇳 हिन्दी"),
+    ("ar", "🇸🇦 العربية"),
+    ("es", "🇪🇸 Español"),
+    ("fr", "🇫🇷 Français"),
+    ("zh-CN", "🇨🇳 中文"),
+    ("ja", "🇯🇵 日本語"),
+]
+
+# Simple greeting matcher so "hi"/"hello"/etc. also open the main menu.
+GREETING_RE = re.compile(
+    r"^(hi+|he+llo+|hey+|yo|start|salam|assalamu\s*alaikum|assalamualaikum)[!.\s]*$",
+    re.IGNORECASE,
+)
+
 # ── 32 Effects definition ─────────────────────────────────────────────────────
 EFFECTS: list[tuple[str, str]] = [
     ("halftone-dots",       "🔴 Halftone"),
@@ -104,13 +136,55 @@ EFFECTS: list[tuple[str, str]] = [
 EFFECT_NAMES = {key: label for key, label in EFFECTS}
 
 WELCOME_MESSAGE = (
-    "👋 Welcome!\n\n"
-    "Send me:\n"
-    "🔗 A *Lummi.ai* photo/illustration/3D link\n"
-    "🔗 A *Hugeicons* icon link\n"
-    "🖼 A *photo* to apply one of 32 image effects\n\n"
-    "Use /help for more info."
+    "```\n"
+    "╔══════════════════════════╗\n"
+    "║   A S S E T • E N G I N E   ║\n"
+    "╚══════════════════════════╝\n"
+    "```\n"
+    "⚡ *System online.* All modules loaded.\n\n"
+    "🔗 Drop a *Lummi.ai* or *Hugeicons* link → instant asset extraction\n"
+    "🖼 Send a *photo* → 32 real-time visual effects\n"
+    "🧰 Or tap a tool below to run a task:\n\n"
+    "_Type /menu anytime to reopen this panel • /cancel to stop a task_"
 )
+
+MENU_INTRO = "🧰 *Select a tool:*"
+
+
+def build_main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Main feature menu shown on /start, /menu, and greetings."""
+    rows = [
+        [
+            InlineKeyboardButton("🎨 Image Effects", callback_data="menu|effects"),
+            InlineKeyboardButton("🧹 Remove BG", callback_data="menu|bgremove"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Translate", callback_data="menu|translate"),
+            InlineKeyboardButton("📄 PDF → Images", callback_data="menu|pdf2img"),
+        ],
+        [
+            InlineKeyboardButton("🖼 Image → PDF", callback_data="menu|img2pdf"),
+            InlineKeyboardButton("🔁 JPEG → PNG", callback_data="menu|jpg2png"),
+        ],
+        [
+            InlineKeyboardButton("🔁 PNG → JPEG", callback_data="menu|png2jpg"),
+            InlineKeyboardButton("📝 MD → TXT", callback_data="menu|md2txt"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def build_translate_lang_keyboard() -> InlineKeyboardMarkup:
+    buttons = []
+    row = []
+    for code, label in TRANSLATE_LANGUAGES:
+        row.append(InlineKeyboardButton(label, callback_data=f"trlang|{code}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -278,6 +352,119 @@ def _get_image_dimensions(image_bytes: bytes) -> tuple[int, int]:
         return 300, 300
 
 
+# ── Background removal ────────────────────────────────────────────────────────
+
+_REMBG_SESSION = None  # lazy-loaded, shared across requests
+
+
+def _get_rembg_session():
+    """Lazily create a rembg session using the lightweight u2netp model.
+
+    u2netp (~4 MB) is far cheaper on RAM/CPU than the default u2net model
+    (~176 MB), which matters on small hosts like Render's free tier.
+    """
+    global _REMBG_SESSION
+    if _REMBG_SESSION is None:
+        from rembg import new_session
+        _REMBG_SESSION = new_session("u2netp")
+    return _REMBG_SESSION
+
+
+async def remove_background(image_bytes: bytes) -> bytes:
+    """Remove the background from an image, returning transparent PNG bytes."""
+    from rembg import remove
+
+    def _run() -> bytes:
+        session = _get_rembg_session()
+        return remove(image_bytes, session=session)
+
+    return await asyncio.to_thread(_run)
+
+
+# ── Format conversion (JPEG/PNG/PDF) ────────────────────────────────────────
+
+async def convert_image_format(image_bytes: bytes, target_format: str) -> bytes:
+    """Convert raw image bytes to JPEG or PNG bytes."""
+    from PIL import Image
+
+    def _run() -> bytes:
+        img = Image.open(BytesIO(image_bytes))
+        if target_format.upper() == "JPEG":
+            img = img.convert("RGB")
+        else:
+            img = img.convert("RGBA")
+        out = BytesIO()
+        img.save(out, format=target_format.upper())
+        return out.getvalue()
+
+    return await asyncio.to_thread(_run)
+
+
+async def image_to_pdf(image_bytes: bytes) -> bytes:
+    """Wrap a single image into a one-page PDF."""
+    from PIL import Image
+
+    def _run() -> bytes:
+        img = Image.open(BytesIO(image_bytes)).convert("RGB")
+        out = BytesIO()
+        img.save(out, format="PDF")
+        return out.getvalue()
+
+    return await asyncio.to_thread(_run)
+
+
+async def pdf_to_images(pdf_bytes: bytes, max_pages: int = PDF2IMG_MAX_PAGES) -> list[bytes]:
+    """Render each page of a PDF to PNG bytes (capped at max_pages)."""
+    import fitz  # PyMuPDF
+
+    def _run() -> list[bytes]:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            pages = []
+            for i, page in enumerate(doc):
+                if i >= max_pages:
+                    break
+                pix = page.get_pixmap(dpi=150)
+                pages.append(pix.tobytes("png"))
+            return pages
+        finally:
+            doc.close()
+
+    return await asyncio.to_thread(_run)
+
+
+# ── Translation ──────────────────────────────────────────────────────────────
+
+TRANSLATE_MAX_CHARS = 4500  # keep comfortably under the free API's limit
+
+
+async def translate_text(text: str, target_lang: str) -> str:
+    from deep_translator import GoogleTranslator
+
+    def _run() -> str:
+        return GoogleTranslator(source="auto", target=target_lang).translate(text)
+
+    return await asyncio.to_thread(_run)
+
+
+# ── Markdown → plain text ────────────────────────────────────────────────────
+
+def markdown_to_plain_text(md: str) -> str:
+    """Strip common Markdown syntax, leaving readable plain text."""
+    text = md
+    text = re.sub(r"!\[.*?\]\(.*?\)", "", text)                    # images
+    text = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", text)                 # links
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)      # headers
+    text = re.sub(r"(\*\*|__)(.*?)\1", r"\2", text, flags=re.DOTALL)  # bold
+    text = re.sub(r"(?<!\*)\*(?!\*)(.*?)\*(?!\*)", r"\1", text)     # italics *
+    text = re.sub(r"(?<!_)_(?!_)(.*?)_(?!_)", r"\1", text)          # italics _
+    text = re.sub(r"`{1,3}(.*?)`{1,3}", r"\1", text, flags=re.DOTALL)  # code
+    text = re.sub(r"^\s*>\s?", "", text, flags=re.MULTILINE)        # blockquotes
+    text = re.sub(r"^\s*[-*+]\s+", "- ", text, flags=re.MULTILINE)  # bullets
+    text = re.sub(r"\n{3,}", "\n\n", text)                          # extra blank lines
+    return text.strip()
+
+
 # ── Lummi ────────────────────────────────────────────────────────────────────
 
 def find_lummi_cid(page_html: str, slug: str) -> str | None:
@@ -367,7 +554,30 @@ def format_svg(svg: str) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
-        await update.message.reply_text(WELCOME_MESSAGE, parse_mode="Markdown")
+        context.user_data.pop("awaiting", None)
+        await update.message.reply_text(
+            WELCOME_MESSAGE,
+            parse_mode="Markdown",
+            reply_markup=build_main_menu_keyboard(),
+        )
+
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        await update.message.reply_text(
+            MENU_INTRO,
+            parse_mode="Markdown",
+            reply_markup=build_main_menu_keyboard(),
+        )
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        had_task = context.user_data.pop("awaiting", None) is not None
+        context.user_data.pop("target_lang", None)
+        await update.message.reply_text(
+            "✅ Cancelled." if had_task else "Nothing to cancel."
+        )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -381,6 +591,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "• `https://hugeicons.com/icon/...`\n\n"
             "*Images:*\n"
             "Send any photo → choose from 32 effects!\n\n"
+            "*Tools (via /menu):*\n"
+            "🧹 Remove background • 🌐 Translate text\n"
+            "📄 PDF → Images • 🖼 Image → PDF\n"
+            "🔁 JPEG ↔ PNG • 📝 MD → TXT\n\n"
             "*Effects:*\n"
             + "  ".join(label for _, label in EFFECTS),
             parse_mode="Markdown",
@@ -444,12 +658,21 @@ async def process_hugeicons(update: Update, status_message: Any, url: str) -> No
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """User sent a photo — ask which effect to apply."""
+    """User sent a photo (compressed). Routes to whichever tool is pending,
+    defaulting to the 32-effect picker if nothing is pending."""
     if not update.message or not update.message.photo:
         return
+
+    awaiting = context.user_data.get("awaiting")
     photo = update.message.photo[-1]  # highest resolution
     file_id = photo.file_id
 
+    if awaiting in ("bgremove", "img2pdf", "jpg2png", "png2jpg"):
+        await _run_image_tool(update, context, file_id, awaiting)
+        context.user_data.pop("awaiting", None)
+        return
+
+    # Default behaviour: show the effect picker (backwards compatible).
     # Store the real (long) file_id under a short token, and only ever
     # put the token in callback_data. This avoids Telegram's 64-byte
     # callback_data limit, which raw file_ids blow past on their own.
@@ -467,6 +690,139 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
+
+
+async def _run_image_tool(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    file_id: str,
+    tool: str,
+) -> None:
+    """Shared implementation for bgremove / img2pdf / jpg2png / png2jpg,
+    usable from both photo and document uploads."""
+    labels = {
+        "bgremove": "Removing background",
+        "img2pdf": "Converting to PDF",
+        "jpg2png": "Converting to PNG",
+        "png2jpg": "Converting to JPEG",
+    }
+    status_message = await update.message.reply_text(f"⏳ {labels.get(tool, 'Processing')}…")
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        if tg_file.file_size and tg_file.file_size > BOT_DOWNLOAD_LIMIT_BYTES:
+            await safe_edit(status_message, "❌ That file is too large for me to download (20 MB limit).")
+            return
+        buf = BytesIO()
+        await tg_file.download_to_memory(buf)
+        image_bytes = buf.getvalue()
+
+        if tool == "bgremove":
+            out_bytes = await remove_background(image_bytes)
+            filename = "background_removed.png"
+        elif tool == "img2pdf":
+            out_bytes = await image_to_pdf(image_bytes)
+            filename = "image.pdf"
+        elif tool == "jpg2png":
+            out_bytes = await convert_image_format(image_bytes, "PNG")
+            filename = "converted.png"
+        elif tool == "png2jpg":
+            out_bytes = await convert_image_format(image_bytes, "JPEG")
+            filename = "converted.jpg"
+        else:
+            await safe_edit(status_message, "❌ Unknown tool.")
+            return
+
+        document = BytesIO(out_bytes)
+        document.name = filename
+        await update.message.reply_document(document=document, filename=filename)
+        await safe_delete(status_message)
+    except Exception as exc:
+        logger.warning("%s failed: %s", tool, exc)
+        await safe_edit(status_message, f"❌ Failed: {exc}")
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles file uploads for pdf2img, img2pdf, jpg2png, png2jpg, md2txt.
+
+    Sending as a "File" (rather than a compressed photo) is required for
+    PNG round-trips and PDFs, since Telegram auto-converts compressed
+    photos to JPEG.
+    """
+    if not update.message or not update.message.document:
+        return
+
+    doc = update.message.document
+    awaiting = context.user_data.get("awaiting")
+    file_name = (doc.file_name or "").lower()
+
+    if not awaiting:
+        await update.message.reply_text(
+            "Please choose a tool first with /menu, then send the file."
+        )
+        return
+
+    if awaiting in ("bgremove", "img2pdf", "jpg2png", "png2jpg"):
+        await _run_image_tool(update, context, doc.file_id, awaiting)
+        context.user_data.pop("awaiting", None)
+        return
+
+    if awaiting == "pdf2img":
+        if not (file_name.endswith(".pdf") or doc.mime_type == "application/pdf"):
+            await update.message.reply_text("⚠️ That doesn't look like a PDF. Please send a .pdf file.")
+            return
+        status_message = await update.message.reply_text("⏳ Rendering PDF pages…")
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            if tg_file.file_size and tg_file.file_size > BOT_DOWNLOAD_LIMIT_BYTES:
+                await safe_edit(status_message, "❌ That PDF is too large for me to download (20 MB limit).")
+                return
+            buf = BytesIO()
+            await tg_file.download_to_memory(buf)
+            pages = await pdf_to_images(buf.getvalue())
+            if not pages:
+                await safe_edit(status_message, "❌ Couldn't render any pages from that PDF.")
+                return
+            await safe_delete(status_message)
+            # Send in batches of 10 (Telegram media group limit).
+            for batch_start in range(0, len(pages), 10):
+                batch = pages[batch_start:batch_start + 10]
+                media = [InputMediaPhoto(BytesIO(p)) for p in batch]
+                await update.message.reply_media_group(media=media)
+            if len(pages) >= PDF2IMG_MAX_PAGES:
+                await update.message.reply_text(
+                    f"ℹ️ Only the first {PDF2IMG_MAX_PAGES} pages were rendered."
+                )
+        except Exception as exc:
+            logger.warning("pdf2img failed: %s", exc)
+            await safe_edit(status_message, f"❌ Failed to convert PDF: {exc}")
+        finally:
+            context.user_data.pop("awaiting", None)
+        return
+
+    if awaiting == "md2txt":
+        if not file_name.endswith(".md"):
+            await update.message.reply_text("⚠️ Please send a .md (Markdown) file.")
+            return
+        status_message = await update.message.reply_text("⏳ Converting…")
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            buf = BytesIO()
+            await tg_file.download_to_memory(buf)
+            md_text = buf.getvalue().decode("utf-8", errors="replace")
+            plain_text = markdown_to_plain_text(md_text)
+            out_name = re.sub(r"\.md$", ".txt", doc.file_name or "output.md", flags=re.IGNORECASE)
+            document = BytesIO(plain_text.encode("utf-8"))
+            document.name = out_name
+            await update.message.reply_document(document=document, filename=out_name)
+            await safe_delete(status_message)
+        except Exception as exc:
+            logger.warning("md2txt failed: %s", exc)
+            await safe_edit(status_message, f"❌ Failed to convert file: {exc}")
+        finally:
+            context.user_data.pop("awaiting", None)
+        return
+
+    await update.message.reply_text("Please choose a tool first with /menu.")
 
 
 async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -529,11 +885,117 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
         await safe_edit(status_msg, f"❌ Failed to apply effect: {exc}")
 
 
+async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User tapped a button in the main tool menu."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, action = query.data.split("|", 1)
+    except ValueError:
+        await query.edit_message_text("❌ Invalid selection.")
+        return
+
+    if action == "effects":
+        context.user_data.pop("awaiting", None)
+        await query.edit_message_text("🎨 Send me a *photo* and pick an effect from the keyboard.", parse_mode="Markdown")
+    elif action == "bgremove":
+        context.user_data["awaiting"] = "bgremove"
+        await query.edit_message_text("🧹 Send me a *photo* and I'll remove its background.", parse_mode="Markdown")
+    elif action == "translate":
+        await query.edit_message_text(
+            "🌐 *Choose the target language:*",
+            parse_mode="Markdown",
+            reply_markup=build_translate_lang_keyboard(),
+        )
+    elif action == "pdf2img":
+        context.user_data["awaiting"] = "pdf2img"
+        await query.edit_message_text(
+            f"📄 Send me a *PDF file* — I'll render up to {PDF2IMG_MAX_PAGES} pages as images.",
+            parse_mode="Markdown",
+        )
+    elif action == "img2pdf":
+        context.user_data["awaiting"] = "img2pdf"
+        await query.edit_message_text("🖼 Send me an *image* (photo or file) and I'll wrap it into a PDF.", parse_mode="Markdown")
+    elif action == "jpg2png":
+        context.user_data["awaiting"] = "jpg2png"
+        await query.edit_message_text(
+            "🔁 Send me a *JPEG image* — for best quality, send it as a *file* (📎 → File), not a compressed photo.",
+            parse_mode="Markdown",
+        )
+    elif action == "png2jpg":
+        context.user_data["awaiting"] = "png2jpg"
+        await query.edit_message_text(
+            "🔁 Send me a *PNG image* as a *file* (📎 → File) — compressed photos are auto-converted to JPEG by Telegram already.",
+            parse_mode="Markdown",
+        )
+    elif action == "md2txt":
+        context.user_data["awaiting"] = "md2txt"
+        await query.edit_message_text("📝 Send me a *.md file* and I'll convert it to plain *.txt*.", parse_mode="Markdown")
+    else:
+        await query.edit_message_text("❌ Unknown option.")
+
+
+async def handle_translate_lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User picked a target language for translation."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, lang_code = query.data.split("|", 1)
+    except ValueError:
+        await query.edit_message_text("❌ Invalid selection.")
+        return
+
+    lang_label = next((label for code, label in TRANSLATE_LANGUAGES if code == lang_code), lang_code)
+    context.user_data["awaiting"] = "translate_text"
+    context.user_data["target_lang"] = lang_code
+    await query.edit_message_text(
+        f"✏️ Send me the text you'd like translated to *{lang_label}*.",
+        parse_mode="Markdown",
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
 
     raw_text = update.message.text
+
+    # Greetings (hi/hello/hey/etc.) open the main menu, same as /start.
+    if GREETING_RE.match(raw_text.strip()):
+        context.user_data.pop("awaiting", None)
+        await update.message.reply_text(
+            WELCOME_MESSAGE,
+            parse_mode="Markdown",
+            reply_markup=build_main_menu_keyboard(),
+        )
+        return
+
+    # Pending translation request takes priority over link detection.
+    if context.user_data.get("awaiting") == "translate_text":
+        target_lang = context.user_data.get("target_lang", "en")
+        text_to_translate = raw_text.strip()
+        if not text_to_translate:
+            await update.message.reply_text("Please send some text to translate.")
+            return
+        if len(text_to_translate) > TRANSLATE_MAX_CHARS:
+            await update.message.reply_text(
+                f"⚠️ That's too long ({len(text_to_translate)} chars). "
+                f"Please send under {TRANSLATE_MAX_CHARS} characters."
+            )
+            return
+        status_message = await update.message.reply_text("🌐 Translating…")
+        try:
+            translated = await translate_text(text_to_translate, target_lang)
+            await safe_edit(status_message, f"✅ *Translation:*\n\n{translated}", parse_mode="Markdown")
+        except Exception as exc:
+            logger.warning("Translation failed: %s", exc)
+            await safe_edit(status_message, "❌ Sorry, translation failed. Please try again.")
+        context.user_data.pop("awaiting", None)
+        context.user_data.pop("target_lang", None)
+        return
+
     lummi_match = LUMMI_URL_RE.search(raw_text)
     url = trim_url(lummi_match.group(0)) if lummi_match else None
     platform = "lummi" if url else None
@@ -583,8 +1045,13 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(CallbackQueryHandler(handle_effect_callback, pattern=r"^fx\|"))
+    application.add_handler(CallbackQueryHandler(handle_menu_callback, pattern=r"^menu\|"))
+    application.add_handler(CallbackQueryHandler(handle_translate_lang_callback, pattern=r"^trlang\|"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
 

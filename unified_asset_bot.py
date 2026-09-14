@@ -1,12 +1,28 @@
-"""BangaliIcon Bot — single-file build.
+"""BangaliIcon Bot — single-file build (v2: activity tracking + admin controls).
 
 Everything (main bot + all helper "modules") lives in this one .py file for
 easy deployment. The former storage.py / qr_tools.py / password_tools.py /
 image_extra.py modules are embedded below as source strings and loaded into
-real module objects at import time via `_load_embedded_module()`, so the
-rest of the code still calls them exactly as `storage.xxx(...)`,
-`qr_tools.xxx(...)`, etc. Nothing about their behavior changes, only where
-the source text lives.
+real module objects at import time via `_load_embedded_module()`.
+
+WHAT'S NEW IN THIS VERSION
+  • storage.record_usage() now also logs WHO did WHAT and WHEN (per-user
+    activity log), not just a global tool counter.
+  • /stats is now a visual dashboard: bar-style counts per tool + a
+    "Top users" leaderboard with clickable usernames.
+  • /useractivity <chat_id|@user> — admin-only, see one user's recent actions.
+  • NEW self-service flow: /requestlimit <n> — any user can ask for a higher
+    heavy-tool limit. This immediately DMs every admin/super-admin with the
+    requester's @username AND numeric chat_id (both are required — you can't
+    set a limit for someone without their chat_id) plus inline
+    Approve / Deny buttons.
+  • /pendingrequests — admin-only, list open limit requests.
+  • /blockuser, /unblockuser — super-admin-only quick actions.
+  • Admin roster links fixed or the correct current telegram handles.
+  • translate_text() retries Google Translate with backoff (2s, then 4s) on
+    rate-limit style failures, then falls back to MyMemory (a separate free
+    provider with its own quota) before giving up. Users get a clear
+    "temporarily rate-limited" message instead of a generic failure.
 
 Run:
     pip install -r requirements.txt  (python-telegram-bot, httpx, beautifulsoup4,
@@ -23,11 +39,6 @@ import types
 
 
 def _load_embedded_module(name: str, source: str) -> types.ModuleType:
-    """Compile `source` as a standalone module named `name` and return it,
-    so the rest of this file can do `storage.get_words(...)` etc. exactly
-    as if it were a real import — each embedded module keeps its own
-    isolated namespace, so there's no risk of name collisions between them
-    or with the main bot code below."""
     module = types.ModuleType(name)
     module.__file__ = f"<embedded:{name}>"
     exec(compile(source, f"<embedded:{name}>", "exec"), module.__dict__)
@@ -37,15 +48,15 @@ def _load_embedded_module(name: str, source: str) -> types.ModuleType:
 _STORAGE_SOURCE = r'''
 """storage.py — lightweight JSON-backed persistence for the bot.
 
-Everything here is intentionally dependency-free (no SQLite/Redis) so it
-drops into a small Render instance with zero extra setup. All writes go
-through a single asyncio.Lock and are flushed atomically (write to temp
-file, then os.replace) so a crash mid-write never corrupts the store.
-
 Layout on disk (single DATA_DIR, one file per concern):
-  data/custom_words.json   {chat_id: {word: replacement}}
-  data/usage_stats.json    {tool_name: count}
-  data/watermarks.json     {chat_id: file_id}
+  data/custom_words.json    {chat_id: {word: replacement}}
+  data/usage_stats.json     {tool_name: count}
+  data/user_activity.json   {chat_id: {"username": str|null, "counts": {tool: n},
+                                        "last_seen": ts, "log": [{"tool","ts"}]}}
+  data/watermarks.json      {chat_id: file_id}
+  data/custom_limits.json   {chat_id: int}
+  data/limit_requests.json  {chat_id: {"username","requested","ts"}}
+  data/blocked_users.json   [chat_id, ...]
 """
 
 from __future__ import annotations
@@ -60,12 +71,18 @@ from typing import Deque
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-CUSTOM_WORDS_PATH = os.path.join(DATA_DIR, "custom_words.json")
-USAGE_STATS_PATH  = os.path.join(DATA_DIR, "usage_stats.json")
-WATERMARKS_PATH   = os.path.join(DATA_DIR, "watermarks.json")
+CUSTOM_WORDS_PATH   = os.path.join(DATA_DIR, "custom_words.json")
+USAGE_STATS_PATH    = os.path.join(DATA_DIR, "usage_stats.json")
+USER_ACTIVITY_PATH  = os.path.join(DATA_DIR, "user_activity.json")
+WATERMARKS_PATH     = os.path.join(DATA_DIR, "watermarks.json")
+CUSTOM_LIMITS_PATH  = os.path.join(DATA_DIR, "custom_limits.json")
+LIMIT_REQUESTS_PATH = os.path.join(DATA_DIR, "limit_requests.json")
+BLOCKED_USERS_PATH  = os.path.join(DATA_DIR, "blocked_users.json")
 
 MAX_WORDS_PER_USER = 100
-RESERVED_WORDS = {"fiverr"}  # never allow overriding the platform's own name entirely blank
+RESERVED_WORDS = {"fiverr"}
+
+MAX_LOG_ENTRIES_PER_USER = 50  # keep the per-user action log bounded
 
 _lock = asyncio.Lock()
 
@@ -80,7 +97,17 @@ def _load(path: str) -> dict:
         return {}
 
 
-def _save(path: str, data: dict) -> None:
+def _load_list(path: str) -> list:
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save(path: str, data) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -133,19 +160,63 @@ async def reset_words(chat_id: int) -> None:
             _save(CUSTOM_WORDS_PATH, data)
 
 
-# ── Usage stats ───────────────────────────────────────────────────────────────
+# ── Usage stats (global counters + per-user activity) ─────────────────────────
 
-async def record_usage(tool_name: str) -> None:
+async def record_usage(tool_name: str, chat_id: int | None = None, username: str | None = None) -> None:
+    """Bumps the global per-tool counter AND, when chat_id is given, records
+    who did it (username + chat_id) so /stats and /useractivity can show a
+    real per-user breakdown, not just an anonymous total."""
+    now = time.time()
     async with _lock:
         data = _load(USAGE_STATS_PATH)
         data[tool_name] = data.get(tool_name, 0) + 1
         _save(USAGE_STATS_PATH, data)
+
+        if chat_id is not None:
+            activity = _load(USER_ACTIVITY_PATH)
+            entry = activity.setdefault(str(chat_id), {
+                "username": username,
+                "counts": {},
+                "last_seen": now,
+                "log": [],
+            })
+            if username:
+                entry["username"] = username  # keep freshest known username
+            entry["counts"][tool_name] = entry["counts"].get(tool_name, 0) + 1
+            entry["last_seen"] = now
+            entry["log"].append({"tool": tool_name, "ts": now})
+            entry["log"] = entry["log"][-MAX_LOG_ENTRIES_PER_USER:]
+            _save(USER_ACTIVITY_PATH, activity)
 
 
 async def get_stats() -> list[tuple[str, int]]:
     async with _lock:
         data = _load(USAGE_STATS_PATH)
     return sorted(data.items(), key=lambda kv: kv[1], reverse=True)
+
+
+async def get_user_activity_all() -> dict:
+    async with _lock:
+        return _load(USER_ACTIVITY_PATH)
+
+
+async def get_user_activity(chat_id: int) -> dict | None:
+    async with _lock:
+        data = _load(USER_ACTIVITY_PATH)
+        return data.get(str(chat_id))
+
+
+async def find_chat_id_by_username(username: str) -> int | None:
+    """Best-effort lookup of a chat_id from a known @username, searched across
+    everyone who has ever triggered record_usage (not just admins)."""
+    username = username.strip().lstrip("@").lower()
+    async with _lock:
+        data = _load(USER_ACTIVITY_PATH)
+    for cid, entry in data.items():
+        uname = (entry.get("username") or "").lower()
+        if uname == username:
+            return int(cid)
+    return None
 
 
 # ── Watermark image (per user) ────────────────────────────────────────────────
@@ -171,8 +242,7 @@ async def clear_watermark(chat_id: int) -> None:
             _save(WATERMARKS_PATH, data)
 
 
-# ── Rate limiting (in-memory, per-process — fine for a single Render instance) ─
-# Sliding-window counter: keeps a deque of call timestamps per (chat_id, bucket).
+# ── Rate limiting (in-memory sliding window + persisted overrides) ────────────
 
 RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_HEAVY_MAX_CALLS = 5
@@ -180,19 +250,14 @@ RATE_LIMIT_HEAVY_MAX_CALLS = 5
 _heavy_call_log: dict[int, Deque[float]] = defaultdict(deque)
 _rate_lock = asyncio.Lock()
 
-# Global concurrency cap for CPU-bound jobs (bgremove, effects, doc renders).
 HEAVY_JOB_SEMAPHORE = asyncio.Semaphore(3)
 
 HEAVY_TOOLS = {
     "bgremove", "effects", "pptx2images", "pdf2img", "watermark", "compress",
 }
 
-CUSTOM_LIMITS_PATH = os.path.join(DATA_DIR, "custom_limits.json")
-
 
 async def set_custom_limit(chat_id: int, max_calls: int | None) -> None:
-    """Admin-set override for one user's heavy-tool limit (per 60s window).
-    Pass None to remove the override and fall back to the default."""
     async with _lock:
         data = _load(CUSTOM_LIMITS_PATH)
         if max_calls is None:
@@ -213,10 +278,31 @@ async def _effective_limit(chat_id: int) -> int:
     return custom if custom is not None else RATE_LIMIT_HEAVY_MAX_CALLS
 
 
+async def is_blocked(chat_id: int) -> bool:
+    async with _lock:
+        blocked = _load_list(BLOCKED_USERS_PATH)
+        return chat_id in blocked
+
+
+async def block_user(chat_id: int) -> None:
+    async with _lock:
+        blocked = _load_list(BLOCKED_USERS_PATH)
+        if chat_id not in blocked:
+            blocked.append(chat_id)
+            _save(BLOCKED_USERS_PATH, blocked)
+    await set_custom_limit(chat_id, 0)
+
+
+async def unblock_user(chat_id: int) -> None:
+    async with _lock:
+        blocked = _load_list(BLOCKED_USERS_PATH)
+        if chat_id in blocked:
+            blocked.remove(chat_id)
+            _save(BLOCKED_USERS_PATH, blocked)
+    await set_custom_limit(chat_id, None)
+
+
 async def check_rate_limit(chat_id: int, exempt: bool = False) -> tuple[bool, float]:
-    """Returns (allowed, seconds_to_wait_if_not_allowed).
-    `exempt=True` (admins/super-admins) always allows and skips the log —
-    admin usage never counts against anyone's window."""
     if exempt:
         return True, 0.0
     limit = await _effective_limit(chat_id)
@@ -235,7 +321,6 @@ async def check_rate_limit(chat_id: int, exempt: bool = False) -> tuple[bool, fl
 
 
 async def calls_used(chat_id: int) -> tuple[int, int]:
-    """Returns (calls_used_in_window, effective_limit) — for a /mylimit style check."""
     limit = await _effective_limit(chat_id)
     now = time.monotonic()
     async with _rate_lock:
@@ -244,15 +329,36 @@ async def calls_used(chat_id: int) -> tuple[int, int]:
             log.popleft()
         return len(log), limit
 
+
+# ── Limit-increase requests (self-service, needs admin approval) ─────────────
+
+async def add_limit_request(chat_id: int, username: str | None, requested: int) -> None:
+    async with _lock:
+        data = _load(LIMIT_REQUESTS_PATH)
+        data[str(chat_id)] = {
+            "username": username,
+            "requested": requested,
+            "ts": time.time(),
+        }
+        _save(LIMIT_REQUESTS_PATH, data)
+
+
+async def get_limit_requests() -> dict:
+    async with _lock:
+        return _load(LIMIT_REQUESTS_PATH)
+
+
+async def remove_limit_request(chat_id: int) -> None:
+    async with _lock:
+        data = _load(LIMIT_REQUESTS_PATH)
+        if str(chat_id) in data:
+            del data[str(chat_id)]
+            _save(LIMIT_REQUESTS_PATH, data)
+
 '''
 
 _QR_TOOLS_SOURCE = r'''
-"""qr_tools.py — QR code generation and scanning.
-
-Generation uses the pure-Python `qrcode` library (no system deps).
-Scanning uses OpenCV's built-in QRCodeDetector so we avoid apt-installing
-libzbar on Render — opencv-python-headless is enough.
-"""
+"""qr_tools.py — QR code generation and scanning."""
 
 from __future__ import annotations
 
@@ -261,17 +367,11 @@ from io import BytesIO
 
 
 async def generate_qr(text: str) -> bytes:
-    """Render `text` as a PNG QR code and return the raw bytes."""
     import qrcode
     from qrcode.constants import ERROR_CORRECT_M
 
     def _run() -> bytes:
-        qr = qrcode.QRCode(
-            version=None,
-            error_correction=ERROR_CORRECT_M,
-            box_size=10,
-            border=4,
-        )
+        qr = qrcode.QRCode(version=None, error_correction=ERROR_CORRECT_M, box_size=10, border=4)
         qr.add_data(text)
         qr.make(fit=True)
         img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
@@ -283,8 +383,6 @@ async def generate_qr(text: str) -> bytes:
 
 
 async def scan_qr(image_bytes: bytes) -> list[str]:
-    """Decode any QR codes found in `image_bytes`. Returns a list of strings
-    (empty if none found). Handles multiple codes in one image."""
     import cv2
     import numpy as np
 
@@ -295,7 +393,6 @@ async def scan_qr(image_bytes: bytes) -> list[str]:
             raise ValueError("Could not decode that image.")
         detector = cv2.QRCodeDetector()
         found = []
-        # multi-code path first, fall back to single-code detection
         try:
             ok, decoded_info, _, _ = detector.detectAndDecodeMulti(img)
             if ok:
@@ -313,11 +410,7 @@ async def scan_qr(image_bytes: bytes) -> list[str]:
 '''
 
 _PASSWORD_TOOLS_SOURCE = r'''
-"""password_tools.py — secure password / PIN generation.
-
-Uses `secrets` (CSPRNG), never `random`, since output is meant to be
-actually usable as a real password.
-"""
+"""password_tools.py — secure password / PIN generation."""
 
 from __future__ import annotations
 
@@ -356,21 +449,15 @@ def generate_password(
     if use_symbols:
         pools.append(SYMBOLS)
     if not pools:
-        pools = [LOWER, DIGITS]  # sane fallback if user disabled everything
+        pools = [LOWER, DIGITS]
 
     if no_ambiguous:
-        pools = [
-            "".join(c for c in pool if c not in AMBIGUOUS_CHARS) or pool
-            for pool in pools
-        ]
+        pools = ["".join(c for c in pool if c not in AMBIGUOUS_CHARS) or pool for pool in pools]
 
     alphabet = "".join(pools)
-
-    # Guarantee at least one char from each selected pool, then fill the rest.
     required = [secrets.choice(pool) for pool in pools]
     remaining = [secrets.choice(alphabet) for _ in range(length - len(required))]
     chars = required + remaining
-    # Shuffle securely (Fisher–Yates using secrets.randbelow).
     for i in range(len(chars) - 1, 0, -1):
         j = secrets.randbelow(i + 1)
         chars[i], chars[j] = chars[j], chars[i]
@@ -384,17 +471,14 @@ def generate_pin(length: int = 4) -> str:
 '''
 
 _IMAGE_EXTRA_SOURCE = r'''
-"""image_extra.py — watermarking and size-targeted compression.
-
-Both are pure Pillow, run in a thread to keep the event loop free.
-"""
+"""image_extra.py — watermarking and size-targeted compression."""
 
 from __future__ import annotations
 
 import asyncio
 from io import BytesIO
 
-DEFAULT_WATERMARK_SCALE   = 0.15  # watermark width as a fraction of base image width
+DEFAULT_WATERMARK_SCALE   = 0.15
 DEFAULT_WATERMARK_OPACITY = 0.60
 DEFAULT_MARGIN_PX         = 16
 
@@ -410,7 +494,6 @@ def _compute_position(pos: str, base_w: int, base_h: int, wm_w: int, wm_h: int, 
         return margin, base_h - wm_h - margin
     if pos == "center":
         return (base_w - wm_w) // 2, (base_h - wm_h) // 2
-    # default bottom-right
     return base_w - wm_w - margin, base_h - wm_h - margin
 
 
@@ -451,39 +534,32 @@ async def apply_watermark(
 
 
 async def compress_to_target(image_bytes: bytes, target_bytes: int) -> bytes:
-    """Iteratively reduce JPEG quality, then downscale, until under target_bytes."""
     from PIL import Image, ImageOps
 
     def _run() -> bytes:
         img = ImageOps.exif_transpose(Image.open(BytesIO(image_bytes))).convert("RGB")
 
-        # First pass: quality ladder at original size.
         for quality in (95, 85, 75, 65, 55, 45, 35, 25):
             buf = BytesIO()
             img.save(buf, format="JPEG", quality=quality, optimize=True)
             if buf.tell() <= target_bytes:
                 return buf.getvalue()
 
-        # Second pass: progressively downscale, keep trying qualities.
         current = img
         for _ in range(6):
-            current = current.resize(
-                (max(1, int(current.width * 0.8)), max(1, int(current.height * 0.8)))
-            )
+            current = current.resize((max(1, int(current.width * 0.8)), max(1, int(current.height * 0.8))))
             for quality in (75, 60, 45, 30):
                 buf = BytesIO()
                 current.save(buf, format="JPEG", quality=quality, optimize=True)
                 if buf.tell() <= target_bytes:
                     return buf.getvalue()
 
-        # Best effort — return the smallest we achieved.
         return buf.getvalue()
 
     return await asyncio.to_thread(_run)
 
 
 def parse_size_to_bytes(text: str) -> int | None:
-    """Parse '500kb', '1mb', '750000' → bytes. Returns None if unparseable."""
     text = text.strip().lower().replace(" ", "")
     try:
         if text.endswith("kb"):
@@ -507,24 +583,6 @@ image_extra = _load_embedded_module("image_extra", _IMAGE_EXTRA_SOURCE)
 # ════════════════════════════════════════════════════════════════════════════
 #  MAIN BOT CODE (originally bot.py) starts here
 # ════════════════════════════════════════════════════════════════════════════
-
-"""Unified Lummi AI + Hugeicons + Image Effects + Fiver Sanitizer Telegram bot.
-
-Upgrades vs previous version:
-  • Sticker & GIF support (WebP sticker → PNG, animated GIF → frames)
-  • Centralised retry logic with exponential back-off for HTTP calls
-  • Typed FileRouter to eliminate duplicated awaiting-state dispatch
-  • connection-pooled AsyncClient (one client per process, not per call)
-  • Graceful shutdown: HTTP client closed + pending_files pruned on bot shutdown (FIXED — now actually wired up)
-  • Guard against stale "awaiting" state when the wrong media type is sent (FIXED)
-  • Richer error messages with user-facing hints
-  • NEW: /FiverMessage — sanitizes text (replaces flagged words) via command or guided prompt
-  • NEW: personal custom word list (/addword, /mywords, /delword, /resetwords)
-  • NEW: per-user rate limiting + global concurrency cap for CPU-bound tools
-  • NEW: /stats admin usage dashboard + admin error alerts
-  • NEW: QR generate/scan, password/PIN generator, image compressor, watermarking
-  • Minor code cleanup: dead imports removed, constants consolidated
-"""
 
 import asyncio
 import base64
@@ -566,16 +624,18 @@ BOT_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 PDF2IMG_MAX_PAGES       = 20
 MAX_PENDING_FILES       = 500
 TRANSLATE_MAX_CHARS     = 4_500
+MYMEMORY_MAX_CHARS      = 500  # MyMemory free tier hard limit per request
 FIVER_SANITIZE_MAX_CHARS = 4_500
 REMBG_MAX_DIMENSION     = 1_500
 REMBG_TIMEOUT_SECONDS   = 90
-GIF_MAX_FRAMES          = 10   # frames extracted from animated GIF
-GIF_FRAME_DELAY_MS      = 100  # default frame delay when not embedded
+GIF_MAX_FRAMES          = 10
+GIF_FRAME_DELAY_MS      = 100
 DEFAULT_COMPRESS_TARGET_BYTES = 1 * 1024 * 1024
+MAX_LIMIT_REQUEST_VALUE = 100  # sanity ceiling on what a user can request
 
 REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
 HTTP_RETRY_ATTEMPTS = 3
-HTTP_RETRY_BACKOFF  = 1.5  # seconds; doubles on each retry
+HTTP_RETRY_BACKOFF  = 1.5
 
 ENGINE_SCRIPT = os.path.join(os.path.dirname(__file__), "python_engine.py")
 
@@ -585,13 +645,13 @@ U2NETP_MODEL_PATH = os.path.join(tempfile.gettempdir(), "u2netp.onnx")
 
 # ── Admin roster ────────────────────────────────────────────────────────────
 # Two tiers, identified by Telegram @username (case-insensitive, no '@').
-# Super admins can do everything admins can, plus anything gated on
-# is_super_admin() in the future (e.g. destructive/global actions).
+# `telegram` holds a direct t.me deep-link so admin cards/messages can be
+# tapped straight through instead of just showing a bare @handle.
 SUPER_ADMINS: dict[str, dict[str, str]] = {
     "ya_rabbu": {
         "name": "Yasir Abed Rabbu",
         "email": "yasirabedrabbu@gmail.com",
-        "telegram": "*@YA_Rabbu*",
+        "telegram": "https://t.me/YA_Rabbu",
     },
 }
 
@@ -599,14 +659,10 @@ ADMINS: dict[str, dict[str, str]] = {
     "smashik_softvence": {
         "name": "Sheikh Muhammad Ashik",
         "email": "smashik716@gmail.com",
-        "telegram": "*@smashik_softvence*",
+        "telegram": "https://t.me/smashik_softvence",
     },
 }
 
-# chat_id fallback — populated the first time an admin/super-admin messages
-# the bot, so notify_admin() can DM them even before we've resolved a
-# username → chat_id mapping any other way. Also settable via ADMIN_CHAT_ID
-# env var for backward compatibility (goes to the super admin group).
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
 _admin_chat_ids: dict[str, int] = {}  # username(lower) -> chat_id
 
@@ -619,13 +675,22 @@ def _username_of(update: Update) -> str | None:
     return (user.username or "").lower() if user and user.username else None
 
 
+def _display_name(update: Update) -> str:
+    """Best-effort human label for notifications: @username, else first name, else chat_id."""
+    user = update.effective_user
+    if user and user.username:
+        return f"@{user.username}"
+    if user and user.first_name:
+        return user.first_name
+    return f"id:{update.effective_chat.id}"
+
+
 def is_super_admin(update: Update) -> bool:
     uname = _username_of(update)
     return uname is not None and uname in SUPER_ADMINS
 
 
 def is_admin(update: Update) -> bool:
-    """True for super admins and admins alike."""
     uname = _username_of(update)
     return uname is not None and (uname in SUPER_ADMINS or uname in ADMINS)
 
@@ -639,7 +704,6 @@ def admin_role_label(update: Update) -> str:
 
 
 def _remember_admin_chat_id(update: Update) -> None:
-    """Cache chat_id for known admins so notify_admin() can reach them by DM."""
     uname = _username_of(update)
     if uname and (uname in SUPER_ADMINS or uname in ADMINS) and update.effective_chat:
         _admin_chat_ids[uname] = update.effective_chat.id
@@ -680,11 +744,7 @@ _http_client: httpx.AsyncClient | None = None
 def get_http_client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(
-            headers=HEADERS,
-            timeout=REQUEST_TIMEOUT,
-            follow_redirects=True,
-        )
+        _http_client = httpx.AsyncClient(headers=HEADERS, timeout=REQUEST_TIMEOUT, follow_redirects=True)
     return _http_client
 
 
@@ -702,7 +762,6 @@ async def with_retry(
     attempts: int = HTTP_RETRY_ATTEMPTS,
     backoff: float = HTTP_RETRY_BACKOFF,
 ) -> Any:
-    """Call `fn` up to `attempts` times, with exponential back-off on transient errors."""
     last_exc: Exception | None = None
     for attempt in range(attempts):
         try:
@@ -718,24 +777,27 @@ async def with_retry(
 
 # ── Admin alerting ────────────────────────────────────────────────────────────
 
-async def notify_admin(context: ContextTypes.DEFAULT_TYPE, error_key: str, message: str) -> None:
-    """Send a short technical error to every known admin chat, throttled per
-    error_key so a recurring failure doesn't spam admins more than once per
-    window. Reaches: the legacy ADMIN_CHAT_ID env var (if set) plus any
-    admin/super-admin whose chat_id we've learned from them messaging the bot."""
+async def notify_admin(context: ContextTypes.DEFAULT_TYPE, error_key: str, message: str,
+                        throttle: bool = True, reply_markup: InlineKeyboardMarkup | None = None) -> None:
+    """Send a message to every known admin chat. Technical error alerts are
+    throttled per error_key; user-facing admin actions (like a limit
+    request) pass throttle=False so they always go through."""
     targets = set(_admin_chat_ids.values())
     if ADMIN_CHAT_ID:
         targets.add(ADMIN_CHAT_ID)
     if not targets:
         return
-    now = asyncio.get_event_loop().time()
-    last = _last_admin_alert.get(error_key, 0)
-    if now - last < _ADMIN_ERROR_THROTTLE_SECONDS:
-        return
-    _last_admin_alert[error_key] = now
+    if throttle:
+        now = asyncio.get_event_loop().time()
+        last = _last_admin_alert.get(error_key, 0)
+        if now - last < _ADMIN_ERROR_THROTTLE_SECONDS:
+            return
+        _last_admin_alert[error_key] = now
     for chat_id in targets:
         try:
-            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {message}"[:4000])
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"⚠️ {message}"[:4000], reply_markup=reply_markup
+            )
         except Exception:
             logger.exception("Failed to notify admin chat_id=%s", chat_id)
 
@@ -841,8 +903,6 @@ def _preserve_case(original: str, replacement: str) -> str:
 
 
 def _build_patterns(word_map: dict[str, str]) -> list[tuple[str, re.Pattern]]:
-    """Sort longest-first so overlapping phrases (e.g. 'video call' vs 'call')
-    match correctly instead of the shorter word winning."""
     words_sorted = sorted(word_map.keys(), key=len, reverse=True)
     return [(w, re.compile(rf"\b{re.escape(w)}\b", re.IGNORECASE)) for w in words_sorted]
 
@@ -851,12 +911,6 @@ _FIVER_WORD_PATTERNS = _build_patterns(FIVER_WORD_MAP)
 
 
 def sanitize_fiver_text(text: str, custom_words: dict[str, str] | None = None) -> str:
-    """Replace flagged words/phrases with their obfuscated equivalents.
-
-    `custom_words`, when given, is merged on top of FIVER_WORD_MAP — the
-    user's own words win on conflict — and the combined map is what actually
-    gets applied.
-    """
     if custom_words:
         merged = {**FIVER_WORD_MAP, **custom_words}
         patterns = _build_patterns(merged)
@@ -899,7 +953,6 @@ MENU_INTRO = "🧰 *Select a tool*"
 # ── Keyboard builders ─────────────────────────────────────────────────────────
 
 def build_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Top-level menu — groups tools into categories."""
     rows = [
         [
             InlineKeyboardButton("🎨 Image Effects",   callback_data="menu|effects"),
@@ -944,10 +997,7 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-# ── Category sub-menus ────────────────────────────────────────────────────────
-
 def build_category_keyboard(cat: str) -> InlineKeyboardMarkup:
-    """Returns the sub-menu keyboard for a given tool category."""
     back = [InlineKeyboardButton("◀ Main Menu", callback_data="cat|back")]
 
     menus: dict[str, list[list[InlineKeyboardButton]]] = {
@@ -1046,10 +1096,7 @@ def build_effect_categories_keyboard(token: str) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
     for cat_key in EFFECT_CATEGORY_ORDER:
-        row.append(InlineKeyboardButton(
-            EFFECT_CATEGORIES[cat_key],
-            callback_data=f"fxcat|{cat_key}|{token}",
-        ))
+        row.append(InlineKeyboardButton(EFFECT_CATEGORIES[cat_key], callback_data=f"fxcat|{cat_key}|{token}"))
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -1114,6 +1161,15 @@ def build_genpass_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def build_limit_request_keyboard(chat_id: int, requested: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"limitreq|approve|{chat_id}|{requested}"),
+            InlineKeyboardButton("❌ Deny", callback_data=f"limitreq|deny|{chat_id}"),
+        ],
+    ])
+
+
 # ── Utility ───────────────────────────────────────────────────────────────────
 
 def trim_url(url: str) -> str:
@@ -1145,7 +1201,6 @@ def markdown_code_escape(text: str) -> str:
 
 
 def _user_hint(exc: Exception) -> str:
-    """Convert common internal errors to friendly user-facing hints."""
     msg = str(exc).lower()
     if "timeout" in msg:
         return "⏱ The operation timed out. Please try a smaller file or try again later."
@@ -1154,6 +1209,15 @@ def _user_hint(exc: Exception) -> str:
     if "memory" in msg or "oom" in msg:
         return "💾 The server ran low on memory. Try a smaller image."
     return f"❌ Something went wrong: {exc}"
+
+
+def _bar(count: int, max_count: int, width: int = 12) -> str:
+    """Tiny ASCII bar for the /stats dashboard."""
+    if max_count <= 0:
+        filled = 0
+    else:
+        filled = max(1, round((count / max_count) * width)) if count > 0 else 0
+    return "█" * filled + "░" * (width - filled)
 
 
 # ── Safe Telegram helpers ─────────────────────────────────────────────────────
@@ -1201,10 +1265,6 @@ def _drop_token(bot_data: dict, token: str) -> None:
 # ── Rate limiting decorator ────────────────────────────────────────────────────
 
 async def _check_heavy_rate_limit(update: Update, tool: str) -> bool:
-    """Returns True if allowed to proceed. Sends a friendly wait message and
-    returns False otherwise. Only applies to tools in storage.HEAVY_TOOLS.
-    Admins and super admins are exempt — their usage never counts against
-    anyone's window and they're never blocked."""
     if tool not in storage.HEAVY_TOOLS:
         return True
     chat_id = update.effective_chat.id
@@ -1212,12 +1272,24 @@ async def _check_heavy_rate_limit(update: Update, tool: str) -> bool:
     allowed, wait_seconds = await storage.check_rate_limit(chat_id, exempt=exempt)
     if not allowed:
         used, limit = await storage.calls_used(chat_id)
+        hint = ""
+        if limit <= 0:
+            hint = " You've been fully blocked by an admin."
         await update.effective_message.reply_text(
             f"⏳ Please wait ~{int(wait_seconds)}s before trying another heavy tool "
-            f"(used {used}/{limit} in the last {storage.RATE_LIMIT_WINDOW_SECONDS}s)."
+            f"(used {used}/{limit} in the last {storage.RATE_LIMIT_WINDOW_SECONDS}s).{hint}\n"
+            f"Need a higher limit? Try `/requestlimit <number>`.",
+            parse_mode="Markdown",
         )
         return False
     return True
+
+
+async def _record(context: ContextTypes.DEFAULT_TYPE, update: Update, tool: str) -> None:
+    """Wrapper around storage.record_usage that always attaches who did it."""
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    username = _username_of(update)
+    await storage.record_usage(tool, chat_id=chat_id, username=username)
 
 
 # ── Image utilities ───────────────────────────────────────────────────────────
@@ -1293,7 +1365,6 @@ async def apply_effect_to_image(image_bytes: bytes, effect: str, width: int, hei
 # ── Sticker & GIF support ─────────────────────────────────────────────────────
 
 async def sticker_to_png(sticker_bytes: bytes) -> bytes:
-    """Convert a WebP (Telegram sticker) to a transparent PNG."""
     from PIL import Image
 
     def _run() -> bytes:
@@ -1306,7 +1377,6 @@ async def sticker_to_png(sticker_bytes: bytes) -> bytes:
 
 
 async def gif_to_frames(gif_bytes: bytes, max_frames: int = GIF_MAX_FRAMES) -> list[bytes]:
-    """Extract up to `max_frames` evenly-spaced frames from an animated GIF as PNGs."""
     from PIL import Image, ImageSequence
 
     def _run() -> list[bytes]:
@@ -1354,9 +1424,7 @@ def _get_rembg_session():
     global _REMBG_SESSION
     if _REMBG_SESSION is None:
         import onnxruntime as ort
-        _REMBG_SESSION = ort.InferenceSession(
-            _ensure_u2netp_model(), providers=["CPUExecutionProvider"]
-        )
+        _REMBG_SESSION = ort.InferenceSession(_ensure_u2netp_model(), providers=["CPUExecutionProvider"])
     return _REMBG_SESSION
 
 
@@ -1401,9 +1469,7 @@ async def remove_background(image_bytes: bytes) -> bytes:
     try:
         return await asyncio.wait_for(asyncio.to_thread(_run), timeout=REMBG_TIMEOUT_SECONDS)
     except asyncio.TimeoutError as exc:
-        raise RuntimeError(
-            "Background removal timed out. The first run downloads a model — please retry."
-        ) from exc
+        raise RuntimeError("Background removal timed out. The first run downloads a model — please retry.") from exc
     except Exception as exc:
         logger.exception("remove_background failed")
         raise RuntimeError(f"Background removal failed: {exc}") from exc
@@ -1444,25 +1510,80 @@ async def pdf_to_images(pdf_bytes: bytes, max_pages: int = PDF2IMG_MAX_PAGES) ->
     def _run() -> list[bytes]:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         try:
-            return [
-                page.get_pixmap(dpi=200).tobytes("png")
-                for i, page in enumerate(doc)
-                if i < max_pages
-            ]
+            return [page.get_pixmap(dpi=200).tobytes("png") for i, page in enumerate(doc) if i < max_pages]
         finally:
             doc.close()
 
     return await asyncio.to_thread(_run)
 
 
-# ── Translation ───────────────────────────────────────────────────────────────
+# ── Translation (Google primary, MyMemory fallback, both with backoff) ───────
+
+_RATE_LIMIT_MARKERS = ("429", "too many requests", "rate limit", "quota")
+
+
+def _looks_rate_limited(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _RATE_LIMIT_MARKERS)
+
+
+async def _translate_google(text: str, target_lang: str) -> str:
+    from deep_translator import GoogleTranslator
+    return await asyncio.to_thread(lambda: GoogleTranslator(source="auto", target=target_lang).translate(text))
+
+
+async def _translate_mymemory(text: str, target_lang: str) -> str:
+    """Fallback provider — separate free API with its own independent quota.
+    Its free tier caps requests at ~500 chars, so callers should chunk longer
+    text before calling this."""
+    from deep_translator import MyMemoryTranslator
+    return await asyncio.to_thread(
+        lambda: MyMemoryTranslator(source="auto", target=target_lang).translate(text)
+    )
+
 
 async def translate_text(text: str, target_lang: str) -> str:
-    from deep_translator import GoogleTranslator
+    """Tries Google Translate with exponential backoff (2s, then 4s) on
+    rate-limit-style errors. If Google keeps failing, falls back to MyMemory
+    (chunked to its ~500 char limit if needed). Raises the last error if both
+    providers are exhausted so the caller can show a clear message."""
+    backoffs = (2, 4)
+    last_exc: Exception | None = None
 
-    return await asyncio.to_thread(
-        lambda: GoogleTranslator(source="auto", target=target_lang).translate(text)
-    )
+    for attempt, delay in enumerate((0, *backoffs)):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            return await _translate_google(text, target_lang)
+        except Exception as exc:
+            last_exc = exc
+            if not _looks_rate_limited(exc):
+                break  # not a rate-limit issue — no point retrying Google
+            logger.warning("Google Translate rate-limited (attempt %d): %s", attempt + 1, exc)
+
+    logger.warning("Google Translate exhausted, falling back to MyMemory: %s", last_exc)
+    try:
+        if len(text) <= MYMEMORY_MAX_CHARS:
+            return await _translate_mymemory(text, target_lang)
+        # Chunk on whitespace boundaries to respect MyMemory's per-request limit.
+        chunks: list[str] = []
+        current = ""
+        for word in text.split(" "):
+            candidate = f"{current} {word}".strip()
+            if len(candidate) > MYMEMORY_MAX_CHARS and current:
+                chunks.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        translated_chunks = []
+        for chunk in chunks:
+            translated_chunks.append(await _translate_mymemory(chunk, target_lang))
+        return " ".join(translated_chunks)
+    except Exception as exc:
+        logger.error("MyMemory fallback also failed: %s", exc)
+        raise RuntimeError("rate_limited") from (last_exc or exc)
 
 
 # ── Markdown → plain text ─────────────────────────────────────────────────────
@@ -1595,7 +1716,6 @@ _AWAITING_LABELS: dict[str, str] = {
 
 
 async def _download_file(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> bytes:
-    """Download a Telegram file by file_id and return raw bytes."""
     tg_file = await context.bot.get_file(file_id)
     if tg_file.file_size and tg_file.file_size > BOT_DOWNLOAD_LIMIT_BYTES:
         raise ValueError("File exceeds the 20 MB bot download limit.")
@@ -1604,12 +1724,7 @@ async def _download_file(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> by
     return buf.getvalue()
 
 
-async def _run_image_tool(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    file_id: str,
-    tool: str,
-) -> None:
+async def _run_image_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, tool: str) -> None:
     if not await _check_heavy_rate_limit(update, tool):
         return
     label, filename, transform = _SINGLE_IMAGE_TOOLS[tool]
@@ -1625,18 +1740,14 @@ async def _run_image_tool(
         doc.name = filename
         await update.message.reply_document(document=doc, filename=filename)
         await safe_delete(status)
-        await storage.record_usage(tool)
+        await _record(context, update, tool)
     except Exception as exc:
         logger.warning("%s failed: %s", tool, exc)
         await safe_edit(status, _user_hint(exc))
         await notify_admin(context, tool, f"Tool `{tool}` failed for chat {update.effective_chat.id}: {exc}")
 
 
-async def _run_gif_tool(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    file_id: str,
-) -> None:
+async def _run_gif_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str) -> None:
     status = await update.message.reply_text(f"⏳ Extracting GIF frames (up to {GIF_MAX_FRAMES})…")
     try:
         gif_bytes = await _download_file(context, file_id)
@@ -1649,10 +1760,8 @@ async def _run_gif_tool(
             batch = frames[batch_start:batch_start + 10]
             media = [InputMediaPhoto(BytesIO(f)) for f in batch]
             await update.message.reply_media_group(media=media)
-        await update.message.reply_text(
-            f"✅ Extracted {len(frames)} frame(s) from the GIF."
-        )
-        await storage.record_usage("gif2frames")
+        await update.message.reply_text(f"✅ Extracted {len(frames)} frame(s) from the GIF.")
+        await _record(context, update, "gif2frames")
     except Exception as exc:
         logger.warning("gif2frames failed: %s", exc)
         await safe_edit(status, _user_hint(exc))
@@ -1711,12 +1820,7 @@ def _doc_accepts(tool: str, mime: str, filename: str) -> bool:
     return False
 
 
-async def _run_doc_tool(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    file_id: str,
-    tool: str,
-) -> None:
+async def _run_doc_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, tool: str) -> None:
     if not await _check_heavy_rate_limit(update, tool):
         return
     if not _DOC_AVAILABLE:
@@ -1737,7 +1841,7 @@ async def _run_doc_tool(
                 batch = pages[batch_start:batch_start + 10]
                 await update.message.reply_media_group([InputMediaPhoto(BytesIO(p)) for p in batch])
             await update.message.reply_text(f"✅ {len(pages)} slide(s) converted.")
-            await storage.record_usage("pptx2images")
+            await _record(context, update, "pptx2images")
         except Exception as exc:
             logger.warning("pptx2images failed: %s", exc)
             await safe_edit(status, _user_hint(exc))
@@ -1759,7 +1863,7 @@ async def _run_doc_tool(
         doc.name = out_name
         await update.message.reply_document(document=doc, filename=out_name)
         await safe_delete(status)
-        await storage.record_usage(tool)
+        await _record(context, update, tool)
     except Exception as exc:
         logger.warning("%s failed: %s", tool, exc)
         await safe_edit(status, _user_hint(exc))
@@ -1773,18 +1877,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _remember_admin_chat_id(update)
         context.user_data.pop("awaiting", None)
         await update.message.reply_text(
-            WELCOME_MESSAGE,
-            parse_mode="Markdown",
-            reply_markup=build_main_menu_keyboard(),
+            WELCOME_MESSAGE, parse_mode="Markdown", reply_markup=build_main_menu_keyboard(),
         )
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
-        await update.message.reply_text(
-            MENU_INTRO, parse_mode="Markdown",
-            reply_markup=build_main_menu_keyboard(),
-        )
+        await update.message.reply_text(MENU_INTRO, parse_mode="Markdown", reply_markup=build_main_menu_keyboard())
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1821,12 +1920,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "*Password Generator:*\n"
             "`/genpass [length] [--symbols] [--no-ambiguous]`\n"
             "`/genpin [length]`\n\n"
+            "*Rate limits:*\n"
+            "`/mylimit` → check your own usage\n"
+            "`/requestlimit <n>` → ask an admin for a higher limit\n\n"
             "*Admin:*\n"
             "`/admins` → view the admin roster\n"
-            "`/stats` → usage stats (admin-only)\n"
-            "`/mylimit` → check your own rate-limit usage\n"
-            "`/setlimit <chat_id|@user> <n>` → admin-only, override someone's limit\n"
-            "`/resetlimit <chat_id|@user>` → admin-only, back to default\n\n"
+            "`/stats` → usage dashboard (admin-only)\n"
+            "`/useractivity <chat_id|@user>` → one user's recent actions (admin-only)\n"
+            "`/pendingrequests` → open limit requests (admin-only)\n"
+            "`/setlimit <chat_id|@user> <n>` → override someone's limit (admin-only)\n"
+            "`/resetlimit <chat_id|@user>` → back to default (admin-only)\n"
+            "`/blockuser <chat_id|@user>` / `/unblockuser <...>` → super-admin only\n\n"
             "*Tools (via /menu):*\n"
             "🧹 Remove BG • 🌐 Translate text • 💧 Watermark\n"
             "📉 Compress • 📄 PDF → Images • 🖼 Image → PDF\n"
@@ -1841,10 +1945,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ── Fiver sanitizer commands ───────────────────────────────────────────────────
 
 async def fivermessage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /FiverMessage <text>  → sanitizes inline immediately.
-    /FiverMessage (alone) → asks the user to send text next.
-    """
     if not update.message:
         return
     args_text = " ".join(context.args) if context.args else ""
@@ -1853,23 +1953,18 @@ async def fivermessage_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if args_text.strip():
         if len(args_text) > FIVER_SANITIZE_MAX_CHARS:
-            await update.message.reply_text(
-                f"⚠️ Too long ({len(args_text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}."
-            )
+            await update.message.reply_text(f"⚠️ Too long ({len(args_text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}.")
             return
         sanitized = sanitize_fiver_text(args_text.strip(), custom_words)
         await update.message.reply_text(f"✅ *Sanitized:*\n\n{sanitized}", parse_mode="Markdown")
-        await storage.record_usage("fiver_sanitize")
+        await _record(context, update, "fiver_sanitize")
         return
 
     context.user_data["awaiting"] = "fiver_sanitize"
-    await update.message.reply_text(
-        "🛡️ Send me the message you want to sanitize (or /cancel)."
-    )
+    await update.message.reply_text("🛡️ Send me the message you want to sanitize (or /cancel).")
 
 
 async def addword_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/addword <word> <replacement> — personal override, merged on top of defaults."""
     if not update.message:
         return
     if len(context.args) < 2:
@@ -1889,7 +1984,6 @@ async def addword_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def mywords_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/mywords — paginated list of the caller's custom words."""
     if not update.message:
         return
     words = await storage.get_words(update.effective_chat.id)
@@ -1934,7 +2028,7 @@ async def resetwords_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("♻️ Your custom words have been cleared — back to defaults only.")
 
 
-# ── Stats (admin only) ─────────────────────────────────────────────────────────
+# ── Stats dashboard (admin only) ──────────────────────────────────────────────
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
@@ -1943,39 +2037,40 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not is_admin(update):
         await update.message.reply_text("🚫 This command is admin-only.")
         return
+
     rows = await storage.get_stats()
+    activity = await storage.get_user_activity_all()
+
     if not rows:
         await update.message.reply_text("No usage recorded yet.")
         return
-    lines = [f"{i+1}. `{tool}` — {count}" for i, (tool, count) in enumerate(rows[:40])]
+
+    top_tools = rows[:12]
+    max_count = top_tools[0][1] if top_tools else 0
+    tool_lines = [f"`{tool:<16}` {_bar(count, max_count)} {count}" for tool, count in top_tools]
+
+    leaderboard = sorted(
+        activity.items(),
+        key=lambda kv: sum(kv[1].get("counts", {}).values()),
+        reverse=True,
+    )[:10]
+    user_lines = []
+    for cid, entry in leaderboard:
+        total = sum(entry.get("counts", {}).values())
+        uname = entry.get("username")
+        label = f"@{uname}" if uname else f"id:{cid}"
+        user_lines.append(f"• {label} — `{cid}` — {total} action(s)")
+
     role = admin_role_label(update)
-    await update.message.reply_text(
-        f"📊 *Usage stats* (viewing as {role}, most-used first):\n\n" + "\n".join(lines),
-        parse_mode="Markdown",
+    text = (
+        f"📊 *Usage Dashboard* (viewing as {role})\n\n"
+        f"*By tool:*\n" + "\n".join(tool_lines) + "\n\n"
+        f"*Top users:*\n" + ("\n".join(user_lines) if user_lines else "_No per-user data yet._")
     )
+    await update.message.reply_text(text, parse_mode="Markdown")
 
-
-async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/admins — shows the admin roster. Visible to everyone (it's just contact info),
-    but tags the caller's own role at the top for a quick self-check."""
-    if not update.message:
-        return
-    _remember_admin_chat_id(update)
-    lines = [f"*Your role:* {admin_role_label(update)}\n"]
-    lines.append("👑 *Super Admin*")
-    for info in SUPER_ADMINS.values():
-        lines.append(f"• {info['name']} — {info['telegram']} — `{info['email']}`")
-    lines.append("\n🛡 *Admin*")
-    for info in ADMINS.values():
-        lines.append(f"• {info['name']} — {info['telegram']} — `{info['email']}`")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-# ── Per-user rate-limit management (admin only, except /mylimit) ─────────────
 
 def _resolve_target_chat_id(arg: str) -> int | None:
-    """Accepts a raw chat_id, or falls back to a known admin's cached chat_id
-    if the arg looks like an @username we've already seen message the bot."""
     arg = arg.strip().lstrip("@")
     if arg.isdigit() or (arg.startswith("-") and arg[1:].isdigit()):
         return int(arg)
@@ -1983,10 +2078,72 @@ def _resolve_target_chat_id(arg: str) -> int | None:
     return cached
 
 
+async def _resolve_target_chat_id_async(arg: str) -> int | None:
+    """Like _resolve_target_chat_id but also checks the full user-activity
+    log (not just known admins), so admins can target any user who has ever
+    used the bot, by @username."""
+    direct = _resolve_target_chat_id(arg)
+    if direct is not None:
+        return direct
+    return await storage.find_chat_id_by_username(arg)
+
+
+async def useractivity_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/useractivity <chat_id|@username> — admin-only recent-actions view."""
+    if not update.message:
+        return
+    _remember_admin_chat_id(update)
+    if not is_admin(update):
+        await update.message.reply_text("🚫 This command is admin-only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/useractivity <chat_id or @username>`", parse_mode="Markdown")
+        return
+    target = await _resolve_target_chat_id_async(context.args[0])
+    if target is None:
+        await update.message.reply_text("⚠️ Couldn't resolve that user (they may not have used the bot yet).")
+        return
+    entry = await storage.get_user_activity(target)
+    if not entry:
+        await update.message.reply_text(f"No activity recorded yet for `{target}`.", parse_mode="Markdown")
+        return
+    uname = entry.get("username")
+    label = f"@{uname}" if uname else "(no username on file)"
+    used, limit = await storage.calls_used(target)
+    counts = entry.get("counts", {})
+    count_lines = "\n".join(f"• `{t}` — {c}" for t, c in sorted(counts.items(), key=lambda kv: -kv[1]))
+    recent = entry.get("log", [])[-10:]
+    import datetime
+    recent_lines = "\n".join(
+        f"• {datetime.datetime.fromtimestamp(e['ts']).strftime('%Y-%m-%d %H:%M')} — `{e['tool']}`"
+        for e in reversed(recent)
+    )
+    await update.message.reply_text(
+        f"👤 *{label}* — chat_id `{target}`\n"
+        f"Rate limit: {used}/{limit} used in the last {storage.RATE_LIMIT_WINDOW_SECONDS}s\n\n"
+        f"*Totals by tool:*\n{count_lines or '_none_'}\n\n"
+        f"*Last {len(recent)} action(s):*\n{recent_lines or '_none_'}",
+        parse_mode="Markdown",
+    )
+
+
+async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    _remember_admin_chat_id(update)
+    lines = [f"*Your role:* {admin_role_label(update)}\n"]
+    lines.append("👑 *Super Admin*")
+    for info in SUPER_ADMINS.values():
+        lines.append(f"• {info['name']} — [Message]({info['telegram']}) — `{info['email']}`")
+    lines.append("\n🛡 *Admin*")
+    for info in ADMINS.values():
+        lines.append(f"• {info['name']} — [Message]({info['telegram']}) — `{info['email']}`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+
+
+# ── Per-user rate-limit management (admin only, except /mylimit/requestlimit) ─
+
 async def setlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/setlimit <chat_id|@username> <calls_per_60s>  — admin only.
-    Overrides one user's heavy-tool rate limit. Use 0 to fully block them,
-    or /resetlimit to go back to the default (5/60s)."""
     if not update.message:
         return
     _remember_admin_chat_id(update)
@@ -1997,16 +2154,16 @@ async def setlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(
             "Usage: `/setlimit <chat_id or @username> <calls_per_60s>`\n"
             "Example: `/setlimit 123456789 10` or `/setlimit 0` to block.\n"
-            "Note: @username only works if that person has already messaged the bot at least once "
-            "(so I've learned their chat_id) — otherwise use their numeric chat_id.",
+            "Note: @username resolves against anyone who has ever used the bot — "
+            "otherwise use their numeric chat_id.",
             parse_mode="Markdown",
         )
         return
-    target = _resolve_target_chat_id(context.args[0])
+    target = await _resolve_target_chat_id_async(context.args[0])
     if target is None:
         await update.message.reply_text(
             "⚠️ Couldn't resolve that user. Send their numeric chat_id, "
-            "or an @username that has already messaged this bot."
+            "or an @username that has already used this bot."
         )
         return
     try:
@@ -2019,10 +2176,16 @@ async def setlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"✅ chat_id `{target}` is now limited to *{new_limit}* heavy-tool call(s) per 60s.",
         parse_mode="Markdown",
     )
+    try:
+        await context.bot.send_message(
+            chat_id=target,
+            text=f"ℹ️ Your heavy-tool limit has been updated to {new_limit} call(s) per 60s by an admin.",
+        )
+    except Exception:
+        pass
 
 
 async def resetlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/resetlimit <chat_id|@username> — admin only. Removes a custom limit override."""
     if not update.message:
         return
     _remember_admin_chat_id(update)
@@ -2032,7 +2195,7 @@ async def resetlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not context.args:
         await update.message.reply_text("Usage: `/resetlimit <chat_id or @username>`", parse_mode="Markdown")
         return
-    target = _resolve_target_chat_id(context.args[0])
+    target = await _resolve_target_chat_id_async(context.args[0])
     if target is None:
         await update.message.reply_text("⚠️ Couldn't resolve that user.")
         return
@@ -2045,7 +2208,6 @@ async def resetlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def mylimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/mylimit — anyone can check their own current usage/limit."""
     if not update.message:
         return
     chat_id = update.effective_chat.id
@@ -2058,9 +2220,141 @@ async def mylimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     used, limit = await storage.calls_used(chat_id)
     await update.message.reply_text(
         f"📊 You've used *{used}/{limit}* heavy-tool calls in the last "
-        f"{storage.RATE_LIMIT_WINDOW_SECONDS}s.",
+        f"{storage.RATE_LIMIT_WINDOW_SECONDS}s.\n"
+        f"Need more? `/requestlimit <number>`",
         parse_mode="Markdown",
     )
+
+
+async def requestlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Self-service: /requestlimit <n> — notifies every admin with the
+    requester's @username AND numeric chat_id (both required, since a limit
+    can only be set against a chat_id) plus Approve/Deny buttons."""
+    if not update.message:
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: `/requestlimit <number>` (e.g. `/requestlimit 15`)", parse_mode="Markdown")
+        return
+    requested = min(int(context.args[0]), MAX_LIMIT_REQUEST_VALUE)
+    chat_id = update.effective_chat.id
+    username = _username_of(update)
+    display = _display_name(update)
+
+    await storage.add_limit_request(chat_id, username, requested)
+    used, limit = await storage.calls_used(chat_id)
+
+    await update.message.reply_text(
+        f"📨 Your request for a limit of *{requested}* calls/60s has been sent to the admins. "
+        f"You'll be notified once it's reviewed.",
+        parse_mode="Markdown",
+    )
+    await notify_admin(
+        context,
+        error_key=f"limitreq-{chat_id}",
+        message=(
+            f"🙋 *Limit increase request*\n"
+            f"User: {display}\n"
+            f"chat_id: `{chat_id}`\n"
+            f"Current limit: {limit} (used {used} in last {storage.RATE_LIMIT_WINDOW_SECONDS}s)\n"
+            f"Requested: *{requested}* calls/60s"
+        ),
+        throttle=False,
+        reply_markup=build_limit_request_keyboard(chat_id, requested),
+    )
+
+
+async def pendingrequests_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    _remember_admin_chat_id(update)
+    if not is_admin(update):
+        await update.message.reply_text("🚫 This command is admin-only.")
+        return
+    reqs = await storage.get_limit_requests()
+    if not reqs:
+        await update.message.reply_text("✅ No pending limit requests.")
+        return
+    for cid, info in reqs.items():
+        uname = info.get("username")
+        label = f"@{uname}" if uname else f"id:{cid}"
+        await update.message.reply_text(
+            f"🙋 {label} — chat_id `{cid}` — requested *{info.get('requested')}*",
+            parse_mode="Markdown",
+            reply_markup=build_limit_request_keyboard(int(cid), int(info.get("requested", 0))),
+        )
+
+
+async def handle_limit_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        await query.answer("Admins only.", show_alert=True)
+        return
+    parts = query.data.split("|")
+    action = parts[1]
+    target_chat_id = int(parts[2])
+
+    if action == "approve":
+        requested = int(parts[3])
+        await storage.set_custom_limit(target_chat_id, requested)
+        await storage.remove_limit_request(target_chat_id)
+        await safe_edit(query.message, f"✅ Approved: chat_id `{target_chat_id}` → {requested} calls/60s.",
+                         parse_mode="Markdown")
+        try:
+            await context.bot.send_message(
+                chat_id=target_chat_id,
+                text=f"✅ Your limit request was approved — you're now at {requested} calls/60s.",
+            )
+        except Exception:
+            pass
+    else:
+        await storage.remove_limit_request(target_chat_id)
+        await safe_edit(query.message, f"❌ Denied request from chat_id `{target_chat_id}`.", parse_mode="Markdown")
+        try:
+            await context.bot.send_message(
+                chat_id=target_chat_id,
+                text="❌ Your limit increase request was denied by an admin.",
+            )
+        except Exception:
+            pass
+
+
+async def blockuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/blockuser <chat_id|@username> — super-admin only."""
+    if not update.message:
+        return
+    _remember_admin_chat_id(update)
+    if not is_super_admin(update):
+        await update.message.reply_text("🚫 This command is super-admin-only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/blockuser <chat_id or @username>`", parse_mode="Markdown")
+        return
+    target = await _resolve_target_chat_id_async(context.args[0])
+    if target is None:
+        await update.message.reply_text("⚠️ Couldn't resolve that user.")
+        return
+    await storage.block_user(target)
+    await update.message.reply_text(f"🚫 chat_id `{target}` is now fully blocked from heavy tools.", parse_mode="Markdown")
+
+
+async def unblockuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/unblockuser <chat_id|@username> — super-admin only."""
+    if not update.message:
+        return
+    _remember_admin_chat_id(update)
+    if not is_super_admin(update):
+        await update.message.reply_text("🚫 This command is super-admin-only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/unblockuser <chat_id or @username>`", parse_mode="Markdown")
+        return
+    target = await _resolve_target_chat_id_async(context.args[0])
+    if target is None:
+        await update.message.reply_text("⚠️ Couldn't resolve that user.")
+        return
+    await storage.unblock_user(target)
+    await update.message.reply_text(f"✅ chat_id `{target}` unblocked (back to default limit).", parse_mode="Markdown")
 
 
 # ── QR commands ─────────────────────────────────────────────────────────────────
@@ -2079,7 +2373,7 @@ async def qr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         doc.name = "qrcode.png"
         await update.message.reply_photo(photo=doc, caption="✅ QR code ready.")
         await safe_delete(status)
-        await storage.record_usage("qr_generate")
+        await _record(context, update, "qr_generate")
     except Exception as exc:
         logger.warning("qr_generate failed: %s", exc)
         await safe_edit(status, _user_hint(exc))
@@ -2115,7 +2409,7 @@ async def genpass_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         length=opts["length"], use_symbols=opts["use_symbols"], no_ambiguous=opts["no_ambiguous"]
     )
     await update.message.reply_text(f"🔑 `{pw}`", parse_mode="Markdown")
-    await storage.record_usage("genpass")
+    await _record(context, update, "genpass")
 
 
 async def genpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2126,7 +2420,7 @@ async def genpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         length = int(context.args[0])
     pin = password_tools.generate_pin(length)
     await update.message.reply_text(f"🔢 `{pin}`", parse_mode="Markdown")
-    await storage.record_usage("genpin")
+    await _record(context, update, "genpin")
 
 
 async def handle_genpass_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2136,7 +2430,7 @@ async def handle_genpass_callback(update: Update, context: ContextTypes.DEFAULT_
         _, length_str = query.data.split("|", 1)
         pw = password_tools.generate_password(length=int(length_str), use_symbols=True)
         await query.edit_message_text(f"🔑 `{pw}`", parse_mode="Markdown")
-        await storage.record_usage("genpass")
+        await _record(context, update, "genpass")
     except Exception:
         await query.edit_message_text("❌ Failed to generate password.")
 
@@ -2148,7 +2442,7 @@ async def handle_genpin_callback(update: Update, context: ContextTypes.DEFAULT_T
         _, length_str = query.data.split("|", 1)
         pin = password_tools.generate_pin(int(length_str))
         await query.edit_message_text(f"🔢 `{pin}`", parse_mode="Markdown")
-        await storage.record_usage("genpin")
+        await _record(context, update, "genpin")
     except Exception:
         await query.edit_message_text("❌ Failed to generate PIN.")
 
@@ -2165,9 +2459,7 @@ async def compress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             target_bytes = parsed
     context.user_data["awaiting"] = "compress_image"
     context.user_data["compress_target_bytes"] = target_bytes
-    await update.message.reply_text(
-        f"📉 Send me the photo to compress (target: ~{target_bytes // 1024} KB)."
-    )
+    await update.message.reply_text(f"📉 Send me the photo to compress (target: ~{target_bytes // 1024} KB).")
 
 
 # ── Watermark handlers ────────────────────────────────────────────────────────
@@ -2186,7 +2478,6 @@ async def watermark_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ── Sticker handler ───────────────────────────────────────────────────────────
 
 async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Telegram sticker received — convert WebP to PNG automatically."""
     if not update.message or not update.message.sticker:
         return
 
@@ -2250,7 +2541,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             doc.name = "watermarked.jpg"
             await update.message.reply_document(document=doc, filename="watermarked.jpg")
             await safe_delete(status)
-            await storage.record_usage("watermark")
+            await _record(context, update, "watermark")
         except Exception as exc:
             logger.warning("watermark failed: %s", exc)
             await safe_edit(status, _user_hint(exc))
@@ -2273,7 +2564,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 caption=f"✅ {len(out_bytes) / 1024:.0f} KB (target ~{target_bytes // 1024} KB)",
             )
             await safe_delete(status)
-            await storage.record_usage("compress")
+            await _record(context, update, "compress")
         except Exception as exc:
             logger.warning("compress failed: %s", exc)
             await safe_edit(status, _user_hint(exc))
@@ -2293,7 +2584,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             else:
                 text = "\n\n".join(f"🔗 `{r}`" for r in results)
                 await safe_edit(status, f"✅ *Found {len(results)} code(s):*\n\n{text}", parse_mode="Markdown")
-            await storage.record_usage("qr_scan")
+            await _record(context, update, "qr_scan")
         except Exception as exc:
             logger.warning("qr_scan failed: %s", exc)
             await safe_edit(status, _user_hint(exc))
@@ -2305,22 +2596,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _warn_wrong_media(update, context, awaiting, "photo")
         return
 
-    # Default (or explicit "effects" awaiting): 32-effect picker
     context.user_data.pop("awaiting", None)
     token = _store_token(context.bot_data, file_id)
     await update.message.reply_text(
-        "🎨 *Choose a category:*",
-        parse_mode="Markdown",
-        reply_markup=build_effect_categories_keyboard(token),
+        "🎨 *Choose a category:*", parse_mode="Markdown", reply_markup=build_effect_categories_keyboard(token),
     )
 
 
-async def _warn_wrong_media(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    awaiting: str,
-    got_kind: str,
-) -> None:
+async def _warn_wrong_media(update: Update, context: ContextTypes.DEFAULT_TYPE, awaiting: str, got_kind: str) -> None:
     label = _AWAITING_LABELS.get(awaiting, awaiting)
     await update.message.reply_text(
         f"⚠️ I'm waiting for input for *{label}*, but got a {got_kind}.\n"
@@ -2359,8 +2642,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         }
         for ext, hint in _EXT_HINTS.items():
             if file_name.endswith(ext):
-                await update.message.reply_text(hint, parse_mode="Markdown",
-                                                reply_markup=build_main_menu_keyboard())
+                await update.message.reply_text(hint, parse_mode="Markdown", reply_markup=build_main_menu_keyboard())
                 return
         await update.message.reply_text(
             "Please choose a tool first with /menu, then send the file.",
@@ -2406,7 +2688,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await update.message.reply_media_group([InputMediaPhoto(BytesIO(p)) for p in batch])
             if len(pages) >= PDF2IMG_MAX_PAGES:
                 await update.message.reply_text(f"ℹ️ Only the first {PDF2IMG_MAX_PAGES} pages were rendered.")
-            await storage.record_usage("pdf2img")
+            await _record(context, update, "pdf2img")
         except Exception as exc:
             logger.warning("pdf2img failed: %s", exc)
             await safe_edit(status, _user_hint(exc))
@@ -2428,7 +2710,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             out_doc.name = out_name
             await update.message.reply_document(document=out_doc, filename=out_name)
             await safe_delete(status)
-            await storage.record_usage("md2txt")
+            await _record(context, update, "md2txt")
         except Exception as exc:
             logger.warning("md2txt failed: %s", exc)
             await safe_edit(status, _user_hint(exc))
@@ -2451,7 +2733,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 out_doc.name = "sanitized.txt"
                 await update.message.reply_document(document=out_doc, filename="sanitized.txt")
                 await safe_delete(status)
-                await storage.record_usage("fiver_sanitize")
+                await _record(context, update, "fiver_sanitize")
             except Exception as exc:
                 logger.warning("fiver_sanitize (file) failed: %s", exc)
                 await safe_edit(status, _user_hint(exc))
@@ -2480,7 +2762,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 caption=f"✅ {len(out_bytes) / 1024:.0f} KB (target ~{target_bytes // 1024} KB)",
             )
             await safe_delete(status)
-            await storage.record_usage("compress")
+            await _record(context, update, "compress")
         except Exception as exc:
             logger.warning("compress failed: %s", exc)
             await safe_edit(status, _user_hint(exc))
@@ -2502,7 +2784,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             else:
                 text = "\n\n".join(f"🔗 `{r}`" for r in results)
                 await safe_edit(status, f"✅ *Found {len(results)} code(s):*\n\n{text}", parse_mode="Markdown")
-            await storage.record_usage("qr_scan")
+            await _record(context, update, "qr_scan")
         except Exception as exc:
             logger.warning("qr_scan (file) failed: %s", exc)
             await safe_edit(status, _user_hint(exc))
@@ -2513,25 +2795,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if awaiting in _DOC_TOOLS or awaiting == "pptx2images":
         if not _doc_accepts(awaiting, mime, file_name):
             exts = " / ".join(_DOC_ACCEPTS.get(awaiting, ([], [".file"]))[1])
-            await update.message.reply_text(
-                f"⚠️ That file type doesn't match this tool. Expected: `{exts}`",
-                parse_mode="Markdown",
-            )
+            await update.message.reply_text(f"⚠️ That file type doesn't match this tool. Expected: `{exts}`", parse_mode="Markdown")
             return
         await _run_doc_tool(update, context, doc.file_id, awaiting)
         context.user_data.pop("awaiting", None)
         return
 
-    await update.message.reply_text(
-        "Please choose a tool first with /menu.",
-        reply_markup=build_main_menu_keyboard(),
-    )
+    await update.message.reply_text("Please choose a tool first with /menu.", reply_markup=build_main_menu_keyboard())
 
 
 # ── Animation / GIF handler ───────────────────────────────────────────────────
 
 async def handle_animation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Telegram sends GIFs as 'animation' objects — handle them here."""
     if not update.message or not update.message.animation:
         return
     awaiting = context.user_data.get("awaiting")
@@ -2544,9 +2819,7 @@ async def handle_animation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _run_gif_tool(update, context, update.message.animation.file_id)
         context.user_data.pop("awaiting", None)
     else:
-        await update.message.reply_text(
-            f"🎞 GIF detected! Extracting up to {GIF_MAX_FRAMES} frames…"
-        )
+        await update.message.reply_text(f"🎞 GIF detected! Extracting up to {GIF_MAX_FRAMES} frames…")
         await _run_gif_tool(update, context, update.message.animation.file_id)
 
 
@@ -2567,9 +2840,7 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     effect_label = EFFECT_NAMES.get(effect_key, effect_key)
-    status_msg = await query.edit_message_text(
-        f"⏳ Applying *{effect_label}*… please wait.", parse_mode="Markdown"
-    )
+    status_msg = await query.edit_message_text(f"⏳ Applying *{effect_label}*… please wait.", parse_mode="Markdown")
     try:
         await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_PHOTO)
         image_bytes = await _download_file(context, file_id)
@@ -2584,7 +2855,7 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
         )
         await safe_edit(status_msg, f"✅ *{effect_label}* done!", parse_mode="Markdown")
         _drop_token(context.bot_data, token)
-        await storage.record_usage("effects")
+        await _record(context, update, "effects")
     except asyncio.TimeoutError:
         await safe_edit(status_msg, "⏱ Timed out — try a smaller image.")
     except Exception as exc:
@@ -2606,9 +2877,7 @@ async def handle_effect_category_callback(update: Update, context: ContextTypes.
         return
     cat_label = EFFECT_CATEGORIES.get(category, category)
     await query.edit_message_text(
-        f"🎨 *{cat_label}* — choose an effect:",
-        parse_mode="Markdown",
-        reply_markup=build_effect_keyboard(category, token),
+        f"🎨 *{cat_label}* — choose an effect:", parse_mode="Markdown", reply_markup=build_effect_keyboard(category, token),
     )
 
 
@@ -2624,9 +2893,7 @@ async def handle_effect_back_callback(update: Update, context: ContextTypes.DEFA
         await query.edit_message_text("❌ Request expired — please resend the photo.")
         return
     await query.edit_message_text(
-        "🎨 *Choose a category:*",
-        parse_mode="Markdown",
-        reply_markup=build_effect_categories_keyboard(token),
+        "🎨 *Choose a category:*", parse_mode="Markdown", reply_markup=build_effect_categories_keyboard(token),
     )
 
 
@@ -2640,9 +2907,7 @@ async def handle_watermark_position_callback(update: Update, context: ContextTyp
         return
     context.user_data["watermark_position"] = position
     context.user_data["awaiting"] = "watermark_apply"
-    await query.edit_message_text(
-        f"✅ Position set to *{position}*. Now send the photo to stamp.", parse_mode="Markdown"
-    )
+    await query.edit_message_text(f"✅ Position set to *{position}*. Now send the photo to stamp.", parse_mode="Markdown")
 
 
 async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2693,29 +2958,21 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if action == "translate":
         await query.edit_message_text(
-            "🌐 *Choose the target language:*",
-            parse_mode="Markdown",
-            reply_markup=build_translate_lang_keyboard(),
+            "🌐 *Choose the target language:*", parse_mode="Markdown", reply_markup=build_translate_lang_keyboard(),
         )
         return
 
     if action == "watermark":
         context.user_data["awaiting"] = "watermark_setup"
-        await query.edit_message_text(
-            "💧 First, send me your *logo/signature image*.", parse_mode="Markdown"
-        )
+        await query.edit_message_text("💧 First, send me your *logo/signature image*.", parse_mode="Markdown")
         return
 
     if action == "genpass":
-        await query.edit_message_text(
-            "🔑 Choose a length:", reply_markup=build_genpass_keyboard()
-        )
+        await query.edit_message_text("🔑 Choose a length:", reply_markup=build_genpass_keyboard())
         return
 
     if action == "qrgen":
-        await query.edit_message_text(
-            "🔳 Send `/qr <text or link>` to generate a QR code.", parse_mode="Markdown"
-        )
+        await query.edit_message_text("🔳 Send `/qr <text or link>` to generate a QR code.", parse_mode="Markdown")
         return
 
     if action == "mywords":
@@ -2748,7 +3005,6 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """User tapped a category button in the main menu."""
     query = update.callback_query
     await query.answer()
     try:
@@ -2758,10 +3014,7 @@ async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     if cat == "back":
-        await query.edit_message_text(
-            MENU_INTRO, parse_mode="Markdown",
-            reply_markup=build_main_menu_keyboard(),
-        )
+        await query.edit_message_text(MENU_INTRO, parse_mode="Markdown", reply_markup=build_main_menu_keyboard())
         return
 
     cat_labels = {
@@ -2774,11 +3027,7 @@ async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT
         "more":  "📚 More Tools",
     }
     label = cat_labels.get(cat, cat.title())
-    await query.edit_message_text(
-        f"*{label}* — choose a conversion:",
-        parse_mode="Markdown",
-        reply_markup=build_category_keyboard(cat),
-    )
+    await query.edit_message_text(f"*{label}* — choose a conversion:", parse_mode="Markdown", reply_markup=build_category_keyboard(cat))
 
 
 async def handle_translate_lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2792,9 +3041,7 @@ async def handle_translate_lang_callback(update: Update, context: ContextTypes.D
     lang_label = next((label for code, label in TRANSLATE_LANGUAGES if code == lang_code), lang_code)
     context.user_data["awaiting"]    = "translate_text"
     context.user_data["target_lang"] = lang_code
-    await query.edit_message_text(
-        f"✏️ Send me the text to translate to *{lang_label}*.", parse_mode="Markdown"
-    )
+    await query.edit_message_text(f"✏️ Send me the text to translate to *{lang_label}*.", parse_mode="Markdown")
 
 
 # ── Text message handler ──────────────────────────────────────────────────────
@@ -2806,27 +3053,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if GREETING_RE.match(raw_text.strip()):
         context.user_data.pop("awaiting", None)
-        await update.message.reply_text(
-            WELCOME_MESSAGE, parse_mode="Markdown",
-            reply_markup=build_main_menu_keyboard(),
-        )
+        await update.message.reply_text(WELCOME_MESSAGE, parse_mode="Markdown", reply_markup=build_main_menu_keyboard())
         return
 
-    # ── Fiver message sanitizer (guided flow) ─────────────────────────────────
     if context.user_data.get("awaiting") == "fiver_sanitize":
         text_to_sanitize = raw_text.strip()
         if not text_to_sanitize:
             await update.message.reply_text("Please send some text to sanitize.")
             return
         if len(text_to_sanitize) > FIVER_SANITIZE_MAX_CHARS:
-            await update.message.reply_text(
-                f"⚠️ Too long ({len(text_to_sanitize)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}."
-            )
+            await update.message.reply_text(f"⚠️ Too long ({len(text_to_sanitize)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}.")
             return
         custom_words = await storage.get_words(update.effective_chat.id)
         sanitized = sanitize_fiver_text(text_to_sanitize, custom_words)
         await update.message.reply_text(f"✅ *Sanitized:*\n\n{sanitized}", parse_mode="Markdown")
-        await storage.record_usage("fiver_sanitize")
+        await _record(context, update, "fiver_sanitize")
         context.user_data.pop("awaiting", None)
         return
 
@@ -2837,18 +3078,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("Please send some text to translate.")
             return
         if len(text_to_xlate) > TRANSLATE_MAX_CHARS:
-            await update.message.reply_text(
-                f"⚠️ Too long ({len(text_to_xlate)} chars). Limit: {TRANSLATE_MAX_CHARS}."
-            )
+            await update.message.reply_text(f"⚠️ Too long ({len(text_to_xlate)} chars). Limit: {TRANSLATE_MAX_CHARS}.")
             return
         status = await update.message.reply_text("🌐 Translating…")
         try:
             translated = await translate_text(text_to_xlate, target_lang)
             await safe_edit(status, f"✅ *Translation:*\n\n{translated}", parse_mode="Markdown")
-            await storage.record_usage("translate")
+            await _record(context, update, "translate")
         except Exception as exc:
             logger.warning("Translation failed: %s", exc)
-            await safe_edit(status, "❌ Translation failed. Please try again.")
+            if "rate_limited" in str(exc).lower():
+                await safe_edit(status, "🚦 The service is temporarily rate-limited. Please try again in a minute.")
+            else:
+                await safe_edit(status, "❌ Translation failed. Please try again.")
         context.user_data.pop("awaiting", None)
         context.user_data.pop("target_lang", None)
         return
@@ -2858,7 +3100,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _warn_wrong_media(update, context, awaiting, "text message")
         return
 
-    # Link detection.
     lummi_match = LUMMI_URL_RE.search(raw_text)
     url = trim_url(lummi_match.group(0)) if lummi_match else None
     platform = "lummi" if url else None
@@ -2880,18 +3121,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT
-    )
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
     status = await update.message.reply_text("⏳ Processing your link…")
 
     if platform == "lummi":
-        await _process_lummi(update, status, url)
+        await _process_lummi(update, context, status, url)
     else:
-        await _process_hugeicons(update, status, url)
+        await _process_hugeicons(update, context, status, url)
 
 
-async def _process_lummi(update: Update, status: Any, url: str) -> None:
+async def _process_lummi(update: Update, context: ContextTypes.DEFAULT_TYPE, status: Any, url: str) -> None:
     try:
         await safe_edit(status, "⏳ Downloading the Lummi asset…")
         result = await fetch_lummi_asset(url)
@@ -2906,13 +3145,13 @@ async def _process_lummi(update: Update, status: Any, url: str) -> None:
             ),
         )
         await safe_delete(status)
-        await storage.record_usage("lummi")
+        await _record(context, update, "lummi")
     except Exception as exc:
         logger.warning("Lummi failed: %s", exc)
         await safe_edit(status, _user_hint(exc))
 
 
-async def _process_hugeicons(update: Update, status: Any, url: str) -> None:
+async def _process_hugeicons(update: Update, context: ContextTypes.DEFAULT_TYPE, status: Any, url: str) -> None:
     try:
         await safe_edit(status, "⏳ Fetching the Hugeicons SVG…")
         result    = await fetch_hugeicons_svg(url)
@@ -2923,16 +3162,11 @@ async def _process_hugeicons(update: Update, status: Any, url: str) -> None:
         await safe_delete(status)
         label = f"✅ *{markdown_v2_escape(icon_name)}* \\({markdown_v2_escape(style)}\\)"
         await update.message.reply_text(label, parse_mode="MarkdownV2")
-        await update.message.reply_text(
-            f"```xml\n{markdown_code_escape(clean_svg)}\n```", parse_mode="MarkdownV2"
-        )
+        await update.message.reply_text(f"```xml\n{markdown_code_escape(clean_svg)}\n```", parse_mode="MarkdownV2")
         doc = BytesIO(clean_svg.encode("utf-8"))
         doc.name = filename
-        await update.message.reply_document(
-            document=doc, filename=filename,
-            caption=truncate_caption(f"{filename} — ready to use."),
-        )
-        await storage.record_usage("hugeicons")
+        await update.message.reply_document(document=doc, filename=filename, caption=truncate_caption(f"{filename} — ready to use."))
+        await _record(context, update, "hugeicons")
     except Exception as exc:
         logger.warning("Hugeicons failed: %s", exc)
         await safe_edit(status, _user_hint(exc))
@@ -2949,7 +3183,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ── Lifecycle hooks ────────────────────────────────────────────────────────────
 
 async def _on_shutdown(app: Application) -> None:
-    """Release the pooled HTTP client and drop any pending file tokens."""
     await close_http_client()
     app.bot_data.pop("pending_files", None)
     logger.info("Shutdown cleanup complete: HTTP client closed, pending_files cleared.")
@@ -2984,10 +3217,15 @@ def main() -> None:
     app.add_handler(CommandHandler("delword", delword_command))
     app.add_handler(CommandHandler("resetwords", resetwords_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("useractivity", useractivity_command))
     app.add_handler(CommandHandler("admins", admins_command))
     app.add_handler(CommandHandler("setlimit", setlimit_command))
     app.add_handler(CommandHandler("resetlimit", resetlimit_command))
     app.add_handler(CommandHandler("mylimit", mylimit_command))
+    app.add_handler(CommandHandler("requestlimit", requestlimit_command))
+    app.add_handler(CommandHandler("pendingrequests", pendingrequests_command))
+    app.add_handler(CommandHandler("blockuser", blockuser_command))
+    app.add_handler(CommandHandler("unblockuser", unblockuser_command))
     app.add_handler(CommandHandler("qr", qr_command))
     app.add_handler(CommandHandler("genpass", genpass_command))
     app.add_handler(CommandHandler("genpin", genpin_command))
@@ -3010,6 +3248,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_watermark_position_callback, pattern=r"^wmpos\|"))
     app.add_handler(CallbackQueryHandler(handle_genpass_callback,         pattern=r"^genpass\|"))
     app.add_handler(CallbackQueryHandler(handle_genpin_callback,          pattern=r"^genpin\|"))
+    app.add_handler(CallbackQueryHandler(handle_limit_request_callback,   pattern=r"^limitreq\|"))
 
     # Text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -3019,17 +3258,15 @@ def main() -> None:
 
     logger.info(
         "Unified bot starting (Lummi + Hugeicons + 32 Effects + Sticker/GIF + "
-        "Fiver Sanitizer + Custom Words + QR + Passwords + Watermark/Compress)"
+        "Fiver Sanitizer + Custom Words + QR + Passwords + Watermark/Compress + "
+        "Per-user Stats + Limit Requests)"
     )
 
     if webhook_url:
         logger.info("Webhook mode on port %s", port)
         app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path="/webhook",
-            webhook_url=f"{webhook_url}/webhook",
-            allowed_updates=Update.ALL_TYPES,
+            listen="0.0.0.0", port=port, url_path="/webhook",
+            webhook_url=f"{webhook_url}/webhook", allowed_updates=Update.ALL_TYPES,
         )
     else:
         logger.info("Polling mode")

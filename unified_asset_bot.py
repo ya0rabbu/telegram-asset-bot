@@ -591,7 +591,7 @@ SUPER_ADMINS: dict[str, dict[str, str]] = {
     "ya_rabbu": {
         "name": "Yasir Abed Rabbu",
         "email": "yasirabedrabbu@gmail.com",
-        "telegram": "@YA_Rabbu",
+        "telegram": "*@YA_Rabbu*",
     },
 }
 
@@ -599,7 +599,7 @@ ADMINS: dict[str, dict[str, str]] = {
     "smashik_softvence": {
         "name": "Sheikh Muhammad Ashik",
         "email": "smashik716@gmail.com",
-        "telegram": "@smashik_softvence",
+        "telegram": "*@smashik_softvence*",
     },
 }
 

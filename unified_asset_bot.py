@@ -187,19 +187,62 @@ HEAVY_TOOLS = {
     "bgremove", "effects", "pptx2images", "pdf2img", "watermark", "compress",
 }
 
+CUSTOM_LIMITS_PATH = os.path.join(DATA_DIR, "custom_limits.json")
 
-async def check_rate_limit(chat_id: int) -> tuple[bool, float]:
-    """Returns (allowed, seconds_to_wait_if_not_allowed)."""
+
+async def set_custom_limit(chat_id: int, max_calls: int | None) -> None:
+    """Admin-set override for one user's heavy-tool limit (per 60s window).
+    Pass None to remove the override and fall back to the default."""
+    async with _lock:
+        data = _load(CUSTOM_LIMITS_PATH)
+        if max_calls is None:
+            data.pop(str(chat_id), None)
+        else:
+            data[str(chat_id)] = max(0, int(max_calls))
+        _save(CUSTOM_LIMITS_PATH, data)
+
+
+async def get_custom_limit(chat_id: int) -> int | None:
+    async with _lock:
+        data = _load(CUSTOM_LIMITS_PATH)
+        return data.get(str(chat_id))
+
+
+async def _effective_limit(chat_id: int) -> int:
+    custom = await get_custom_limit(chat_id)
+    return custom if custom is not None else RATE_LIMIT_HEAVY_MAX_CALLS
+
+
+async def check_rate_limit(chat_id: int, exempt: bool = False) -> tuple[bool, float]:
+    """Returns (allowed, seconds_to_wait_if_not_allowed).
+    `exempt=True` (admins/super-admins) always allows and skips the log —
+    admin usage never counts against anyone's window."""
+    if exempt:
+        return True, 0.0
+    limit = await _effective_limit(chat_id)
     now = time.monotonic()
     async with _rate_lock:
         log = _heavy_call_log[chat_id]
         while log and now - log[0] > RATE_LIMIT_WINDOW_SECONDS:
             log.popleft()
-        if len(log) >= RATE_LIMIT_HEAVY_MAX_CALLS:
+        if limit <= 0:
+            return False, float(RATE_LIMIT_WINDOW_SECONDS)
+        if len(log) >= limit:
             wait = RATE_LIMIT_WINDOW_SECONDS - (now - log[0])
             return False, max(wait, 1.0)
         log.append(now)
         return True, 0.0
+
+
+async def calls_used(chat_id: int) -> tuple[int, int]:
+    """Returns (calls_used_in_window, effective_limit) — for a /mylimit style check."""
+    limit = await _effective_limit(chat_id)
+    now = time.monotonic()
+    async with _rate_lock:
+        log = _heavy_call_log[chat_id]
+        while log and now - log[0] > RATE_LIMIT_WINDOW_SECONDS:
+            log.popleft()
+        return len(log), limit
 
 '''
 
@@ -1159,15 +1202,19 @@ def _drop_token(bot_data: dict, token: str) -> None:
 
 async def _check_heavy_rate_limit(update: Update, tool: str) -> bool:
     """Returns True if allowed to proceed. Sends a friendly wait message and
-    returns False otherwise. Only applies to tools in storage.HEAVY_TOOLS."""
+    returns False otherwise. Only applies to tools in storage.HEAVY_TOOLS.
+    Admins and super admins are exempt — their usage never counts against
+    anyone's window and they're never blocked."""
     if tool not in storage.HEAVY_TOOLS:
         return True
     chat_id = update.effective_chat.id
-    allowed, wait_seconds = await storage.check_rate_limit(chat_id)
+    exempt = is_admin(update)
+    allowed, wait_seconds = await storage.check_rate_limit(chat_id, exempt=exempt)
     if not allowed:
+        used, limit = await storage.calls_used(chat_id)
         await update.effective_message.reply_text(
             f"⏳ Please wait ~{int(wait_seconds)}s before trying another heavy tool "
-            f"(max {storage.RATE_LIMIT_HEAVY_MAX_CALLS} per {storage.RATE_LIMIT_WINDOW_SECONDS}s)."
+            f"(used {used}/{limit} in the last {storage.RATE_LIMIT_WINDOW_SECONDS}s)."
         )
         return False
     return True
@@ -1776,7 +1823,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "`/genpin [length]`\n\n"
             "*Admin:*\n"
             "`/admins` → view the admin roster\n"
-            "`/stats` → usage stats (admin-only)\n\n"
+            "`/stats` → usage stats (admin-only)\n"
+            "`/mylimit` → check your own rate-limit usage\n"
+            "`/setlimit <chat_id|@user> <n>` → admin-only, override someone's limit\n"
+            "`/resetlimit <chat_id|@user>` → admin-only, back to default\n\n"
             "*Tools (via /menu):*\n"
             "🧹 Remove BG • 🌐 Translate text • 💧 Watermark\n"
             "📉 Compress • 📄 PDF → Images • 🖼 Image → PDF\n"
@@ -1919,6 +1969,98 @@ async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     for info in ADMINS.values():
         lines.append(f"• {info['name']} — {info['telegram']} — `{info['email']}`")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ── Per-user rate-limit management (admin only, except /mylimit) ─────────────
+
+def _resolve_target_chat_id(arg: str) -> int | None:
+    """Accepts a raw chat_id, or falls back to a known admin's cached chat_id
+    if the arg looks like an @username we've already seen message the bot."""
+    arg = arg.strip().lstrip("@")
+    if arg.isdigit() or (arg.startswith("-") and arg[1:].isdigit()):
+        return int(arg)
+    cached = _admin_chat_ids.get(arg.lower())
+    return cached
+
+
+async def setlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/setlimit <chat_id|@username> <calls_per_60s>  — admin only.
+    Overrides one user's heavy-tool rate limit. Use 0 to fully block them,
+    or /resetlimit to go back to the default (5/60s)."""
+    if not update.message:
+        return
+    _remember_admin_chat_id(update)
+    if not is_admin(update):
+        await update.message.reply_text("🚫 This command is admin-only.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: `/setlimit <chat_id or @username> <calls_per_60s>`\n"
+            "Example: `/setlimit 123456789 10` or `/setlimit 0` to block.\n"
+            "Note: @username only works if that person has already messaged the bot at least once "
+            "(so I've learned their chat_id) — otherwise use their numeric chat_id.",
+            parse_mode="Markdown",
+        )
+        return
+    target = _resolve_target_chat_id(context.args[0])
+    if target is None:
+        await update.message.reply_text(
+            "⚠️ Couldn't resolve that user. Send their numeric chat_id, "
+            "or an @username that has already messaged this bot."
+        )
+        return
+    try:
+        new_limit = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("⚠️ Limit must be a number (calls per 60s).")
+        return
+    await storage.set_custom_limit(target, new_limit)
+    await update.message.reply_text(
+        f"✅ chat_id `{target}` is now limited to *{new_limit}* heavy-tool call(s) per 60s.",
+        parse_mode="Markdown",
+    )
+
+
+async def resetlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/resetlimit <chat_id|@username> — admin only. Removes a custom limit override."""
+    if not update.message:
+        return
+    _remember_admin_chat_id(update)
+    if not is_admin(update):
+        await update.message.reply_text("🚫 This command is admin-only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/resetlimit <chat_id or @username>`", parse_mode="Markdown")
+        return
+    target = _resolve_target_chat_id(context.args[0])
+    if target is None:
+        await update.message.reply_text("⚠️ Couldn't resolve that user.")
+        return
+    await storage.set_custom_limit(target, None)
+    await update.message.reply_text(
+        f"♻️ chat_id `{target}` is back to the default limit "
+        f"({storage.RATE_LIMIT_HEAVY_MAX_CALLS} per {storage.RATE_LIMIT_WINDOW_SECONDS}s).",
+        parse_mode="Markdown",
+    )
+
+
+async def mylimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/mylimit — anyone can check their own current usage/limit."""
+    if not update.message:
+        return
+    chat_id = update.effective_chat.id
+    if is_admin(update):
+        await update.message.reply_text(
+            f"👑 You're *{admin_role_label(update)}* — heavy-tool rate limits don't apply to you.",
+            parse_mode="Markdown",
+        )
+        return
+    used, limit = await storage.calls_used(chat_id)
+    await update.message.reply_text(
+        f"📊 You've used *{used}/{limit}* heavy-tool calls in the last "
+        f"{storage.RATE_LIMIT_WINDOW_SECONDS}s.",
+        parse_mode="Markdown",
+    )
 
 
 # ── QR commands ─────────────────────────────────────────────────────────────────
@@ -2843,6 +2985,9 @@ def main() -> None:
     app.add_handler(CommandHandler("resetwords", resetwords_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("admins", admins_command))
+    app.add_handler(CommandHandler("setlimit", setlimit_command))
+    app.add_handler(CommandHandler("resetlimit", resetlimit_command))
+    app.add_handler(CommandHandler("mylimit", mylimit_command))
     app.add_handler(CommandHandler("qr", qr_command))
     app.add_handler(CommandHandler("genpass", genpass_command))
     app.add_handler(CommandHandler("genpin", genpin_command))

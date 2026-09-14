@@ -675,14 +675,18 @@ def _username_of(update: Update) -> str | None:
     return (user.username or "").lower() if user and user.username else None
 
 
-def _display_name(update: Update) -> str:
-    """Best-effort human label for notifications: @username, else first name, else chat_id."""
+def _display_name(update: Update, escape_markdown: bool = False) -> str:
+    """Best-effort human label for notifications: @username, else first name, else chat_id.
+    Pass escape_markdown=True when the result will be dropped into a
+    parse_mode='Markdown' message (e.g. usernames with underscores)."""
     user = update.effective_user
     if user and user.username:
-        return f"@{user.username}"
-    if user and user.first_name:
-        return user.first_name
-    return f"id:{update.effective_chat.id}"
+        label = f"@{user.username}"
+    elif user and user.first_name:
+        label = user.first_name
+    else:
+        label = f"id:{update.effective_chat.id}"
+    return _esc_md(label) if escape_markdown else label
 
 
 def is_super_admin(update: Update) -> bool:
@@ -1209,6 +1213,15 @@ def _user_hint(exc: Exception) -> str:
     if "memory" in msg or "oom" in msg:
         return "💾 The server ran low on memory. Try a smaller image."
     return f"❌ Something went wrong: {exc}"
+
+
+def _esc_md(text: str) -> str:
+    """Escape legacy-Markdown special chars (_ * ` [) so usernames like
+    'yolo_anik' don't get parsed as italic/bold/code markers and crash
+    send_message with 'can't find end of the entity' errors."""
+    if not text:
+        return text
+    return re.sub(r"([_*`\[])", r"\\\1", text)
 
 
 def _bar(count: int, max_count: int, width: int = 12) -> str:
@@ -2058,7 +2071,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     for cid, entry in leaderboard:
         total = sum(entry.get("counts", {}).values())
         uname = entry.get("username")
-        label = f"@{uname}" if uname else f"id:{cid}"
+        label = _esc_md(f"@{uname}") if uname else f"id:{cid}"
         user_lines.append(f"• {label} — `{cid}` — {total} action(s)")
 
     role = admin_role_label(update)
@@ -2108,7 +2121,7 @@ async def useractivity_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"No activity recorded yet for `{target}`.", parse_mode="Markdown")
         return
     uname = entry.get("username")
-    label = f"@{uname}" if uname else "(no username on file)"
+    label = _esc_md(f"@{uname}") if uname else "(no username on file)"
     used, limit = await storage.calls_used(target)
     counts = entry.get("counts", {})
     count_lines = "\n".join(f"• `{t}` — {c}" for t, c in sorted(counts.items(), key=lambda kv: -kv[1]))
@@ -2197,7 +2210,11 @@ async def resetlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     target = await _resolve_target_chat_id_async(context.args[0])
     if target is None:
-        await update.message.reply_text("⚠️ Couldn't resolve that user.")
+        await update.message.reply_text(
+            "⚠️ Couldn't resolve that user. Usage: `/resetlimit <chat_id>` or `/resetlimit @username` "
+            "(space-separated, not `chat_id|@username`).",
+            parse_mode="Markdown",
+        )
         return
     await storage.set_custom_limit(target, None)
     await update.message.reply_text(
@@ -2238,7 +2255,7 @@ async def requestlimit_command(update: Update, context: ContextTypes.DEFAULT_TYP
     requested = min(int(context.args[0]), MAX_LIMIT_REQUEST_VALUE)
     chat_id = update.effective_chat.id
     username = _username_of(update)
-    display = _display_name(update)
+    display = _display_name(update, escape_markdown=True)
 
     await storage.add_limit_request(chat_id, username, requested)
     used, limit = await storage.calls_used(chat_id)
@@ -2276,7 +2293,7 @@ async def pendingrequests_command(update: Update, context: ContextTypes.DEFAULT_
         return
     for cid, info in reqs.items():
         uname = info.get("username")
-        label = f"@{uname}" if uname else f"id:{cid}"
+        label = _esc_md(f"@{uname}") if uname else f"id:{cid}"
         await update.message.reply_text(
             f"🙋 {label} — chat_id `{cid}` — requested *{info.get('requested')}*",
             parse_mode="Markdown",

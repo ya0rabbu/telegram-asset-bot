@@ -1,3 +1,470 @@
+"""BangaliIcon Bot — single-file build.
+
+Everything (main bot + all helper "modules") lives in this one .py file for
+easy deployment. The former storage.py / qr_tools.py / password_tools.py /
+image_extra.py modules are embedded below as source strings and loaded into
+real module objects at import time via `_load_embedded_module()`, so the
+rest of the code still calls them exactly as `storage.xxx(...)`,
+`qr_tools.xxx(...)`, etc. Nothing about their behavior changes, only where
+the source text lives.
+
+Run:
+    pip install -r requirements.txt  (python-telegram-bot, httpx, beautifulsoup4,
+        Pillow, pymupdf, deep-translator, onnxruntime, numpy, qrcode[pil],
+        opencv-python-headless)
+    export TELEGRAM_BOT_TOKEN=...
+    export ADMIN_CHAT_ID=...        # optional, legacy fallback
+    python bot_single_file.py
+"""
+
+from __future__ import annotations
+
+import types
+
+
+def _load_embedded_module(name: str, source: str) -> types.ModuleType:
+    """Compile `source` as a standalone module named `name` and return it,
+    so the rest of this file can do `storage.get_words(...)` etc. exactly
+    as if it were a real import — each embedded module keeps its own
+    isolated namespace, so there's no risk of name collisions between them
+    or with the main bot code below."""
+    module = types.ModuleType(name)
+    module.__file__ = f"<embedded:{name}>"
+    exec(compile(source, f"<embedded:{name}>", "exec"), module.__dict__)
+    return module
+
+
+_STORAGE_SOURCE = r'''
+"""storage.py — lightweight JSON-backed persistence for the bot.
+
+Everything here is intentionally dependency-free (no SQLite/Redis) so it
+drops into a small Render instance with zero extra setup. All writes go
+through a single asyncio.Lock and are flushed atomically (write to temp
+file, then os.replace) so a crash mid-write never corrupts the store.
+
+Layout on disk (single DATA_DIR, one file per concern):
+  data/custom_words.json   {chat_id: {word: replacement}}
+  data/usage_stats.json    {tool_name: count}
+  data/watermarks.json     {chat_id: file_id}
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import time
+from collections import defaultdict, deque
+from typing import Deque
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+CUSTOM_WORDS_PATH = os.path.join(DATA_DIR, "custom_words.json")
+USAGE_STATS_PATH  = os.path.join(DATA_DIR, "usage_stats.json")
+WATERMARKS_PATH   = os.path.join(DATA_DIR, "watermarks.json")
+
+MAX_WORDS_PER_USER = 100
+RESERVED_WORDS = {"fiverr"}  # never allow overriding the platform's own name entirely blank
+
+_lock = asyncio.Lock()
+
+
+def _load(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save(path: str, data: dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+# ── Custom words ──────────────────────────────────────────────────────────────
+
+async def add_word(chat_id: int, word: str, replacement: str) -> tuple[bool, str]:
+    word = word.strip().lower()
+    replacement = replacement.strip()
+    if not word or not replacement:
+        return False, "Both word and replacement must be non-empty."
+    if word in RESERVED_WORDS:
+        return False, f"'{word}' is reserved and can't be overridden."
+    async with _lock:
+        data = _load(CUSTOM_WORDS_PATH)
+        user_words = data.setdefault(str(chat_id), {})
+        was_update = word in user_words
+        if not was_update and len(user_words) >= MAX_WORDS_PER_USER:
+            return False, f"Limit reached ({MAX_WORDS_PER_USER} custom words). Remove one with /delword first."
+        user_words[word] = replacement
+        _save(CUSTOM_WORDS_PATH, data)
+    return True, ("updated" if was_update else "added")
+
+
+async def get_words(chat_id: int) -> dict[str, str]:
+    async with _lock:
+        data = _load(CUSTOM_WORDS_PATH)
+        return dict(data.get(str(chat_id), {}))
+
+
+async def del_word(chat_id: int, word: str) -> bool:
+    word = word.strip().lower()
+    async with _lock:
+        data = _load(CUSTOM_WORDS_PATH)
+        user_words = data.get(str(chat_id), {})
+        if word not in user_words:
+            return False
+        del user_words[word]
+        _save(CUSTOM_WORDS_PATH, data)
+        return True
+
+
+async def reset_words(chat_id: int) -> None:
+    async with _lock:
+        data = _load(CUSTOM_WORDS_PATH)
+        if str(chat_id) in data:
+            del data[str(chat_id)]
+            _save(CUSTOM_WORDS_PATH, data)
+
+
+# ── Usage stats ───────────────────────────────────────────────────────────────
+
+async def record_usage(tool_name: str) -> None:
+    async with _lock:
+        data = _load(USAGE_STATS_PATH)
+        data[tool_name] = data.get(tool_name, 0) + 1
+        _save(USAGE_STATS_PATH, data)
+
+
+async def get_stats() -> list[tuple[str, int]]:
+    async with _lock:
+        data = _load(USAGE_STATS_PATH)
+    return sorted(data.items(), key=lambda kv: kv[1], reverse=True)
+
+
+# ── Watermark image (per user) ────────────────────────────────────────────────
+
+async def set_watermark(chat_id: int, file_id: str) -> None:
+    async with _lock:
+        data = _load(WATERMARKS_PATH)
+        data[str(chat_id)] = file_id
+        _save(WATERMARKS_PATH, data)
+
+
+async def get_watermark(chat_id: int) -> str | None:
+    async with _lock:
+        data = _load(WATERMARKS_PATH)
+        return data.get(str(chat_id))
+
+
+async def clear_watermark(chat_id: int) -> None:
+    async with _lock:
+        data = _load(WATERMARKS_PATH)
+        if str(chat_id) in data:
+            del data[str(chat_id)]
+            _save(WATERMARKS_PATH, data)
+
+
+# ── Rate limiting (in-memory, per-process — fine for a single Render instance) ─
+# Sliding-window counter: keeps a deque of call timestamps per (chat_id, bucket).
+
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_HEAVY_MAX_CALLS = 5
+
+_heavy_call_log: dict[int, Deque[float]] = defaultdict(deque)
+_rate_lock = asyncio.Lock()
+
+# Global concurrency cap for CPU-bound jobs (bgremove, effects, doc renders).
+HEAVY_JOB_SEMAPHORE = asyncio.Semaphore(3)
+
+HEAVY_TOOLS = {
+    "bgremove", "effects", "pptx2images", "pdf2img", "watermark", "compress",
+}
+
+
+async def check_rate_limit(chat_id: int) -> tuple[bool, float]:
+    """Returns (allowed, seconds_to_wait_if_not_allowed)."""
+    now = time.monotonic()
+    async with _rate_lock:
+        log = _heavy_call_log[chat_id]
+        while log and now - log[0] > RATE_LIMIT_WINDOW_SECONDS:
+            log.popleft()
+        if len(log) >= RATE_LIMIT_HEAVY_MAX_CALLS:
+            wait = RATE_LIMIT_WINDOW_SECONDS - (now - log[0])
+            return False, max(wait, 1.0)
+        log.append(now)
+        return True, 0.0
+
+'''
+
+_QR_TOOLS_SOURCE = r'''
+"""qr_tools.py — QR code generation and scanning.
+
+Generation uses the pure-Python `qrcode` library (no system deps).
+Scanning uses OpenCV's built-in QRCodeDetector so we avoid apt-installing
+libzbar on Render — opencv-python-headless is enough.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from io import BytesIO
+
+
+async def generate_qr(text: str) -> bytes:
+    """Render `text` as a PNG QR code and return the raw bytes."""
+    import qrcode
+    from qrcode.constants import ERROR_CORRECT_M
+
+    def _run() -> bytes:
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=ERROR_CORRECT_M,
+            box_size=10,
+            border=4,
+        )
+        qr.add_data(text)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+        buf = BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+
+    return await asyncio.to_thread(_run)
+
+
+async def scan_qr(image_bytes: bytes) -> list[str]:
+    """Decode any QR codes found in `image_bytes`. Returns a list of strings
+    (empty if none found). Handles multiple codes in one image."""
+    import cv2
+    import numpy as np
+
+    def _run() -> list[str]:
+        arr = np.frombuffer(image_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Could not decode that image.")
+        detector = cv2.QRCodeDetector()
+        found = []
+        # multi-code path first, fall back to single-code detection
+        try:
+            ok, decoded_info, _, _ = detector.detectAndDecodeMulti(img)
+            if ok:
+                found = [s for s in decoded_info if s]
+        except cv2.error:
+            pass
+        if not found:
+            data, _, _ = detector.detectAndDecode(img)
+            if data:
+                found = [data]
+        return found
+
+    return await asyncio.to_thread(_run)
+
+'''
+
+_PASSWORD_TOOLS_SOURCE = r'''
+"""password_tools.py — secure password / PIN generation.
+
+Uses `secrets` (CSPRNG), never `random`, since output is meant to be
+actually usable as a real password.
+"""
+
+from __future__ import annotations
+
+import secrets
+import string
+
+AMBIGUOUS_CHARS = "il1Lo0O"
+
+LOWER   = string.ascii_lowercase
+UPPER   = string.ascii_uppercase
+DIGITS  = string.digits
+SYMBOLS = "!@#$%^&*()-_=+[]{};:,.?/"
+
+MIN_LENGTH = 4
+MAX_LENGTH = 128
+DEFAULT_LENGTH = 16
+
+
+def generate_password(
+    length: int = DEFAULT_LENGTH,
+    use_upper: bool = True,
+    use_lower: bool = True,
+    use_digits: bool = True,
+    use_symbols: bool = True,
+    no_ambiguous: bool = False,
+) -> str:
+    length = max(MIN_LENGTH, min(MAX_LENGTH, length))
+
+    pools: list[str] = []
+    if use_lower:
+        pools.append(LOWER)
+    if use_upper:
+        pools.append(UPPER)
+    if use_digits:
+        pools.append(DIGITS)
+    if use_symbols:
+        pools.append(SYMBOLS)
+    if not pools:
+        pools = [LOWER, DIGITS]  # sane fallback if user disabled everything
+
+    if no_ambiguous:
+        pools = [
+            "".join(c for c in pool if c not in AMBIGUOUS_CHARS) or pool
+            for pool in pools
+        ]
+
+    alphabet = "".join(pools)
+
+    # Guarantee at least one char from each selected pool, then fill the rest.
+    required = [secrets.choice(pool) for pool in pools]
+    remaining = [secrets.choice(alphabet) for _ in range(length - len(required))]
+    chars = required + remaining
+    # Shuffle securely (Fisher–Yates using secrets.randbelow).
+    for i in range(len(chars) - 1, 0, -1):
+        j = secrets.randbelow(i + 1)
+        chars[i], chars[j] = chars[j], chars[i]
+    return "".join(chars[:length])
+
+
+def generate_pin(length: int = 4) -> str:
+    length = max(3, min(12, length))
+    return "".join(secrets.choice(string.digits) for _ in range(length))
+
+'''
+
+_IMAGE_EXTRA_SOURCE = r'''
+"""image_extra.py — watermarking and size-targeted compression.
+
+Both are pure Pillow, run in a thread to keep the event loop free.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from io import BytesIO
+
+DEFAULT_WATERMARK_SCALE   = 0.15  # watermark width as a fraction of base image width
+DEFAULT_WATERMARK_OPACITY = 0.60
+DEFAULT_MARGIN_PX         = 16
+
+_POSITIONS = {"top-left", "top-right", "bottom-left", "bottom-right", "center"}
+
+
+def _compute_position(pos: str, base_w: int, base_h: int, wm_w: int, wm_h: int, margin: int) -> tuple[int, int]:
+    if pos == "top-left":
+        return margin, margin
+    if pos == "top-right":
+        return base_w - wm_w - margin, margin
+    if pos == "bottom-left":
+        return margin, base_h - wm_h - margin
+    if pos == "center":
+        return (base_w - wm_w) // 2, (base_h - wm_h) // 2
+    # default bottom-right
+    return base_w - wm_w - margin, base_h - wm_h - margin
+
+
+async def apply_watermark(
+    base_bytes: bytes,
+    watermark_bytes: bytes,
+    position: str = "bottom-right",
+    scale: float = DEFAULT_WATERMARK_SCALE,
+    opacity: float = DEFAULT_WATERMARK_OPACITY,
+) -> bytes:
+    from PIL import Image, ImageOps
+
+    position = position if position in _POSITIONS else "bottom-right"
+    scale = min(max(scale, 0.02), 0.9)
+    opacity = min(max(opacity, 0.05), 1.0)
+
+    def _run() -> bytes:
+        base = ImageOps.exif_transpose(Image.open(BytesIO(base_bytes))).convert("RGBA")
+        wm = Image.open(BytesIO(watermark_bytes)).convert("RGBA")
+
+        target_w = max(1, int(base.width * scale))
+        ratio = target_w / wm.width
+        wm = wm.resize((target_w, max(1, int(wm.height * ratio))))
+
+        if opacity < 1.0:
+            alpha = wm.split()[3].point(lambda a: int(a * opacity))
+            wm.putalpha(alpha)
+
+        x, y = _compute_position(position, base.width, base.height, wm.width, wm.height, DEFAULT_MARGIN_PX)
+        composed = base.copy()
+        composed.alpha_composite(wm, dest=(x, y))
+
+        buf = BytesIO()
+        composed.convert("RGB").save(buf, format="JPEG", quality=95, optimize=True)
+        return buf.getvalue()
+
+    return await asyncio.to_thread(_run)
+
+
+async def compress_to_target(image_bytes: bytes, target_bytes: int) -> bytes:
+    """Iteratively reduce JPEG quality, then downscale, until under target_bytes."""
+    from PIL import Image, ImageOps
+
+    def _run() -> bytes:
+        img = ImageOps.exif_transpose(Image.open(BytesIO(image_bytes))).convert("RGB")
+
+        # First pass: quality ladder at original size.
+        for quality in (95, 85, 75, 65, 55, 45, 35, 25):
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=quality, optimize=True)
+            if buf.tell() <= target_bytes:
+                return buf.getvalue()
+
+        # Second pass: progressively downscale, keep trying qualities.
+        current = img
+        for _ in range(6):
+            current = current.resize(
+                (max(1, int(current.width * 0.8)), max(1, int(current.height * 0.8)))
+            )
+            for quality in (75, 60, 45, 30):
+                buf = BytesIO()
+                current.save(buf, format="JPEG", quality=quality, optimize=True)
+                if buf.tell() <= target_bytes:
+                    return buf.getvalue()
+
+        # Best effort — return the smallest we achieved.
+        return buf.getvalue()
+
+    return await asyncio.to_thread(_run)
+
+
+def parse_size_to_bytes(text: str) -> int | None:
+    """Parse '500kb', '1mb', '750000' → bytes. Returns None if unparseable."""
+    text = text.strip().lower().replace(" ", "")
+    try:
+        if text.endswith("kb"):
+            return int(float(text[:-2]) * 1024)
+        if text.endswith("mb"):
+            return int(float(text[:-2]) * 1024 * 1024)
+        if text.endswith("b"):
+            return int(text[:-1])
+        return int(text)
+    except ValueError:
+        return None
+
+'''
+
+storage = _load_embedded_module("storage", _STORAGE_SOURCE)
+qr_tools = _load_embedded_module("qr_tools", _QR_TOOLS_SOURCE)
+password_tools = _load_embedded_module("password_tools", _PASSWORD_TOOLS_SOURCE)
+image_extra = _load_embedded_module("image_extra", _IMAGE_EXTRA_SOURCE)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  MAIN BOT CODE (originally bot.py) starts here
+# ════════════════════════════════════════════════════════════════════════════
+
 """Unified Lummi AI + Hugeicons + Image Effects + Fiver Sanitizer Telegram bot.
 
 Upgrades vs previous version:
@@ -9,10 +476,12 @@ Upgrades vs previous version:
   • Guard against stale "awaiting" state when the wrong media type is sent (FIXED)
   • Richer error messages with user-facing hints
   • NEW: /FiverMessage — sanitizes text (replaces flagged words) via command or guided prompt
+  • NEW: personal custom word list (/addword, /mywords, /delword, /resetwords)
+  • NEW: per-user rate limiting + global concurrency cap for CPU-bound tools
+  • NEW: /stats admin usage dashboard + admin error alerts
+  • NEW: QR generate/scan, password/PIN generator, image compressor, watermarking
   • Minor code cleanup: dead imports removed, constants consolidated
 """
-
-from __future__ import annotations
 
 import asyncio
 import base64
@@ -46,6 +515,7 @@ from telegram.ext import (
     filters,
 )
 
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 MAX_UPLOAD_BYTES        = 49 * 1024 * 1024
 MAX_CAPTION_LENGTH      = 1024
@@ -58,6 +528,7 @@ REMBG_MAX_DIMENSION     = 1_500
 REMBG_TIMEOUT_SECONDS   = 90
 GIF_MAX_FRAMES          = 10   # frames extracted from animated GIF
 GIF_FRAME_DELAY_MS      = 100  # default frame delay when not embedded
+DEFAULT_COMPRESS_TARGET_BYTES = 1 * 1024 * 1024
 
 REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
 HTTP_RETRY_ATTEMPTS = 3
@@ -67,6 +538,68 @@ ENGINE_SCRIPT = os.path.join(os.path.dirname(__file__), "python_engine.py")
 
 U2NETP_MODEL_URL  = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx"
 U2NETP_MODEL_PATH = os.path.join(tempfile.gettempdir(), "u2netp.onnx")
+
+
+# ── Admin roster ────────────────────────────────────────────────────────────
+# Two tiers, identified by Telegram @username (case-insensitive, no '@').
+# Super admins can do everything admins can, plus anything gated on
+# is_super_admin() in the future (e.g. destructive/global actions).
+SUPER_ADMINS: dict[str, dict[str, str]] = {
+    "ya_rabbu": {
+        "name": "Yasir Abed Rabbu",
+        "email": "yasirabedrabbu@gmail.com",
+        "telegram": "@YA_Rabbu",
+    },
+}
+
+ADMINS: dict[str, dict[str, str]] = {
+    "smashik_softvence": {
+        "name": "Sheikh Muhammad Ashik",
+        "email": "smashik716@gmail.com",
+        "telegram": "@smashik_softvence",
+    },
+}
+
+# chat_id fallback — populated the first time an admin/super-admin messages
+# the bot, so notify_admin() can DM them even before we've resolved a
+# username → chat_id mapping any other way. Also settable via ADMIN_CHAT_ID
+# env var for backward compatibility (goes to the super admin group).
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
+_admin_chat_ids: dict[str, int] = {}  # username(lower) -> chat_id
+
+_ADMIN_ERROR_THROTTLE_SECONDS = 600
+_last_admin_alert: dict[str, float] = {}
+
+
+def _username_of(update: Update) -> str | None:
+    user = update.effective_user
+    return (user.username or "").lower() if user and user.username else None
+
+
+def is_super_admin(update: Update) -> bool:
+    uname = _username_of(update)
+    return uname is not None and uname in SUPER_ADMINS
+
+
+def is_admin(update: Update) -> bool:
+    """True for super admins and admins alike."""
+    uname = _username_of(update)
+    return uname is not None and (uname in SUPER_ADMINS or uname in ADMINS)
+
+
+def admin_role_label(update: Update) -> str:
+    if is_super_admin(update):
+        return "Super Admin"
+    if is_admin(update):
+        return "Admin"
+    return "User"
+
+
+def _remember_admin_chat_id(update: Update) -> None:
+    """Cache chat_id for known admins so notify_admin() can reach them by DM."""
+    uname = _username_of(update)
+    if uname and (uname in SUPER_ADMINS or uname in ADMINS) and update.effective_chat:
+        _admin_chat_ids[uname] = update.effective_chat.id
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -140,6 +673,30 @@ async def with_retry(
     raise last_exc
 
 
+# ── Admin alerting ────────────────────────────────────────────────────────────
+
+async def notify_admin(context: ContextTypes.DEFAULT_TYPE, error_key: str, message: str) -> None:
+    """Send a short technical error to every known admin chat, throttled per
+    error_key so a recurring failure doesn't spam admins more than once per
+    window. Reaches: the legacy ADMIN_CHAT_ID env var (if set) plus any
+    admin/super-admin whose chat_id we've learned from them messaging the bot."""
+    targets = set(_admin_chat_ids.values())
+    if ADMIN_CHAT_ID:
+        targets.add(ADMIN_CHAT_ID)
+    if not targets:
+        return
+    now = asyncio.get_event_loop().time()
+    last = _last_admin_alert.get(error_key, 0)
+    if now - last < _ADMIN_ERROR_THROTTLE_SECONDS:
+        return
+    _last_admin_alert[error_key] = now
+    for chat_id in targets:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {message}"[:4000])
+        except Exception:
+            logger.exception("Failed to notify admin chat_id=%s", chat_id)
+
+
 # ── Effects ───────────────────────────────────────────────────────────────────
 EFFECT_CATEGORIES: dict[str, str] = {
     "retro":   "Retro & Print",
@@ -200,9 +757,6 @@ TRANSLATE_LANGUAGES: list[tuple[str, str]] = [
 ]
 
 # ── Fiver message sanitizer ────────────────────────────────────────────────────
-# Ported from the Text Sanitizer Pro Chrome extension's word map, with the
-# malformed nested "marketing_and_spam" object removed (it broke replacement
-# because its value was a dict, not a string).
 FIVER_WORD_MAP: dict[str, str] = {
     "email": "ema-il", "gmail": "gma-il", "whatsapp": "wha-tsapp", "skype": "sky-pe",
     "telegram": "tele-gram", "discord": "dis-cord", "phone": "pho-ne", "mobile": "mobi-le",
@@ -231,13 +785,6 @@ FIVER_WORD_MAP: dict[str, str] = {
     "order": "ord-er", "cancel": "can-cel", "refund": "refu-nd",
     "portfolio": "port-folio", "website": "web-site",
 }
-# Sorted longest-first once at import time so overlapping phrases (e.g.
-# "video call" vs "call") match correctly instead of the shorter word winning.
-_FIVER_WORDS_SORTED = sorted(FIVER_WORD_MAP.keys(), key=len, reverse=True)
-_FIVER_WORD_PATTERNS = [
-    (word, re.compile(rf"\b{re.escape(word)}\b", re.IGNORECASE))
-    for word in _FIVER_WORDS_SORTED
-]
 
 
 def _preserve_case(original: str, replacement: str) -> str:
@@ -250,11 +797,33 @@ def _preserve_case(original: str, replacement: str) -> str:
     return replacement
 
 
-def sanitize_fiver_text(text: str) -> str:
-    """Replace flagged words/phrases with their obfuscated equivalents."""
+def _build_patterns(word_map: dict[str, str]) -> list[tuple[str, re.Pattern]]:
+    """Sort longest-first so overlapping phrases (e.g. 'video call' vs 'call')
+    match correctly instead of the shorter word winning."""
+    words_sorted = sorted(word_map.keys(), key=len, reverse=True)
+    return [(w, re.compile(rf"\b{re.escape(w)}\b", re.IGNORECASE)) for w in words_sorted]
+
+
+_FIVER_WORD_PATTERNS = _build_patterns(FIVER_WORD_MAP)
+
+
+def sanitize_fiver_text(text: str, custom_words: dict[str, str] | None = None) -> str:
+    """Replace flagged words/phrases with their obfuscated equivalents.
+
+    `custom_words`, when given, is merged on top of FIVER_WORD_MAP — the
+    user's own words win on conflict — and the combined map is what actually
+    gets applied.
+    """
+    if custom_words:
+        merged = {**FIVER_WORD_MAP, **custom_words}
+        patterns = _build_patterns(merged)
+    else:
+        merged = FIVER_WORD_MAP
+        patterns = _FIVER_WORD_PATTERNS
+
     result = text
-    for word, pattern in _FIVER_WORD_PATTERNS:
-        replacement = FIVER_WORD_MAP[word]
+    for word, pattern in patterns:
+        replacement = merged[word]
         result = pattern.sub(lambda m: _preserve_case(m.group(0), replacement), result)
     return result
 
@@ -275,6 +844,8 @@ WELCOME_MESSAGE = (
     "     → extract frames or convert to PNG\n"
     "🛡 Use `/FiverMessage <text>`\n"
     "     → sanitize flagged words instantly\n"
+    "🔑 Use `/genpass` or `/qr <text>`\n"
+    "     → passwords & QR codes on demand\n"
     "🧰 Or tap a tool below to get started\n\n"
     "_Type_ `/menu` _anytime ·_ `/cancel` _to stop a task_\n\n"
     "✦ Design and Developed By *@YA_Rabbu*"
@@ -298,6 +869,18 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("🛡 Fiver Sanitizer",  callback_data="menu|fiversanitize"),
             InlineKeyboardButton("🌐 Translate",       callback_data="menu|translate"),
+        ],
+        [
+            InlineKeyboardButton("💧 Watermark",       callback_data="menu|watermark"),
+            InlineKeyboardButton("📉 Compress",        callback_data="menu|compress"),
+        ],
+        [
+            InlineKeyboardButton("🔳 QR Generate",     callback_data="menu|qrgen"),
+            InlineKeyboardButton("🔍 QR Scan",         callback_data="menu|qrscan"),
+        ],
+        [
+            InlineKeyboardButton("🔑 Password Gen",    callback_data="menu|genpass"),
+            InlineKeyboardButton("📚 Words List",      callback_data="menu|mywords"),
         ],
         [
             InlineKeyboardButton("🖼 Image Tools",     callback_data="cat|image"),
@@ -333,6 +916,10 @@ def build_category_keyboard(cat: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("🔁 JPEG → PNG",    callback_data="menu|jpg2png"),
                 InlineKeyboardButton("🔁 PNG → JPEG",    callback_data="menu|png2jpg"),
+            ],
+            [
+                InlineKeyboardButton("💧 Watermark",     callback_data="menu|watermark"),
+                InlineKeyboardButton("📉 Compress",      callback_data="menu|compress"),
             ],
             back,
         ],
@@ -457,6 +1044,33 @@ def build_translate_lang_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+def build_watermark_position_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("↖ Top-Left", callback_data="wmpos|top-left"),
+            InlineKeyboardButton("↗ Top-Right", callback_data="wmpos|top-right"),
+        ],
+        [
+            InlineKeyboardButton("↙ Bottom-Left", callback_data="wmpos|bottom-left"),
+            InlineKeyboardButton("↘ Bottom-Right", callback_data="wmpos|bottom-right"),
+        ],
+        [InlineKeyboardButton("⏺ Center", callback_data="wmpos|center")],
+    ])
+
+
+def build_genpass_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("8", callback_data="genpass|8"),
+            InlineKeyboardButton("12", callback_data="genpass|12"),
+            InlineKeyboardButton("16", callback_data="genpass|16"),
+            InlineKeyboardButton("20", callback_data="genpass|20"),
+        ],
+        [InlineKeyboardButton("🔢 4-digit PIN", callback_data="genpin|4")],
+        [InlineKeyboardButton("🔢 6-digit PIN", callback_data="genpin|6")],
+    ])
+
+
 # ── Utility ───────────────────────────────────────────────────────────────────
 
 def trim_url(url: str) -> str:
@@ -539,6 +1153,24 @@ def _get_file_id(bot_data: dict, token: str) -> str | None:
 
 def _drop_token(bot_data: dict, token: str) -> None:
     bot_data.get("pending_files", {}).pop(token, None)
+
+
+# ── Rate limiting decorator ────────────────────────────────────────────────────
+
+async def _check_heavy_rate_limit(update: Update, tool: str) -> bool:
+    """Returns True if allowed to proceed. Sends a friendly wait message and
+    returns False otherwise. Only applies to tools in storage.HEAVY_TOOLS."""
+    if tool not in storage.HEAVY_TOOLS:
+        return True
+    chat_id = update.effective_chat.id
+    allowed, wait_seconds = await storage.check_rate_limit(chat_id)
+    if not allowed:
+        await update.effective_message.reply_text(
+            f"⏳ Please wait ~{int(wait_seconds)}s before trying another heavy tool "
+            f"(max {storage.RATE_LIMIT_HEAVY_MAX_CALLS} per {storage.RATE_LIMIT_WINDOW_SECONDS}s)."
+        )
+        return False
+    return True
 
 
 # ── Image utilities ───────────────────────────────────────────────────────────
@@ -637,7 +1269,6 @@ async def gif_to_frames(gif_bytes: bytes, max_frames: int = GIF_MAX_FRAMES) -> l
         if total == 0:
             raise ValueError("GIF contains no frames.")
 
-        # Pick evenly-spaced indices so we always sample the whole animation.
         if total <= max_frames:
             indices = list(range(total))
         else:
@@ -896,9 +1527,6 @@ def format_svg(svg: str) -> str:
 
 
 # ── Shared image-tool runner ──────────────────────────────────────────────────
-# Maps tool key → (status label, output filename, async transform)
-# Sticker/GIF tools are handled separately because they produce multiple files.
-
 _SINGLE_IMAGE_TOOLS: dict[str, tuple[str, str, Callable]] = {
     "bgremove":    ("Removing background", "background_removed.png", remove_background),
     "img2pdf":     ("Converting to PDF",   "image.pdf",              image_to_pdf),
@@ -907,13 +1535,15 @@ _SINGLE_IMAGE_TOOLS: dict[str, tuple[str, str, Callable]] = {
     "sticker2png": ("Converting sticker",  "sticker.png",            sticker_to_png),
 }
 
-# Human-readable labels for every "awaiting" state, used to warn the user
-# when they send the wrong kind of media while a tool is pending.
 _AWAITING_LABELS: dict[str, str] = {
     **{k: v[0] for k, v in _SINGLE_IMAGE_TOOLS.items()},
     "gif2frames":     "Extract GIF frames",
     "translate_text": "Translate text",
     "fiver_sanitize": "Sanitize Fiver message",
+    "watermark_setup": "Upload watermark logo",
+    "watermark_apply": "Apply watermark to photo",
+    "compress_image":  "Compress image",
+    "qrscan":          "Scan QR code",
 }
 
 
@@ -933,18 +1563,26 @@ async def _run_image_tool(
     file_id: str,
     tool: str,
 ) -> None:
+    if not await _check_heavy_rate_limit(update, tool):
+        return
     label, filename, transform = _SINGLE_IMAGE_TOOLS[tool]
     status = await update.message.reply_text(f"⏳ {label}…")
     try:
         image_bytes = await _download_file(context, file_id)
-        out_bytes   = await transform(image_bytes)
+        if tool in storage.HEAVY_TOOLS:
+            async with storage.HEAVY_JOB_SEMAPHORE:
+                out_bytes = await transform(image_bytes)
+        else:
+            out_bytes = await transform(image_bytes)
         doc = BytesIO(out_bytes)
         doc.name = filename
         await update.message.reply_document(document=doc, filename=filename)
         await safe_delete(status)
+        await storage.record_usage(tool)
     except Exception as exc:
         logger.warning("%s failed: %s", tool, exc)
         await safe_edit(status, _user_hint(exc))
+        await notify_admin(context, tool, f"Tool `{tool}` failed for chat {update.effective_chat.id}: {exc}")
 
 
 async def _run_gif_tool(
@@ -967,13 +1605,14 @@ async def _run_gif_tool(
         await update.message.reply_text(
             f"✅ Extracted {len(frames)} frame(s) from the GIF."
         )
+        await storage.record_usage("gif2frames")
     except Exception as exc:
         logger.warning("gif2frames failed: %s", exc)
         await safe_edit(status, _user_hint(exc))
+        await notify_admin(context, "gif2frames", f"gif2frames failed for chat {update.effective_chat.id}: {exc}")
 
 
 # ── Doc converter integration ─────────────────────────────────────────────────
-# Imported lazily so the bot starts even if an optional dep is missing.
 try:
     from doc_converters import DOC_TOOLS as _DOC_TOOLS
     from doc_converters import pptx_to_images as _pptx_to_images
@@ -983,12 +1622,9 @@ except ImportError:
     _DOC_AVAILABLE = False
     logger.warning("doc_converters.py not found — document tools disabled.")
 
-# Which doc tool-keys produce multiple images instead of one file
 _MULTI_IMAGE_DOC_TOOLS = {"pptx2images", "pdf2img"}
 
-# Accepted MIME types / extensions per tool — used to validate uploads
 _DOC_ACCEPTS: dict[str, tuple[list[str], list[str]]] = {
-    # tool_key: ([mime_prefixes...], [extensions...])
     "pdf2docx":    (["application/pdf"],                              [".pdf"]),
     "pdf2txt":     (["application/pdf"],                              [".pdf"]),
     "pdf2img":     (["application/pdf"],                              [".pdf"]),
@@ -1017,9 +1653,8 @@ _DOC_ACCEPTS: dict[str, tuple[list[str], list[str]]] = {
 
 
 def _doc_accepts(tool: str, mime: str, filename: str) -> bool:
-    """Return True if this file type is acceptable for the given doc tool."""
     if tool not in _DOC_ACCEPTS:
-        return True  # unknown tool — let it try
+        return True
     mimes, exts = _DOC_ACCEPTS[tool]
     fname = filename.lower()
     if any(fname.endswith(e) for e in exts):
@@ -1035,17 +1670,18 @@ async def _run_doc_tool(
     file_id: str,
     tool: str,
 ) -> None:
-    """Run a document conversion tool and send the result back."""
+    if not await _check_heavy_rate_limit(update, tool):
+        return
     if not _DOC_AVAILABLE:
         await update.message.reply_text("❌ Document tools are not available on this server.")
         return
 
     if tool == "pptx2images":
-        # Special multi-image path
         status = await update.message.reply_text("⏳ Converting slides to images…")
         try:
             raw = await _download_file(context, file_id)
-            pages = await _pptx_to_images(raw)
+            async with storage.HEAVY_JOB_SEMAPHORE:
+                pages = await _pptx_to_images(raw)
             if not pages:
                 await safe_edit(status, "❌ No slides could be rendered.")
                 return
@@ -1054,9 +1690,11 @@ async def _run_doc_tool(
                 batch = pages[batch_start:batch_start + 10]
                 await update.message.reply_media_group([InputMediaPhoto(BytesIO(p)) for p in batch])
             await update.message.reply_text(f"✅ {len(pages)} slide(s) converted.")
+            await storage.record_usage("pptx2images")
         except Exception as exc:
             logger.warning("pptx2images failed: %s", exc)
             await safe_edit(status, _user_hint(exc))
+            await notify_admin(context, "pptx2images", f"pptx2images failed: {exc}")
         return
 
     entry = _DOC_TOOLS.get(tool)
@@ -1074,15 +1712,18 @@ async def _run_doc_tool(
         doc.name = out_name
         await update.message.reply_document(document=doc, filename=out_name)
         await safe_delete(status)
+        await storage.record_usage(tool)
     except Exception as exc:
         logger.warning("%s failed: %s", tool, exc)
         await safe_edit(status, _user_hint(exc))
+        await notify_admin(context, tool, f"Doc tool `{tool}` failed: {exc}")
 
 
 # ── Telegram Handlers ─────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
+        _remember_admin_chat_id(update)
         context.user_data.pop("awaiting", None)
         await update.message.reply_text(
             WELCOME_MESSAGE,
@@ -1103,6 +1744,8 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.message:
         had_task = context.user_data.pop("awaiting", None) is not None
         context.user_data.pop("target_lang", None)
+        context.user_data.pop("compress_target_bytes", None)
+        context.user_data.pop("watermark_position", None)
         await update.message.reply_text("✅ Cancelled." if had_task else "Nothing to cancel.")
 
 
@@ -1122,10 +1765,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "Send a GIF → extract up to 10 frames as images\n\n"
             "*Fiver Message Sanitizer:*\n"
             "`/FiverMessage <text>` → sanitize immediately\n"
-            "`/FiverMessage` alone → I'll ask for the text next\n\n"
+            "`/FiverMessage` alone → I'll ask for the text next\n"
+            "`/addword <word> <replacement>` → add your own\n"
+            "`/mywords` · `/delword <word>` · `/resetwords`\n\n"
+            "*QR codes:*\n"
+            "`/qr <text or link>` → generate a QR code\n"
+            "Send a photo of a QR (via /menu → QR Scan) → decode it\n\n"
+            "*Password Generator:*\n"
+            "`/genpass [length] [--symbols] [--no-ambiguous]`\n"
+            "`/genpin [length]`\n\n"
+            "*Admin:*\n"
+            "`/admins` → view the admin roster\n"
+            "`/stats` → usage stats (admin-only)\n\n"
             "*Tools (via /menu):*\n"
-            "🧹 Remove BG • 🌐 Translate text\n"
-            "📄 PDF → Images • 🖼 Image → PDF\n"
+            "🧹 Remove BG • 🌐 Translate text • 💧 Watermark\n"
+            "📉 Compress • 📄 PDF → Images • 🖼 Image → PDF\n"
             "🔁 JPEG ↔ PNG • 📝 MD → TXT\n"
             "😄 Sticker → PNG • 🎞 GIF → Frames\n"
             "🛡 Fiver Message Sanitizer\n\n"
@@ -1133,6 +1787,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             parse_mode="Markdown",
         )
 
+
+# ── Fiver sanitizer commands ───────────────────────────────────────────────────
 
 async def fivermessage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -1142,19 +1798,246 @@ async def fivermessage_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not update.message:
         return
     args_text = " ".join(context.args) if context.args else ""
+    chat_id = update.effective_chat.id
+    custom_words = await storage.get_words(chat_id)
+
     if args_text.strip():
         if len(args_text) > FIVER_SANITIZE_MAX_CHARS:
             await update.message.reply_text(
                 f"⚠️ Too long ({len(args_text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}."
             )
             return
-        sanitized = sanitize_fiver_text(args_text.strip())
+        sanitized = sanitize_fiver_text(args_text.strip(), custom_words)
         await update.message.reply_text(f"✅ *Sanitized:*\n\n{sanitized}", parse_mode="Markdown")
+        await storage.record_usage("fiver_sanitize")
         return
 
     context.user_data["awaiting"] = "fiver_sanitize"
     await update.message.reply_text(
         "🛡️ Send me the message you want to sanitize (or /cancel)."
+    )
+
+
+async def addword_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/addword <word> <replacement> — personal override, merged on top of defaults."""
+    if not update.message:
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: `/addword <word> <replacement>`\nExample: `/addword deadline dead-line`",
+            parse_mode="Markdown",
+        )
+        return
+    word = context.args[0]
+    replacement = " ".join(context.args[1:])
+    ok, info = await storage.add_word(update.effective_chat.id, word, replacement)
+    if not ok:
+        await update.message.reply_text(f"❌ {info}")
+        return
+    verb = "Updated" if info == "updated" else "Added"
+    await update.message.reply_text(f"✅ {verb}: *{word}* → *{replacement}*", parse_mode="Markdown")
+
+
+async def mywords_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/mywords — paginated list of the caller's custom words."""
+    if not update.message:
+        return
+    words = await storage.get_words(update.effective_chat.id)
+    if not words:
+        await update.message.reply_text(
+            "You have no custom words yet. Add one with `/addword <word> <replacement>`.",
+            parse_mode="Markdown",
+        )
+        return
+    PAGE_SIZE = 25
+    items = sorted(words.items())
+    pages = [items[i:i + PAGE_SIZE] for i in range(0, len(items), PAGE_SIZE)]
+    lines = []
+    for page_num, page in enumerate(pages, start=1):
+        lines.append(f"*Page {page_num}/{len(pages)}*")
+        for w, r in page:
+            lines.append(f"• `{w}` → `{r}`")
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3800] + "\n… (truncated, use /delword to trim)"
+    await update.message.reply_text(f"📚 *Your custom words* ({len(words)} total):\n\n{text}", parse_mode="Markdown")
+
+
+async def delword_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/delword <word>`", parse_mode="Markdown")
+        return
+    word = context.args[0]
+    removed = await storage.del_word(update.effective_chat.id, word)
+    if removed:
+        await update.message.reply_text(f"🗑 Removed *{word}* from your custom words.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"⚠️ You don't have a custom mapping for *{word}*.", parse_mode="Markdown")
+
+
+async def resetwords_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    await storage.reset_words(update.effective_chat.id)
+    await update.message.reply_text("♻️ Your custom words have been cleared — back to defaults only.")
+
+
+# ── Stats (admin only) ─────────────────────────────────────────────────────────
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    _remember_admin_chat_id(update)
+    if not is_admin(update):
+        await update.message.reply_text("🚫 This command is admin-only.")
+        return
+    rows = await storage.get_stats()
+    if not rows:
+        await update.message.reply_text("No usage recorded yet.")
+        return
+    lines = [f"{i+1}. `{tool}` — {count}" for i, (tool, count) in enumerate(rows[:40])]
+    role = admin_role_label(update)
+    await update.message.reply_text(
+        f"📊 *Usage stats* (viewing as {role}, most-used first):\n\n" + "\n".join(lines),
+        parse_mode="Markdown",
+    )
+
+
+async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/admins — shows the admin roster. Visible to everyone (it's just contact info),
+    but tags the caller's own role at the top for a quick self-check."""
+    if not update.message:
+        return
+    _remember_admin_chat_id(update)
+    lines = [f"*Your role:* {admin_role_label(update)}\n"]
+    lines.append("👑 *Super Admin*")
+    for info in SUPER_ADMINS.values():
+        lines.append(f"• {info['name']} — {info['telegram']} — `{info['email']}`")
+    lines.append("\n🛡 *Admin*")
+    for info in ADMINS.values():
+        lines.append(f"• {info['name']} — {info['telegram']} — `{info['email']}`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ── QR commands ─────────────────────────────────────────────────────────────────
+
+async def qr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    text = " ".join(context.args) if context.args else ""
+    if not text.strip():
+        await update.message.reply_text("Usage: `/qr <text or link>`", parse_mode="Markdown")
+        return
+    status = await update.message.reply_text("⏳ Generating QR code…")
+    try:
+        png_bytes = await qr_tools.generate_qr(text.strip())
+        doc = BytesIO(png_bytes)
+        doc.name = "qrcode.png"
+        await update.message.reply_photo(photo=doc, caption="✅ QR code ready.")
+        await safe_delete(status)
+        await storage.record_usage("qr_generate")
+    except Exception as exc:
+        logger.warning("qr_generate failed: %s", exc)
+        await safe_edit(status, _user_hint(exc))
+
+
+# ── Password commands ────────────────────────────────────────────────────────────
+
+def _parse_genpass_args(args: list[str]) -> dict:
+    length = password_tools.DEFAULT_LENGTH
+    use_symbols = False
+    no_ambiguous = False
+    for a in args:
+        if a.lstrip("-").isdigit():
+            length = int(a)
+        elif a in ("--symbols", "-s"):
+            use_symbols = True
+        elif a in ("--no-ambiguous", "-na"):
+            no_ambiguous = True
+    return {"length": length, "use_symbols": use_symbols, "no_ambiguous": no_ambiguous}
+
+
+async def genpass_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "🔑 Choose a length, or use `/genpass 16 --symbols --no-ambiguous`:",
+            reply_markup=build_genpass_keyboard(),
+        )
+        return
+    opts = _parse_genpass_args(context.args)
+    pw = password_tools.generate_password(
+        length=opts["length"], use_symbols=opts["use_symbols"], no_ambiguous=opts["no_ambiguous"]
+    )
+    await update.message.reply_text(f"🔑 `{pw}`", parse_mode="Markdown")
+    await storage.record_usage("genpass")
+
+
+async def genpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    length = 4
+    if context.args and context.args[0].isdigit():
+        length = int(context.args[0])
+    pin = password_tools.generate_pin(length)
+    await update.message.reply_text(f"🔢 `{pin}`", parse_mode="Markdown")
+    await storage.record_usage("genpin")
+
+
+async def handle_genpass_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, length_str = query.data.split("|", 1)
+        pw = password_tools.generate_password(length=int(length_str), use_symbols=True)
+        await query.edit_message_text(f"🔑 `{pw}`", parse_mode="Markdown")
+        await storage.record_usage("genpass")
+    except Exception:
+        await query.edit_message_text("❌ Failed to generate password.")
+
+
+async def handle_genpin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, length_str = query.data.split("|", 1)
+        pin = password_tools.generate_pin(int(length_str))
+        await query.edit_message_text(f"🔢 `{pin}`", parse_mode="Markdown")
+        await storage.record_usage("genpin")
+    except Exception:
+        await query.edit_message_text("❌ Failed to generate PIN.")
+
+
+# ── Compress command ──────────────────────────────────────────────────────────
+
+async def compress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    target_bytes = DEFAULT_COMPRESS_TARGET_BYTES
+    if context.args:
+        parsed = image_extra.parse_size_to_bytes(context.args[0])
+        if parsed:
+            target_bytes = parsed
+    context.user_data["awaiting"] = "compress_image"
+    context.user_data["compress_target_bytes"] = target_bytes
+    await update.message.reply_text(
+        f"📉 Send me the photo to compress (target: ~{target_bytes // 1024} KB)."
+    )
+
+
+# ── Watermark handlers ────────────────────────────────────────────────────────
+
+async def watermark_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    context.user_data["awaiting"] = "watermark_setup"
+    await update.message.reply_text(
+        "💧 First, send me your *logo/signature image* (PNG with transparency works best) — "
+        "I'll remember it for future watermarking.",
+        parse_mode="Markdown",
     )
 
 
@@ -1194,9 +2077,89 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data.pop("awaiting", None)
         return
 
+    if awaiting == "watermark_setup":
+        raw = await _download_file(context, file_id)
+        await storage.set_watermark(update.effective_chat.id, file_id)
+        context.user_data["awaiting"] = "watermark_apply"
+        await update.message.reply_text(
+            "✅ Watermark logo saved. Now send the *photo to stamp it onto*, "
+            "or pick a position first:",
+            parse_mode="Markdown",
+            reply_markup=build_watermark_position_keyboard(),
+        )
+        return
+
+    if awaiting == "watermark_apply":
+        if not await _check_heavy_rate_limit(update, "watermark"):
+            return
+        wm_file_id = await storage.get_watermark(update.effective_chat.id)
+        if not wm_file_id:
+            await update.message.reply_text("⚠️ No watermark logo saved yet. Use /watermark first.")
+            context.user_data.pop("awaiting", None)
+            return
+        status = await update.message.reply_text("⏳ Applying watermark…")
+        try:
+            base_bytes = await _download_file(context, file_id)
+            wm_bytes = await _download_file(context, wm_file_id)
+            position = context.user_data.get("watermark_position", "bottom-right")
+            async with storage.HEAVY_JOB_SEMAPHORE:
+                out_bytes = await image_extra.apply_watermark(base_bytes, wm_bytes, position=position)
+            doc = BytesIO(out_bytes)
+            doc.name = "watermarked.jpg"
+            await update.message.reply_document(document=doc, filename="watermarked.jpg")
+            await safe_delete(status)
+            await storage.record_usage("watermark")
+        except Exception as exc:
+            logger.warning("watermark failed: %s", exc)
+            await safe_edit(status, _user_hint(exc))
+            await notify_admin(context, "watermark", f"watermark failed: {exc}")
+        return
+
+    if awaiting == "compress_image":
+        if not await _check_heavy_rate_limit(update, "compress"):
+            return
+        target_bytes = context.user_data.get("compress_target_bytes", DEFAULT_COMPRESS_TARGET_BYTES)
+        status = await update.message.reply_text("⏳ Compressing…")
+        try:
+            raw = await _download_file(context, file_id)
+            async with storage.HEAVY_JOB_SEMAPHORE:
+                out_bytes = await image_extra.compress_to_target(raw, target_bytes)
+            doc = BytesIO(out_bytes)
+            doc.name = "compressed.jpg"
+            await update.message.reply_document(
+                document=doc, filename="compressed.jpg",
+                caption=f"✅ {len(out_bytes) / 1024:.0f} KB (target ~{target_bytes // 1024} KB)",
+            )
+            await safe_delete(status)
+            await storage.record_usage("compress")
+        except Exception as exc:
+            logger.warning("compress failed: %s", exc)
+            await safe_edit(status, _user_hint(exc))
+            await notify_admin(context, "compress", f"compress failed: {exc}")
+        finally:
+            context.user_data.pop("awaiting", None)
+            context.user_data.pop("compress_target_bytes", None)
+        return
+
+    if awaiting == "qrscan":
+        status = await update.message.reply_text("⏳ Scanning for QR codes…")
+        try:
+            raw = await _download_file(context, file_id)
+            results = await qr_tools.scan_qr(raw)
+            if not results:
+                await safe_edit(status, "❌ No QR code found in that image.")
+            else:
+                text = "\n\n".join(f"🔗 `{r}`" for r in results)
+                await safe_edit(status, f"✅ *Found {len(results)} code(s):*\n\n{text}", parse_mode="Markdown")
+            await storage.record_usage("qr_scan")
+        except Exception as exc:
+            logger.warning("qr_scan failed: %s", exc)
+            await safe_edit(status, _user_hint(exc))
+        finally:
+            context.user_data.pop("awaiting", None)
+        return
+
     if awaiting and awaiting not in ("effects",):
-        # A non-image tool (doc conversion, gif, translate, fiver sanitize, …)
-        # is pending — warn instead of silently launching the effect picker.
         await _warn_wrong_media(update, context, awaiting, "photo")
         return
 
@@ -1234,7 +2197,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     file_name = (doc.file_name or "").lower()
     mime      = doc.mime_type or ""
 
-    # ── No tool selected yet: smart hint based on file type ──────────────────
     if not awaiting:
         _EXT_HINTS = {
             ".pdf":  "📄 PDF detected! Go to /menu → *PDF Tools* to convert it.",
@@ -1264,7 +2226,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # ── Image-only tools (no file-type check needed — Pillow handles it) ──────
     if awaiting in _SINGLE_IMAGE_TOOLS:
         if not (mime.startswith("image/") or any(
             file_name.endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".gif")
@@ -1275,7 +2236,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.pop("awaiting", None)
         return
 
-    # ── GIF frames ────────────────────────────────────────────────────────────
     if awaiting == "gif2frames":
         if not (file_name.endswith(".gif") or mime == "image/gif"):
             await update.message.reply_text("⚠️ Please send a .gif file.")
@@ -1284,15 +2244,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.pop("awaiting", None)
         return
 
-    # ── PDF → Images (existing fast path using fitz) ──────────────────────────
     if awaiting == "pdf2img":
+        if not await _check_heavy_rate_limit(update, "pdf2img"):
+            return
         if not (file_name.endswith(".pdf") or mime == "application/pdf"):
             await update.message.reply_text("⚠️ Please send a .pdf file.")
             return
         status = await update.message.reply_text("⏳ Rendering PDF pages…")
         try:
             pdf_bytes = await _download_file(context, doc.file_id)
-            pages     = await pdf_to_images(pdf_bytes)
+            async with storage.HEAVY_JOB_SEMAPHORE:
+                pages = await pdf_to_images(pdf_bytes)
             if not pages:
                 await safe_edit(status, "❌ Couldn't render any pages from that PDF.")
                 return
@@ -1302,14 +2264,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await update.message.reply_media_group([InputMediaPhoto(BytesIO(p)) for p in batch])
             if len(pages) >= PDF2IMG_MAX_PAGES:
                 await update.message.reply_text(f"ℹ️ Only the first {PDF2IMG_MAX_PAGES} pages were rendered.")
+            await storage.record_usage("pdf2img")
         except Exception as exc:
             logger.warning("pdf2img failed: %s", exc)
             await safe_edit(status, _user_hint(exc))
+            await notify_admin(context, "pdf2img", f"pdf2img failed: {exc}")
         finally:
             context.user_data.pop("awaiting", None)
         return
 
-    # ── MD → TXT (fast pure-Python path, no subprocess needed) ───────────────
     if awaiting == "md2txt":
         if not file_name.endswith(".md"):
             await update.message.reply_text("⚠️ Please send a .md (Markdown) file.")
@@ -1323,6 +2286,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             out_doc.name = out_name
             await update.message.reply_document(document=out_doc, filename=out_name)
             await safe_delete(status)
+            await storage.record_usage("md2txt")
         except Exception as exc:
             logger.warning("md2txt failed: %s", exc)
             await safe_edit(status, _user_hint(exc))
@@ -1330,7 +2294,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data.pop("awaiting", None)
         return
 
-    # ── Fiver sanitizer: a document was sent instead of plain text ───────────
     if awaiting == "fiver_sanitize":
         if file_name.endswith(".txt") or mime == "text/plain":
             status = await update.message.reply_text("⏳ Sanitizing…")
@@ -1340,11 +2303,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 if len(text) > FIVER_SANITIZE_MAX_CHARS:
                     await safe_edit(status, f"⚠️ Too long ({len(text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}.")
                     return
-                sanitized = sanitize_fiver_text(text)
+                custom_words = await storage.get_words(update.effective_chat.id)
+                sanitized = sanitize_fiver_text(text, custom_words)
                 out_doc = BytesIO(sanitized.encode("utf-8"))
                 out_doc.name = "sanitized.txt"
                 await update.message.reply_document(document=out_doc, filename="sanitized.txt")
                 await safe_delete(status)
+                await storage.record_usage("fiver_sanitize")
             except Exception as exc:
                 logger.warning("fiver_sanitize (file) failed: %s", exc)
                 await safe_edit(status, _user_hint(exc))
@@ -1354,7 +2319,55 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text("⚠️ Please send a .txt file, or just type the message directly.")
         return
 
-    # ── All other document tools (routed through doc_converters) ──────────────
+    if awaiting == "compress_image":
+        if not (mime.startswith("image/") or any(file_name.endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp"))):
+            await update.message.reply_text("⚠️ Please send an image file.")
+            return
+        if not await _check_heavy_rate_limit(update, "compress"):
+            return
+        target_bytes = context.user_data.get("compress_target_bytes", DEFAULT_COMPRESS_TARGET_BYTES)
+        status = await update.message.reply_text("⏳ Compressing…")
+        try:
+            raw = await _download_file(context, doc.file_id)
+            async with storage.HEAVY_JOB_SEMAPHORE:
+                out_bytes = await image_extra.compress_to_target(raw, target_bytes)
+            out_doc = BytesIO(out_bytes)
+            out_doc.name = "compressed.jpg"
+            await update.message.reply_document(
+                document=out_doc, filename="compressed.jpg",
+                caption=f"✅ {len(out_bytes) / 1024:.0f} KB (target ~{target_bytes // 1024} KB)",
+            )
+            await safe_delete(status)
+            await storage.record_usage("compress")
+        except Exception as exc:
+            logger.warning("compress failed: %s", exc)
+            await safe_edit(status, _user_hint(exc))
+        finally:
+            context.user_data.pop("awaiting", None)
+            context.user_data.pop("compress_target_bytes", None)
+        return
+
+    if awaiting == "qrscan":
+        if not (mime.startswith("image/") or any(file_name.endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp"))):
+            await update.message.reply_text("⚠️ Please send an image file containing a QR code.")
+            return
+        status = await update.message.reply_text("⏳ Scanning for QR codes…")
+        try:
+            raw = await _download_file(context, doc.file_id)
+            results = await qr_tools.scan_qr(raw)
+            if not results:
+                await safe_edit(status, "❌ No QR code found in that image.")
+            else:
+                text = "\n\n".join(f"🔗 `{r}`" for r in results)
+                await safe_edit(status, f"✅ *Found {len(results)} code(s):*\n\n{text}", parse_mode="Markdown")
+            await storage.record_usage("qr_scan")
+        except Exception as exc:
+            logger.warning("qr_scan (file) failed: %s", exc)
+            await safe_edit(status, _user_hint(exc))
+        finally:
+            context.user_data.pop("awaiting", None)
+        return
+
     if awaiting in _DOC_TOOLS or awaiting == "pptx2images":
         if not _doc_accepts(awaiting, mime, file_name):
             exts = " / ".join(_DOC_ACCEPTS.get(awaiting, ([], [".file"]))[1])
@@ -1389,7 +2402,6 @@ async def handle_animation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _run_gif_tool(update, context, update.message.animation.file_id)
         context.user_data.pop("awaiting", None)
     else:
-        # Auto-extract without needing the user to select the tool first.
         await update.message.reply_text(
             f"🎞 GIF detected! Extracting up to {GIF_MAX_FRAMES} frames…"
         )
@@ -1420,7 +2432,8 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
         await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_PHOTO)
         image_bytes = await _download_file(context, file_id)
         w, h = _get_image_dimensions(image_bytes)
-        png_bytes = await apply_effect_to_image(image_bytes, effect_key, w, h)
+        async with storage.HEAVY_JOB_SEMAPHORE:
+            png_bytes = await apply_effect_to_image(image_bytes, effect_key, w, h)
         doc = BytesIO(png_bytes)
         doc.name = f"{effect_key}.png"
         await query.message.reply_document(
@@ -1429,11 +2442,13 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
         )
         await safe_edit(status_msg, f"✅ *{effect_label}* done!", parse_mode="Markdown")
         _drop_token(context.bot_data, token)
+        await storage.record_usage("effects")
     except asyncio.TimeoutError:
         await safe_edit(status_msg, "⏱ Timed out — try a smaller image.")
     except Exception as exc:
         logger.warning("Effect %s failed: %s", effect_key, exc)
         await safe_edit(status_msg, _user_hint(exc))
+        await notify_admin(context, "effects", f"Effect `{effect_key}` failed: {exc}")
 
 
 async def handle_effect_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1473,6 +2488,21 @@ async def handle_effect_back_callback(update: Update, context: ContextTypes.DEFA
     )
 
 
+async def handle_watermark_position_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, position = query.data.split("|", 1)
+    except ValueError:
+        await query.edit_message_text("❌ Invalid selection.")
+        return
+    context.user_data["watermark_position"] = position
+    context.user_data["awaiting"] = "watermark_apply"
+    await query.edit_message_text(
+        f"✅ Position set to *{position}*. Now send the photo to stamp.", parse_mode="Markdown"
+    )
+
+
 async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -1482,9 +2512,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("❌ Invalid selection.")
         return
 
-    # Prompt messages for every tool (action → (awaiting_key, user_message))
     _TOOL_PROMPTS: dict[str, tuple[str, str]] = {
-        # Image
         "effects":     ("effects",    "🎨 Send me a *photo* and pick an effect."),
         "bgremove":    ("bgremove",   "🧹 Send me a *photo* — I'll remove its background."),
         "sticker2png": ("sticker2png","😄 Send me a *static sticker* and I'll convert it to PNG."),
@@ -1493,28 +2521,24 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "pdf2img":     ("pdf2img",    f"📄 Send me a *PDF file* — I'll render up to {PDF2IMG_MAX_PAGES} pages as images."),
         "jpg2png":     ("jpg2png",    "🔁 Send me a *JPEG image* as a *file* for best quality."),
         "png2jpg":     ("png2jpg",    "🔁 Send me a *PNG image* as a *file*."),
-        # Fiver sanitizer
         "fiversanitize": ("fiver_sanitize", "🛡️ Send me the message you want to sanitize."),
-        # PDF
+        "compress":    ("compress_image", "📉 Send me the photo to compress (default target: 1 MB). Use /compress 500kb for a custom target."),
+        "qrscan":      ("qrscan",      "🔍 Send me a photo containing a QR code."),
         "pdf2docx":    ("pdf2docx",   "📄 Send me a *PDF file* → I'll convert it to DOCX."),
         "pdf2txt":     ("pdf2txt",    "📄 Send me a *PDF file* → I'll extract plain text."),
-        # Word
         "docx2pdf":    ("docx2pdf",   "📝 Send me a *.docx file* → I'll convert it to PDF."),
         "docx2txt":    ("docx2txt",   "📝 Send me a *.docx file* → I'll extract plain text."),
         "docx2html":   ("docx2html",  "📝 Send me a *.docx file* → I'll convert it to HTML."),
         "doc2docx":    ("doc2docx",   "📄 Send me a *.doc file* → I'll convert it to DOCX."),
         "odt2pdf":     ("odt2pdf",    "📄 Send me an *.odt file* → I'll convert it to PDF."),
         "odt2docx":    ("odt2docx",   "📄 Send me an *.odt file* → I'll convert it to DOCX."),
-        # Spreadsheet
         "xlsx2pdf":    ("xlsx2pdf",   "📊 Send me an *.xlsx file* → I'll convert it to PDF."),
         "xlsx2csv":    ("xlsx2csv",   "📊 Send me an *.xlsx file* → I'll export the first sheet as CSV."),
         "csv2xlsx":    ("csv2xlsx",   "📃 Send me a *.csv file* → I'll build an XLSX spreadsheet."),
         "xls2xlsx":    ("xls2xlsx",   "📊 Send me an *.xls file* → I'll convert it to XLSX."),
-        # Presentation
         "pptx2pdf":    ("pptx2pdf",   "📽 Send me a *.pptx file* → I'll convert it to PDF."),
         "pptx2images": ("pptx2images","📽 Send me a *.pptx file* → I'll render each slide as an image."),
         "ppt2pptx":    ("ppt2pptx",   "📽 Send me a *.ppt file* → I'll convert it to PPTX."),
-        # Text / Markup
         "txt2pdf":     ("txt2pdf",    "📃 Send me a *.txt file* → I'll convert it to PDF."),
         "html2pdf":    ("html2pdf",   "🌐 Send me an *.html file* → I'll render it as PDF."),
         "md2pdf":      ("md2pdf",     "📝 Send me a *.md file* → I'll convert it to PDF."),
@@ -1522,7 +2546,6 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "md2docx":     ("md2docx",    "📝 Send me a *.md file* → I'll convert it to DOCX."),
         "rtf2txt":     ("rtf2txt",    "📄 Send me a *.rtf file* → I'll strip it to plain text."),
         "rtf2pdf":     ("rtf2pdf",    "📄 Send me a *.rtf file* → I'll convert it to PDF."),
-        # eBook
         "epub2pdf":    ("epub2pdf",   "📚 Send me an *.epub file* → I'll convert it to PDF."),
     }
 
@@ -1532,6 +2555,41 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="Markdown",
             reply_markup=build_translate_lang_keyboard(),
         )
+        return
+
+    if action == "watermark":
+        context.user_data["awaiting"] = "watermark_setup"
+        await query.edit_message_text(
+            "💧 First, send me your *logo/signature image*.", parse_mode="Markdown"
+        )
+        return
+
+    if action == "genpass":
+        await query.edit_message_text(
+            "🔑 Choose a length:", reply_markup=build_genpass_keyboard()
+        )
+        return
+
+    if action == "qrgen":
+        await query.edit_message_text(
+            "🔳 Send `/qr <text or link>` to generate a QR code.", parse_mode="Markdown"
+        )
+        return
+
+    if action == "mywords":
+        words = await storage.get_words(query.message.chat_id)
+        if not words:
+            await query.edit_message_text(
+                "You have no custom words yet. Add one with `/addword <word> <replacement>`.",
+                parse_mode="Markdown",
+            )
+        else:
+            preview = "\n".join(f"• `{w}` → `{r}`" for w, r in list(sorted(words.items()))[:20])
+            await query.edit_message_text(
+                f"📚 *Your custom words* ({len(words)} total):\n\n{preview}\n\n"
+                "Use /mywords for the full paginated list.",
+                parse_mode="Markdown",
+            )
         return
 
     if action == "effects":
@@ -1623,8 +2681,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"⚠️ Too long ({len(text_to_sanitize)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}."
             )
             return
-        sanitized = sanitize_fiver_text(text_to_sanitize)
+        custom_words = await storage.get_words(update.effective_chat.id)
+        sanitized = sanitize_fiver_text(text_to_sanitize, custom_words)
         await update.message.reply_text(f"✅ *Sanitized:*\n\n{sanitized}", parse_mode="Markdown")
+        await storage.record_usage("fiver_sanitize")
         context.user_data.pop("awaiting", None)
         return
 
@@ -1643,6 +2703,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         try:
             translated = await translate_text(text_to_xlate, target_lang)
             await safe_edit(status, f"✅ *Translation:*\n\n{translated}", parse_mode="Markdown")
+            await storage.record_usage("translate")
         except Exception as exc:
             logger.warning("Translation failed: %s", exc)
             await safe_edit(status, "❌ Translation failed. Please try again.")
@@ -1650,8 +2711,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data.pop("target_lang", None)
         return
 
-    # A non-text tool (image/doc/gif) is pending and the user sent plain text
-    # instead — warn rather than silently falling through to link detection.
     awaiting = context.user_data.get("awaiting")
     if awaiting and awaiting not in ("translate_text", "fiver_sanitize"):
         await _warn_wrong_media(update, context, awaiting, "text message")
@@ -1705,6 +2764,7 @@ async def _process_lummi(update: Update, status: Any, url: str) -> None:
             ),
         )
         await safe_delete(status)
+        await storage.record_usage("lummi")
     except Exception as exc:
         logger.warning("Lummi failed: %s", exc)
         await safe_edit(status, _user_hint(exc))
@@ -1730,6 +2790,7 @@ async def _process_hugeicons(update: Update, status: Any, url: str) -> None:
             document=doc, filename=filename,
             caption=truncate_caption(f"{filename} — ready to use."),
         )
+        await storage.record_usage("hugeicons")
     except Exception as exc:
         logger.warning("Hugeicons failed: %s", exc)
         await safe_edit(status, _user_hint(exc))
@@ -1737,6 +2798,10 @@ async def _process_hugeicons(update: Update, status: Any, url: str) -> None:
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception:", exc_info=context.error)
+    try:
+        await notify_admin(context, "unhandled", f"Unhandled exception: {context.error}")
+    except Exception:
+        pass
 
 
 # ── Lifecycle hooks ────────────────────────────────────────────────────────────
@@ -1772,6 +2837,17 @@ def main() -> None:
     app.add_handler(CommandHandler("menu",   menu_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("FiverMessage", fivermessage_command))
+    app.add_handler(CommandHandler("addword", addword_command))
+    app.add_handler(CommandHandler("mywords", mywords_command))
+    app.add_handler(CommandHandler("delword", delword_command))
+    app.add_handler(CommandHandler("resetwords", resetwords_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("admins", admins_command))
+    app.add_handler(CommandHandler("qr", qr_command))
+    app.add_handler(CommandHandler("genpass", genpass_command))
+    app.add_handler(CommandHandler("genpin", genpin_command))
+    app.add_handler(CommandHandler("compress", compress_command))
+    app.add_handler(CommandHandler("watermark", watermark_command))
 
     # Media
     app.add_handler(MessageHandler(filters.PHOTO,     handle_photo))
@@ -1786,6 +2862,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_menu_callback,            pattern=r"^menu\|"))
     app.add_handler(CallbackQueryHandler(handle_category_callback,        pattern=r"^cat\|"))
     app.add_handler(CallbackQueryHandler(handle_translate_lang_callback,  pattern=r"^trlang\|"))
+    app.add_handler(CallbackQueryHandler(handle_watermark_position_callback, pattern=r"^wmpos\|"))
+    app.add_handler(CallbackQueryHandler(handle_genpass_callback,         pattern=r"^genpass\|"))
+    app.add_handler(CallbackQueryHandler(handle_genpin_callback,          pattern=r"^genpin\|"))
 
     # Text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -1793,7 +2872,10 @@ def main() -> None:
     # Errors
     app.add_error_handler(error_handler)
 
-    logger.info("Unified bot starting (Lummi + Hugeicons + 32 Effects + Sticker/GIF + Fiver Sanitizer)")
+    logger.info(
+        "Unified bot starting (Lummi + Hugeicons + 32 Effects + Sticker/GIF + "
+        "Fiver Sanitizer + Custom Words + QR + Passwords + Watermark/Compress)"
+    )
 
     if webhook_url:
         logger.info("Webhook mode on port %s", port)

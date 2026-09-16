@@ -8,7 +8,7 @@ at import time via _load_embedded_module().
 v3.1 changes
 ------------
   • New Fiver Sanitizer flow: collects
-    ClientName_OrderID_ProjectName_ProfileName_Amount as one combined
+    ClientName_OrderID_ProfileName_Amount as one combined
     string, then the message body, and outputs a fixed template inside
     a copyable Markdown code block, followed by a separate quality report.
   • Markdown stripping (bold/italic/headers/links) now runs before
@@ -138,12 +138,12 @@ async def add_word(chat_id: int, word: str, replacement: str) -> tuple[bool, str
     async with _get_lock():
         data = _load(CUSTOM_WORDS_PATH)
         user_words = data.setdefault(str(chat_id), {})
-        was_update = word in user_words
-        if not was_update and len(user_words) >= MAX_WORDS_PER_USER:
+        was_Inbox = word in user_words
+        if not was_Inbox and len(user_words) >= MAX_WORDS_PER_USER:
             return False, f"Limit reached ({MAX_WORDS_PER_USER} words). Remove one with /delword first."
         user_words[word] = replacement
         _save(CUSTOM_WORDS_PATH, data)
-    return True, "updated" if was_update else "added"
+    return True, "Inboxd" if was_Inbox else "added"
 
 
 async def get_words(chat_id: int) -> dict[str, str]:
@@ -568,7 +568,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
-    Update,
+    Inbox,
 )
 from telegram.constants import ChatAction
 from telegram.error import BadRequest
@@ -689,42 +689,42 @@ async def with_retry(fn: Callable[[], Coroutine], attempts: int = HTTP_RETRY_ATT
 
 # ── Admin helpers ─────────────────────────────────────────────────────────────
 
-def _username_of(update: Update) -> str | None:
-    user = update.effective_user
+def _username_of(Inbox: Inbox) -> str | None:
+    user = Inbox.effective_user
     return (user.username or "").lower() if user and user.username else None
 
 
-def _display_name(update: Update, escape_markdown: bool = False) -> str:
-    user = update.effective_user
+def _display_name(Inbox: Inbox, escape_markdown: bool = False) -> str:
+    user = Inbox.effective_user
     if user and user.username:
         label = f"@{user.username}"
     elif user and user.first_name:
         label = user.first_name
     else:
-        label = f"id:{update.effective_chat.id}"
+        label = f"id:{Inbox.effective_chat.id}"
     return _esc_md(label) if escape_markdown else label
 
 
-def is_super_admin(update: Update) -> bool:
-    uname = _username_of(update)
+def is_super_admin(Inbox: Inbox) -> bool:
+    uname = _username_of(Inbox)
     return uname is not None and uname in SUPER_ADMINS
 
 
-def is_admin(update: Update) -> bool:
-    uname = _username_of(update)
+def is_admin(Inbox: Inbox) -> bool:
+    uname = _username_of(Inbox)
     return uname is not None and (uname in SUPER_ADMINS or uname in ADMINS)
 
 
-def admin_role_label(update: Update) -> str:
-    if is_super_admin(update): return "Super Admin"
-    if is_admin(update):       return "Admin"
+def admin_role_label(Inbox: Inbox) -> str:
+    if is_super_admin(Inbox): return "Super Admin"
+    if is_admin(Inbox):       return "Admin"
     return "User"
 
 
-def _remember_admin_chat_id(update: Update) -> None:
-    uname = _username_of(update)
-    if uname and (uname in SUPER_ADMINS or uname in ADMINS) and update.effective_chat:
-        _admin_chat_ids[uname] = update.effective_chat.id
+def _remember_admin_chat_id(Inbox: Inbox) -> None:
+    uname = _username_of(Inbox)
+    if uname and (uname in SUPER_ADMINS or uname in ADMINS) and Inbox.effective_chat:
+        _admin_chat_ids[uname] = Inbox.effective_chat.id
 
 
 async def notify_admin(
@@ -872,7 +872,7 @@ def _build_patterns(word_map: dict[str, str]) -> list[tuple[str, re.Pattern]]:
 
 _FIVER_WORD_PATTERNS = _build_patterns(FIVER_WORD_MAP)
 
-FIVER_INFO_PATTERN_HINT = "ClientName_OrderID_ProjectName_ProfileName_Amount"
+FIVER_INFO_PATTERN_HINT = "ClientName_OrderID_ProfileName_Amount"
 
 GREETING_NORMALIZE_RE = re.compile(
     r"^\s*(hi+|hey+|hello+)\b[\s,!.]*",
@@ -885,11 +885,11 @@ SIGNOFF_RE = re.compile(
 )
 
 THANK_YOU_CHECK_CHARS = 250
-DEFAULT_CLOSING_LINE = "Thank you again for your support, and I'll keep you updated on the progress."
+DEFAULT_CLOSING_LINE = "Thank you again for your support, and I'll keep you Inboxd on the progress."
 
 FIVER_TEMPLATE = (
     "==================================\n"
-    "Status: Inbox (Update)\n"
+    "Status: Inbox (Inbox)\n"
     "Profile Name: {profile}\n"
     "Client Name: {client}\n"
     "Project Name: {project}\n"
@@ -903,7 +903,7 @@ FIVER_TEMPLATE = (
 
 
 def parse_fiver_info(text: str) -> dict[str, str] | None:
-    """Parses 'ClientName_OrderID_ProjectName_ProfileName_Amount'."""
+    """Parses 'ClientName_OrderID_ProfileName_Amount'."""
     parts = [p.strip() for p in text.strip().split("_")]
     if len(parts) != 5 or not all(parts):
         return None
@@ -1621,15 +1621,15 @@ def _drop_token(bot_data: dict, token: str) -> None:
 
 # ── Rate-limit guard ──────────────────────────────────────────────────────────
 
-async def _check_heavy_rate_limit(update: Update, tool: str) -> bool:
+async def _check_heavy_rate_limit(Inbox: Inbox, tool: str) -> bool:
     if tool not in storage.HEAVY_TOOLS:
         return True
-    chat_id = update.effective_chat.id
-    allowed, wait = await storage.check_rate_limit(chat_id, exempt=is_admin(update))
+    chat_id = Inbox.effective_chat.id
+    allowed, wait = await storage.check_rate_limit(chat_id, exempt=is_admin(Inbox))
     if not allowed:
         used, limit = await storage.calls_used(chat_id)
         extra = " You have been fully blocked by an admin." if limit <= 0 else ""
-        await update.effective_message.reply_text(
+        await Inbox.effective_message.reply_text(
             f"⏳ Please wait ~{int(wait)}s before using another heavy tool "
             f"({used}/{limit} used in the last {storage.RATE_LIMIT_WINDOW_SECONDS}s).{extra}\n"
             f"Need a higher limit? Try `/requestlimit <number>`.",
@@ -1639,9 +1639,9 @@ async def _check_heavy_rate_limit(update: Update, tool: str) -> bool:
     return True
 
 
-async def _record(context: ContextTypes.DEFAULT_TYPE, update: Update, tool: str) -> None:
-    chat_id  = update.effective_chat.id if update.effective_chat else None
-    username = _username_of(update)
+async def _record(context: ContextTypes.DEFAULT_TYPE, Inbox: Inbox, tool: str) -> None:
+    chat_id  = Inbox.effective_chat.id if Inbox.effective_chat else None
+    username = _username_of(Inbox)
     await storage.record_usage(tool, chat_id=chat_id, username=username)
 
 
@@ -2014,11 +2014,11 @@ async def _download_file(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> by
     return buf.getvalue()
 
 
-async def _run_image_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, tool: str) -> None:
-    if not await _check_heavy_rate_limit(update, tool):
+async def _run_image_tool(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE, file_id: str, tool: str) -> None:
+    if not await _check_heavy_rate_limit(Inbox, tool):
         return
     label, filename, transform = _SINGLE_IMAGE_TOOLS[tool]
-    status = await update.message.reply_text(f"⏳ {label}…")
+    status = await Inbox.message.reply_text(f"⏳ {label}…")
     try:
         image_bytes = await _download_file(context, file_id)
         if tool in storage.HEAVY_TOOLS:
@@ -2027,17 +2027,17 @@ async def _run_image_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, fi
         else:
             out_bytes = await transform(image_bytes)
         doc = BytesIO(out_bytes); doc.name = filename
-        await update.message.reply_document(document=doc, filename=filename)
+        await Inbox.message.reply_document(document=doc, filename=filename)
         await safe_delete(status)
-        await _record(context, update, tool)
+        await _record(context, Inbox, tool)
     except Exception as exc:
         logger.warning("%s failed: %s", tool, exc)
         await safe_edit(status, _user_hint(exc))
-        await notify_admin(context, tool, f"Tool `{tool}` failed for chat {update.effective_chat.id}: {exc}")
+        await notify_admin(context, tool, f"Tool `{tool}` failed for chat {Inbox.effective_chat.id}: {exc}")
 
 
-async def _run_gif_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str) -> None:
-    status = await update.message.reply_text(f"⏳ Extracting GIF frames (up to {GIF_MAX_FRAMES})…")
+async def _run_gif_tool(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE, file_id: str) -> None:
+    status = await Inbox.message.reply_text(f"⏳ Extracting GIF frames (up to {GIF_MAX_FRAMES})…")
     try:
         gif_bytes = await _download_file(context, file_id)
         frames    = await gif_to_frames(gif_bytes)
@@ -2045,9 +2045,9 @@ async def _run_gif_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, file
             await safe_edit(status, "❌ No frames could be extracted from that GIF."); return
         await safe_delete(status)
         for i in range(0, len(frames), 10):
-            await update.message.reply_media_group([InputMediaPhoto(BytesIO(f)) for f in frames[i:i+10]])
-        await update.message.reply_text(f"✅ {len(frames)} frame(s) extracted.")
-        await _record(context, update, "gif2frames")
+            await Inbox.message.reply_media_group([InputMediaPhoto(BytesIO(f)) for f in frames[i:i+10]])
+        await Inbox.message.reply_text(f"✅ {len(frames)} frame(s) extracted.")
+        await _record(context, Inbox, "gif2frames")
     except Exception as exc:
         logger.warning("gif2frames failed: %s", exc)
         await safe_edit(status, _user_hint(exc))
@@ -2099,14 +2099,14 @@ def _doc_accepts(tool: str, mime: str, filename: str) -> bool:
     return any(fn.endswith(e) for e in exts) or any(mime.startswith(m) for m in mimes)
 
 
-async def _run_doc_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, tool: str) -> None:
-    if not await _check_heavy_rate_limit(update, tool):
+async def _run_doc_tool(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE, file_id: str, tool: str) -> None:
+    if not await _check_heavy_rate_limit(Inbox, tool):
         return
     if not _DOC_AVAILABLE:
-        await update.message.reply_text("❌ Document tools are unavailable on this server."); return
+        await Inbox.message.reply_text("❌ Document tools are unavailable on this server."); return
 
     if tool == "pptx2images":
-        status = await update.message.reply_text("⏳ Rendering slides…")
+        status = await Inbox.message.reply_text("⏳ Rendering slides…")
         try:
             raw   = await _download_file(context, file_id)
             async with storage.HEAVY_JOB_SEMAPHORE:
@@ -2115,9 +2115,9 @@ async def _run_doc_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, file
                 await safe_edit(status, "❌ No slides could be rendered."); return
             await safe_delete(status)
             for i in range(0, len(pages), 10):
-                await update.message.reply_media_group([InputMediaPhoto(BytesIO(p)) for p in pages[i:i+10]])
-            await update.message.reply_text(f"✅ {len(pages)} slide(s) rendered.")
-            await _record(context, update, "pptx2images")
+                await Inbox.message.reply_media_group([InputMediaPhoto(BytesIO(p)) for p in pages[i:i+10]])
+            await Inbox.message.reply_text(f"✅ {len(pages)} slide(s) rendered.")
+            await _record(context, Inbox, "pptx2images")
         except Exception as exc:
             logger.warning("pptx2images failed: %s", exc)
             await safe_edit(status, _user_hint(exc))
@@ -2125,16 +2125,16 @@ async def _run_doc_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, file
 
     entry = _DOC_TOOLS.get(tool)
     if not entry:
-        await update.message.reply_text("❌ Unknown document tool."); return
+        await Inbox.message.reply_text("❌ Unknown document tool."); return
     label, _, handler = entry
-    status = await update.message.reply_text(f"⏳ {label}…")
+    status = await Inbox.message.reply_text(f"⏳ {label}…")
     try:
         raw = await _download_file(context, file_id)
         out_bytes, out_name = await handler(raw)
         doc = BytesIO(out_bytes); doc.name = out_name
-        await update.message.reply_document(document=doc, filename=out_name)
+        await Inbox.message.reply_document(document=doc, filename=out_name)
         await safe_delete(status)
-        await _record(context, update, tool)
+        await _record(context, Inbox, tool)
     except Exception as exc:
         logger.warning("%s failed: %s", tool, exc)
         await safe_edit(status, _user_hint(exc))
@@ -2145,32 +2145,32 @@ async def _run_doc_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, file
 #  COMMAND HANDLERS
 # ════════════════════════════════════════════════════════════════════════════
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    _remember_admin_chat_id(update)
+async def start(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
+    _remember_admin_chat_id(Inbox)
     context.user_data.pop("awaiting", None)
-    await update.message.reply_text(WELCOME_MESSAGE, parse_mode="Markdown", reply_markup=build_main_menu_keyboard())
+    await Inbox.message.reply_text(WELCOME_MESSAGE, parse_mode="Markdown", reply_markup=build_main_menu_keyboard())
 
 
-async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    await update.message.reply_text(MENU_INTRO, parse_mode="Markdown", reply_markup=build_main_menu_keyboard())
+async def menu_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
+    await Inbox.message.reply_text(MENU_INTRO, parse_mode="Markdown", reply_markup=build_main_menu_keyboard())
 
 
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
+async def cancel_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
     had = context.user_data.pop("awaiting", None)
     for key in (
         "target_lang", "compress_target_bytes", "watermark_position", "color_tool",
         "dev_tool", "dev_tool_step", "fiver_info", "diff_text_a", "case_input",
     ):
         context.user_data.pop(key, None)
-    await update.message.reply_text("✅ Cancelled." if had else "Nothing to cancel.")
+    await Inbox.message.reply_text("✅ Cancelled." if had else "Nothing to cancel.")
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    await update.message.reply_text(
+async def help_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
+    await Inbox.message.reply_text(
         "📖 *BangaliIcon Bot — Help*\n\n"
         "*Asset extraction:*\n"
         "Send a Lummi.ai or Hugeicons link → instant download\n\n"
@@ -2178,7 +2178,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Send any photo → choose category → choose effect\n\n"
         "*Fiver Sanitizer:*\n"
         "`/FiverMessage` → send order info, then the message text\n"
-        "Order info format: `ClientName_OrderID_ProjectName_ProfileName_Amount`\n"
+        "Order info format: `ClientName_OrderID_ProfileName_Amount`\n"
         "Output is a copy-ready template in a code block + a separate quality report.\n"
         "`/addword` · `/mywords` · `/delword` · `/resetwords`\n\n"
         "*🎨 Colour Tools (/menu → Colour Tools):*\n"
@@ -2199,11 +2199,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # ── Fiver Sanitizer v3 ────────────────────────────────────────────────────────
 
-async def fivermessage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
+async def fivermessage_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
     context.user_data.pop("fiver_info", None)
     context.user_data["awaiting"] = "fiver_info"
-    await update.message.reply_text(
+    await Inbox.message.reply_text(
         "🛡 প্রথমে অর্ডার তথ্য দিন এই ফরম্যাটে (একটাই লাইনে, `_` দিয়ে আলাদা করে):\n\n"
         f"`{FIVER_INFO_PATTERN_HINT}`\n\n"
         "উদাহরণ: `jmbattaglia_FO41C0CAC4D84_CustomerPortal_brainflux_1000`\n\n"
@@ -2212,22 +2212,22 @@ async def fivermessage_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-async def addword_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
+async def addword_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: `/addword <word> <replacement>`", parse_mode="Markdown"); return
-    ok, info = await storage.add_word(update.effective_chat.id, context.args[0], " ".join(context.args[1:]))
+        await Inbox.message.reply_text("Usage: `/addword <word> <replacement>`", parse_mode="Markdown"); return
+    ok, info = await storage.add_word(Inbox.effective_chat.id, context.args[0], " ".join(context.args[1:]))
     if not ok:
-        await update.message.reply_text(f"❌ {info}"); return
-    verb = "Updated" if info == "updated" else "Added"
-    await update.message.reply_text(f"✅ {verb}: *{context.args[0]}* → *{' '.join(context.args[1:])}*", parse_mode="Markdown")
+        await Inbox.message.reply_text(f"❌ {info}"); return
+    verb = "Inboxd" if info == "Inboxd" else "Added"
+    await Inbox.message.reply_text(f"✅ {verb}: *{context.args[0]}* → *{' '.join(context.args[1:])}*", parse_mode="Markdown")
 
 
-async def mywords_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    words = await storage.get_words(update.effective_chat.id)
+async def mywords_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
+    words = await storage.get_words(Inbox.effective_chat.id)
     if not words:
-        await update.message.reply_text("No custom words yet. Add with `/addword <word> <replacement>`.", parse_mode="Markdown"); return
+        await Inbox.message.reply_text("No custom words yet. Add with `/addword <word> <replacement>`.", parse_mode="Markdown"); return
     PAGE_SIZE = 25
     items = sorted(words.items())
     lines = []
@@ -2237,37 +2237,37 @@ async def mywords_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     text = "\n".join(lines)
     if len(text) > 3800:
         text = text[:3800] + "\n… (truncated)"
-    await update.message.reply_text(f"📚 *Custom words* ({len(words)}):\n\n{text}", parse_mode="Markdown")
+    await Inbox.message.reply_text(f"📚 *Custom words* ({len(words)}):\n\n{text}", parse_mode="Markdown")
 
 
-async def delword_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
+async def delword_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
     if not context.args:
-        await update.message.reply_text("Usage: `/delword <word>`", parse_mode="Markdown"); return
-    removed = await storage.del_word(update.effective_chat.id, context.args[0])
-    await update.message.reply_text(
+        await Inbox.message.reply_text("Usage: `/delword <word>`", parse_mode="Markdown"); return
+    removed = await storage.del_word(Inbox.effective_chat.id, context.args[0])
+    await Inbox.message.reply_text(
         f"🗑 Removed *{context.args[0]}*." if removed else f"⚠️ No custom mapping for *{context.args[0]}*.",
         parse_mode="Markdown",
     )
 
 
-async def resetwords_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    await storage.reset_words(update.effective_chat.id)
-    await update.message.reply_text("♻️ Custom words cleared.")
+async def resetwords_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
+    await storage.reset_words(Inbox.effective_chat.id)
+    await Inbox.message.reply_text("♻️ Custom words cleared.")
 
 
 # ── Stats / Admin ─────────────────────────────────────────────────────────────
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    _remember_admin_chat_id(update)
-    if not is_admin(update):
-        await update.message.reply_text("🚫 Admin only."); return
+async def stats_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
+    _remember_admin_chat_id(Inbox)
+    if not is_admin(Inbox):
+        await Inbox.message.reply_text("🚫 Admin only."); return
     rows     = await storage.get_stats()
     activity = await storage.get_user_activity_all()
     if not rows:
-        await update.message.reply_text("No usage recorded yet."); return
+        await Inbox.message.reply_text("No usage recorded yet."); return
     top      = rows[:12]
     mx       = top[0][1] if top else 0
     tool_lines = [f"`{t:<18}` {_bar(c, mx)} {c}" for t, c in top]
@@ -2276,8 +2276,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• {_esc_md('@'+e.get('username','')) if e.get('username') else 'id:'+cid} — `{cid}` — {sum(e.get('counts',{}).values())}"
         for cid, e in leaders
     ]
-    await update.message.reply_text(
-        f"📊 *Usage Dashboard* ({admin_role_label(update)})\n\n"
+    await Inbox.message.reply_text(
+        f"📊 *Usage Dashboard* ({admin_role_label(Inbox)})\n\n"
         f"*By tool:*\n" + "\n".join(tool_lines) +
         "\n\n*Top users:*\n" + ("\n".join(user_lines) or "_No per-user data yet._"),
         parse_mode="Markdown",
@@ -2296,19 +2296,19 @@ async def _resolve_target_chat_id_async(arg: str) -> int | None:
     return direct if direct is not None else await storage.find_chat_id_by_username(arg)
 
 
-async def useractivity_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    _remember_admin_chat_id(update)
-    if not is_admin(update):
-        await update.message.reply_text("🚫 Admin only."); return
+async def useractivity_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
+    _remember_admin_chat_id(Inbox)
+    if not is_admin(Inbox):
+        await Inbox.message.reply_text("🚫 Admin only."); return
     if not context.args:
-        await update.message.reply_text("Usage: `/useractivity <chat_id or @username>`", parse_mode="Markdown"); return
+        await Inbox.message.reply_text("Usage: `/useractivity <chat_id or @username>`", parse_mode="Markdown"); return
     target = await _resolve_target_chat_id_async(context.args[0])
     if target is None:
-        await update.message.reply_text("⚠️ User not found."); return
+        await Inbox.message.reply_text("⚠️ User not found."); return
     entry = await storage.get_user_activity(target)
     if not entry:
-        await update.message.reply_text(f"No activity for `{target}`.", parse_mode="Markdown"); return
+        await Inbox.message.reply_text(f"No activity for `{target}`.", parse_mode="Markdown"); return
     uname  = entry.get("username")
     label  = _esc_md(f"@{uname}") if uname else "(no username)"
     used, limit = await storage.calls_used(target)
@@ -2319,7 +2319,7 @@ async def useractivity_command(update: Update, context: ContextTypes.DEFAULT_TYP
         f"• {datetime.datetime.fromtimestamp(e['ts']).strftime('%Y-%m-%d %H:%M')} — `{e['tool']}`"
         for e in reversed(recent)
     )
-    await update.message.reply_text(
+    await Inbox.message.reply_text(
         f"👤 *{label}* — `{target}`\n"
         f"Rate limit: {used}/{limit}\n\n"
         f"*Totals:*\n{count_lines or '_none_'}\n\n"
@@ -2328,75 +2328,75 @@ async def useractivity_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    _remember_admin_chat_id(update)
-    lines = [f"*Your role:* {admin_role_label(update)}\n", "👑 *Super Admin*"]
+async def admins_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
+    _remember_admin_chat_id(Inbox)
+    lines = [f"*Your role:* {admin_role_label(Inbox)}\n", "👑 *Super Admin*"]
     lines += [f"• {i['name']} — [Message]({i['telegram']}) — `{i['email']}`" for i in SUPER_ADMINS.values()]
     lines += ["\n🛡 *Admin*"]
     lines += [f"• {i['name']} — [Message]({i['telegram']}) — `{i['email']}`" for i in ADMINS.values()]
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+    await Inbox.message.reply_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
 
 
-async def setlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    _remember_admin_chat_id(update)
-    if not is_admin(update):
-        await update.message.reply_text("🚫 Admin only."); return
+async def setlimit_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
+    _remember_admin_chat_id(Inbox)
+    if not is_admin(Inbox):
+        await Inbox.message.reply_text("🚫 Admin only."); return
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: `/setlimit <chat_id|@user> <n>`", parse_mode="Markdown"); return
+        await Inbox.message.reply_text("Usage: `/setlimit <chat_id|@user> <n>`", parse_mode="Markdown"); return
     target = await _resolve_target_chat_id_async(context.args[0])
     if target is None:
-        await update.message.reply_text("⚠️ User not found."); return
+        await Inbox.message.reply_text("⚠️ User not found."); return
     try:
         n = int(context.args[1])
     except ValueError:
-        await update.message.reply_text("⚠️ Limit must be a number."); return
+        await Inbox.message.reply_text("⚠️ Limit must be a number."); return
     await storage.set_custom_limit(target, n)
-    await update.message.reply_text(f"✅ `{target}` limited to *{n}* calls/60s.", parse_mode="Markdown")
+    await Inbox.message.reply_text(f"✅ `{target}` limited to *{n}* calls/60s.", parse_mode="Markdown")
     try:
-        await context.bot.send_message(target, f"ℹ️ Your limit was updated to {n} calls/60s by an admin.")
+        await context.bot.send_message(target, f"ℹ️ Your limit was Inboxd to {n} calls/60s by an admin.")
     except Exception:
         pass
 
 
-async def resetlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    _remember_admin_chat_id(update)
-    if not is_admin(update):
-        await update.message.reply_text("🚫 Admin only."); return
+async def resetlimit_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
+    _remember_admin_chat_id(Inbox)
+    if not is_admin(Inbox):
+        await Inbox.message.reply_text("🚫 Admin only."); return
     if not context.args:
-        await update.message.reply_text("Usage: `/resetlimit <chat_id|@user>`", parse_mode="Markdown"); return
+        await Inbox.message.reply_text("Usage: `/resetlimit <chat_id|@user>`", parse_mode="Markdown"); return
     target = await _resolve_target_chat_id_async(context.args[0])
     if target is None:
-        await update.message.reply_text("⚠️ User not found."); return
+        await Inbox.message.reply_text("⚠️ User not found."); return
     await storage.set_custom_limit(target, None)
-    await update.message.reply_text(f"♻️ `{target}` back to default limit.", parse_mode="Markdown")
+    await Inbox.message.reply_text(f"♻️ `{target}` back to default limit.", parse_mode="Markdown")
 
 
-async def mylimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    if is_admin(update):
-        await update.message.reply_text(f"👑 You are *{admin_role_label(update)}* — rate limits do not apply.", parse_mode="Markdown"); return
-    used, limit = await storage.calls_used(update.effective_chat.id)
-    await update.message.reply_text(
+async def mylimit_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
+    if is_admin(Inbox):
+        await Inbox.message.reply_text(f"👑 You are *{admin_role_label(Inbox)}* — rate limits do not apply.", parse_mode="Markdown"); return
+    used, limit = await storage.calls_used(Inbox.effective_chat.id)
+    await Inbox.message.reply_text(
         f"📊 *{used}/{limit}* heavy-tool calls used in the last {storage.RATE_LIMIT_WINDOW_SECONDS}s.\n"
         f"Need more? `/requestlimit <number>`",
         parse_mode="Markdown",
     )
 
 
-async def requestlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
+async def requestlimit_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: `/requestlimit <number>`", parse_mode="Markdown"); return
+        await Inbox.message.reply_text("Usage: `/requestlimit <number>`", parse_mode="Markdown"); return
     requested = min(int(context.args[0]), MAX_LIMIT_REQUEST_VALUE)
-    chat_id   = update.effective_chat.id
-    username  = _username_of(update)
-    display   = _display_name(update, escape_markdown=True)
+    chat_id   = Inbox.effective_chat.id
+    username  = _username_of(Inbox)
+    display   = _display_name(Inbox, escape_markdown=True)
     await storage.add_limit_request(chat_id, username, requested)
     used, limit = await storage.calls_used(chat_id)
-    await update.message.reply_text(
+    await Inbox.message.reply_text(
         f"📨 Request for *{requested}* calls/60s sent to admins. You'll be notified once reviewed.",
         parse_mode="Markdown",
     )
@@ -2413,74 +2413,74 @@ async def requestlimit_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-async def pendingrequests_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    _remember_admin_chat_id(update)
-    if not is_admin(update):
-        await update.message.reply_text("🚫 Admin only."); return
+async def pendingrequests_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
+    _remember_admin_chat_id(Inbox)
+    if not is_admin(Inbox):
+        await Inbox.message.reply_text("🚫 Admin only."); return
     reqs = await storage.get_limit_requests()
     if not reqs:
-        await update.message.reply_text("✅ No pending requests."); return
+        await Inbox.message.reply_text("✅ No pending requests."); return
     for cid, info in reqs.items():
         uname = info.get("username")
         label = _esc_md(f"@{uname}") if uname else f"id:{cid}"
-        await update.message.reply_text(
+        await Inbox.message.reply_text(
             f"🙋 {label} — `{cid}` — requested *{info.get('requested')}*",
             parse_mode="Markdown",
             reply_markup=build_limit_request_keyboard(int(cid), int(info.get("requested", 0))),
         )
 
 
-async def blockuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    _remember_admin_chat_id(update)
-    if not is_super_admin(update):
-        await update.message.reply_text("🚫 Super-admin only."); return
+async def blockuser_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
+    _remember_admin_chat_id(Inbox)
+    if not is_super_admin(Inbox):
+        await Inbox.message.reply_text("🚫 Super-admin only."); return
     if not context.args:
-        await update.message.reply_text("Usage: `/blockuser <chat_id|@user>`", parse_mode="Markdown"); return
+        await Inbox.message.reply_text("Usage: `/blockuser <chat_id|@user>`", parse_mode="Markdown"); return
     target = await _resolve_target_chat_id_async(context.args[0])
     if target is None:
-        await update.message.reply_text("⚠️ User not found."); return
+        await Inbox.message.reply_text("⚠️ User not found."); return
     await storage.block_user(target)
-    await update.message.reply_text(f"🚫 `{target}` fully blocked.", parse_mode="Markdown")
+    await Inbox.message.reply_text(f"🚫 `{target}` fully blocked.", parse_mode="Markdown")
 
 
-async def unblockuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
-    _remember_admin_chat_id(update)
-    if not is_super_admin(update):
-        await update.message.reply_text("🚫 Super-admin only."); return
+async def unblockuser_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
+    _remember_admin_chat_id(Inbox)
+    if not is_super_admin(Inbox):
+        await Inbox.message.reply_text("🚫 Super-admin only."); return
     if not context.args:
-        await update.message.reply_text("Usage: `/unblockuser <chat_id|@user>`", parse_mode="Markdown"); return
+        await Inbox.message.reply_text("Usage: `/unblockuser <chat_id|@user>`", parse_mode="Markdown"); return
     target = await _resolve_target_chat_id_async(context.args[0])
     if target is None:
-        await update.message.reply_text("⚠️ User not found."); return
+        await Inbox.message.reply_text("⚠️ User not found."); return
     await storage.unblock_user(target)
-    await update.message.reply_text(f"✅ `{target}` unblocked.", parse_mode="Markdown")
+    await Inbox.message.reply_text(f"✅ `{target}` unblocked.", parse_mode="Markdown")
 
 
 # ── QR, Password, Compress, Watermark ────────────────────────────────────────
 
-async def qr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
+async def qr_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
     text = " ".join(context.args) if context.args else ""
     if not text.strip():
-        await update.message.reply_text("Usage: `/qr <text or link>`", parse_mode="Markdown"); return
-    status = await update.message.reply_text("⏳ Generating QR code…")
+        await Inbox.message.reply_text("Usage: `/qr <text or link>`", parse_mode="Markdown"); return
+    status = await Inbox.message.reply_text("⏳ Generating QR code…")
     try:
         png = await qr_tools.generate_qr(text.strip())
         doc = BytesIO(png); doc.name = "qrcode.png"
-        await update.message.reply_photo(photo=doc, caption="✅ QR code ready.")
+        await Inbox.message.reply_photo(photo=doc, caption="✅ QR code ready.")
         await safe_delete(status)
-        await _record(context, update, "qr_generate")
+        await _record(context, Inbox, "qr_generate")
     except Exception as exc:
         await safe_edit(status, _user_hint(exc))
 
 
-async def genpass_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
+async def genpass_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
     if not context.args:
-        await update.message.reply_text("🔑 Choose a length:", reply_markup=build_genpass_keyboard()); return
+        await Inbox.message.reply_text("🔑 Choose a length:", reply_markup=build_genpass_keyboard()); return
     length     = password_tools.DEFAULT_LENGTH
     use_sym    = False
     no_ambig   = False
@@ -2489,32 +2489,32 @@ async def genpass_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         elif a in ("--symbols","-s"): use_sym = True
         elif a in ("--no-ambiguous","-na"): no_ambig = True
     pw = password_tools.generate_password(length=length, use_symbols=use_sym, no_ambiguous=no_ambig)
-    await update.message.reply_text(f"🔑 `{pw}`", parse_mode="Markdown")
-    await _record(context, update, "genpass")
+    await Inbox.message.reply_text(f"🔑 `{pw}`", parse_mode="Markdown")
+    await _record(context, Inbox, "genpass")
 
 
-async def genpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
+async def genpin_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
     length = int(context.args[0]) if context.args and context.args[0].isdigit() else 4
-    await update.message.reply_text(f"🔢 `{password_tools.generate_pin(length)}`", parse_mode="Markdown")
-    await _record(context, update, "genpin")
+    await Inbox.message.reply_text(f"🔢 `{password_tools.generate_pin(length)}`", parse_mode="Markdown")
+    await _record(context, Inbox, "genpin")
 
 
-async def compress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
+async def compress_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
     target = DEFAULT_COMPRESS_TARGET
     if context.args:
         parsed = image_extra.parse_size_to_bytes(context.args[0])
         if parsed: target = parsed
     context.user_data["awaiting"]              = "compress_image"
     context.user_data["compress_target_bytes"] = target
-    await update.message.reply_text(f"📉 Send the photo to compress (target: ~{target//1024} KB).")
+    await Inbox.message.reply_text(f"📉 Send the photo to compress (target: ~{target//1024} KB).")
 
 
-async def watermark_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message: return
+async def watermark_command(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message: return
     context.user_data["awaiting"] = "watermark_setup"
-    await update.message.reply_text(
+    await Inbox.message.reply_text(
         "💧 Send your *logo/signature image* first (PNG with transparency works best).",
         parse_mode="Markdown",
     )
@@ -2524,8 +2524,8 @@ async def watermark_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 #  CALLBACK HANDLERS
 # ════════════════════════════════════════════════════════════════════════════
 
-async def handle_effect_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query; await query.answer()
+async def handle_effect_category_callback(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = Inbox.callback_query; await query.answer()
     try: _, category, token = query.data.split("|", 2)
     except ValueError: await query.edit_message_text("❌ Invalid."); return
     if not _get_file_id(context.bot_data, token):
@@ -2536,8 +2536,8 @@ async def handle_effect_category_callback(update: Update, context: ContextTypes.
     )
 
 
-async def handle_effect_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query; await query.answer()
+async def handle_effect_back_callback(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = Inbox.callback_query; await query.answer()
     try: _, token = query.data.split("|", 1)
     except ValueError: await query.edit_message_text("❌ Invalid."); return
     if not _get_file_id(context.bot_data, token):
@@ -2545,8 +2545,8 @@ async def handle_effect_back_callback(update: Update, context: ContextTypes.DEFA
     await query.edit_message_text("🎨 *Choose a category:*", parse_mode="Markdown", reply_markup=build_effect_categories_keyboard(token))
 
 
-async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query; await query.answer()
+async def handle_effect_callback(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = Inbox.callback_query; await query.answer()
     try: _, effect_key, token = query.data.split("|", 2)
     except ValueError: await query.edit_message_text("❌ Invalid."); return
     file_id = _get_file_id(context.bot_data, token)
@@ -2554,7 +2554,7 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("❌ Request expired — please resend the photo."); return
 
     # Effects are a heavy tool — enforce the rate limit here too.
-    if not await _check_heavy_rate_limit(update, "effects"):
+    if not await _check_heavy_rate_limit(Inbox, "effects"):
         return
 
     label = EFFECT_NAMES.get(effect_key, effect_key)
@@ -2572,7 +2572,7 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
         )
         await safe_edit(status_msg, f"✅ *{label}* done!", parse_mode="Markdown")
         _drop_token(context.bot_data, token)
-        await _record(context, update, f"effect:{effect_key}")
+        await _record(context, Inbox, f"effect:{effect_key}")
     except asyncio.TimeoutError:
         await safe_edit(status_msg, "⏱ Timed out — try a smaller image.")
     except Exception as exc:
@@ -2581,8 +2581,8 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
         await notify_admin(context, "effects", f"Effect `{effect_key}` failed: {exc}")
 
 
-async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query; await query.answer()
+async def handle_menu_callback(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = Inbox.callback_query; await query.answer()
     try: _, action = query.data.split("|", 1)
     except ValueError: await query.edit_message_text("❌ Invalid."); return
 
@@ -2595,7 +2595,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "pdf2img":     ("pdf2img",         f"📄 Send me a *PDF* — I'll render up to {PDF2IMG_MAX_PAGES} pages."),
         "jpg2png":     ("jpg2png",         "🔁 Send me a *JPEG* as a file for best quality."),
         "png2jpg":     ("png2jpg",         "🔁 Send me a *PNG* as a file."),
-        "fiversanitize":("fiver_info",     "🛡 প্রথমে অর্ডার তথ্য দিন: `ClientName_OrderID_ProjectName_ProfileName_Amount`"),
+        "fiversanitize":("fiver_info",     "🛡 প্রথমে অর্ডার তথ্য দিন: `ClientName_OrderID_ProfileName_Amount`"),
         "compress":    ("compress_image",  f"📉 Send me the photo to compress (default ~{DEFAULT_COMPRESS_TARGET//1024} KB)."),
         "qrscan":      ("qrscan",          "🔍 Send me a photo containing a QR code."),
         **{t: (t, f"Send me the file for `{t}`.") for t in _DOC_ACCEPTS},
@@ -2635,8 +2635,8 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("❌ Unknown option.")
 
 
-async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query; await query.answer()
+async def handle_category_callback(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = Inbox.callback_query; await query.answer()
     try: _, cat = query.data.split("|", 1)
     except ValueError: await query.edit_message_text("❌ Invalid."); return
     if cat == "back":
@@ -2652,8 +2652,8 @@ async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT
     )
 
 
-async def handle_color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query; await query.answer()
+async def handle_color_callback(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = Inbox.callback_query; await query.answer()
     try: _, tool = query.data.split("|", 1)
     except ValueError: await query.edit_message_text("❌ Invalid."); return
 
@@ -2669,8 +2669,8 @@ async def handle_color_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(prompts.get(tool, "Send colour input:"), parse_mode="Markdown", reply_markup=build_color_input_keyboard(tool))
 
 
-async def handle_dev_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query; await query.answer()
+async def handle_dev_callback(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = Inbox.callback_query; await query.answer()
     try: _, tool = query.data.split("|", 1)
     except ValueError: await query.edit_message_text("❌ Invalid."); return
 
@@ -2702,8 +2702,8 @@ async def handle_dev_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_text(prompts.get(tool, "Send input:"), parse_mode="Markdown", reply_markup=build_dev_input_keyboard(tool))
 
 
-async def handle_case_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query; await query.answer()
+async def handle_case_callback(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = Inbox.callback_query; await query.answer()
     try: _, mode = query.data.split("|", 1)
     except ValueError: await query.edit_message_text("❌ Invalid."); return
     text = context.user_data.pop("case_input", "")
@@ -2713,8 +2713,8 @@ async def handle_case_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(f"🔤 *{mode}:*\n\n`{result}`", parse_mode="Markdown", reply_markup=build_dev_input_keyboard("case"))
 
 
-async def handle_translate_lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query; await query.answer()
+async def handle_translate_lang_callback(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = Inbox.callback_query; await query.answer()
     try: _, lang_code = query.data.split("|", 1)
     except ValueError: await query.edit_message_text("❌ Invalid."); return
     lang_label = next((l for c, l in TRANSLATE_LANGUAGES if c == lang_code), lang_code)
@@ -2723,8 +2723,8 @@ async def handle_translate_lang_callback(update: Update, context: ContextTypes.D
     await query.edit_message_text(f"✏️ Send the text to translate to *{lang_label}*.", parse_mode="Markdown")
 
 
-async def handle_watermark_position_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query; await query.answer()
+async def handle_watermark_position_callback(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = Inbox.callback_query; await query.answer()
     try: _, position = query.data.split("|", 1)
     except ValueError: await query.edit_message_text("❌ Invalid."); return
     context.user_data["watermark_position"] = position
@@ -2732,30 +2732,30 @@ async def handle_watermark_position_callback(update: Update, context: ContextTyp
     await query.edit_message_text(f"✅ Position set to *{position}*. Now send the photo to stamp.", parse_mode="Markdown")
 
 
-async def handle_genpass_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query; await query.answer()
+async def handle_genpass_callback(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = Inbox.callback_query; await query.answer()
     try:
         _, length_str = query.data.split("|", 1)
         pw = password_tools.generate_password(length=int(length_str), use_symbols=True)
         await query.edit_message_text(f"🔑 `{pw}`", parse_mode="Markdown")
-        await _record(context, update, "genpass")
+        await _record(context, Inbox, "genpass")
     except Exception:
         await query.edit_message_text("❌ Failed to generate password.")
 
 
-async def handle_genpin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query; await query.answer()
+async def handle_genpin_callback(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = Inbox.callback_query; await query.answer()
     try:
         _, length_str = query.data.split("|", 1)
         await query.edit_message_text(f"🔢 `{password_tools.generate_pin(int(length_str))}`", parse_mode="Markdown")
-        await _record(context, update, "genpin")
+        await _record(context, Inbox, "genpin")
     except Exception:
         await query.edit_message_text("❌ Failed to generate PIN.")
 
 
-async def handle_limit_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query; await query.answer()
-    if not is_admin(update):
+async def handle_limit_request_callback(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = Inbox.callback_query; await query.answer()
+    if not is_admin(Inbox):
         await query.answer("Admins only.", show_alert=True); return
     parts     = query.data.split("|")
     action    = parts[1]
@@ -2778,52 +2778,52 @@ async def handle_limit_request_callback(update: Update, context: ContextTypes.DE
 #  MEDIA HANDLERS
 # ════════════════════════════════════════════════════════════════════════════
 
-async def _warn_wrong_media(update: Update, context: ContextTypes.DEFAULT_TYPE, awaiting: str, got: str) -> None:
+async def _warn_wrong_media(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE, awaiting: str, got: str) -> None:
     label = _AWAITING_LABELS.get(awaiting, awaiting)
-    await update.message.reply_text(
+    await Inbox.message.reply_text(
         f"⚠️ I'm waiting for *{label}* input, but got a {got}.\n"
         f"Send the correct input or /cancel.",
         parse_mode="Markdown",
     )
 
 
-async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.sticker: return
+async def handle_sticker(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message or not Inbox.message.sticker: return
     awaiting = context.user_data.get("awaiting")
     if awaiting and awaiting != "sticker2png":
-        await _warn_wrong_media(update, context, awaiting, "sticker"); return
-    sticker = update.message.sticker
+        await _warn_wrong_media(Inbox, context, awaiting, "sticker"); return
+    sticker = Inbox.message.sticker
     if sticker.is_animated or sticker.is_video:
-        await update.message.reply_text("⚠️ Animated/video stickers can't be converted to static PNG."); return
-    await _run_image_tool(update, context, sticker.file_id, "sticker2png")
+        await Inbox.message.reply_text("⚠️ Animated/video stickers can't be converted to static PNG."); return
+    await _run_image_tool(Inbox, context, sticker.file_id, "sticker2png")
     context.user_data.pop("awaiting", None)
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.photo: return
+async def handle_photo(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message or not Inbox.message.photo: return
     awaiting = context.user_data.get("awaiting")
-    file_id  = update.message.photo[-1].file_id
+    file_id  = Inbox.message.photo[-1].file_id
 
     if awaiting in _SINGLE_IMAGE_TOOLS:
-        await _run_image_tool(update, context, file_id, awaiting)
+        await _run_image_tool(Inbox, context, file_id, awaiting)
         context.user_data.pop("awaiting", None); return
 
     if awaiting == "watermark_setup":
-        await storage.set_watermark(update.effective_chat.id, file_id)
+        await storage.set_watermark(Inbox.effective_chat.id, file_id)
         _watermark_cache[file_id] = await _download_file(context, file_id)
         context.user_data["awaiting"] = "watermark_apply"
-        await update.message.reply_text(
+        await Inbox.message.reply_text(
             "✅ Logo saved. Now send the *photo* to stamp, or pick a position:",
             parse_mode="Markdown", reply_markup=build_watermark_position_keyboard(),
         ); return
 
     if awaiting == "watermark_apply":
-        if not await _check_heavy_rate_limit(update, "watermark"): return
-        wm_file_id = await storage.get_watermark(update.effective_chat.id)
+        if not await _check_heavy_rate_limit(Inbox, "watermark"): return
+        wm_file_id = await storage.get_watermark(Inbox.effective_chat.id)
         if not wm_file_id:
-            await update.message.reply_text("⚠️ No logo saved yet. Use /watermark first.")
+            await Inbox.message.reply_text("⚠️ No logo saved yet. Use /watermark first.")
             context.user_data.pop("awaiting", None); return
-        status = await update.message.reply_text("⏳ Applying watermark…")
+        status = await Inbox.message.reply_text("⏳ Applying watermark…")
         try:
             base_bytes = await _download_file(context, file_id)
             wm_bytes   = await _get_watermark_bytes(context, wm_file_id)
@@ -2831,27 +2831,27 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             async with storage.HEAVY_JOB_SEMAPHORE:
                 out = await image_extra.apply_watermark(base_bytes, wm_bytes, position=position)
             doc = BytesIO(out); doc.name = "watermarked.jpg"
-            await update.message.reply_document(document=doc, filename="watermarked.jpg")
+            await Inbox.message.reply_document(document=doc, filename="watermarked.jpg")
             await safe_delete(status)
-            await _record(context, update, "watermark")
+            await _record(context, Inbox, "watermark")
         except Exception as exc:
             await safe_edit(status, _user_hint(exc))
             await notify_admin(context, "watermark", f"watermark failed: {exc}")
         return
 
     if awaiting == "compress_image":
-        if not await _check_heavy_rate_limit(update, "compress"): return
+        if not await _check_heavy_rate_limit(Inbox, "compress"): return
         target = context.user_data.get("compress_target_bytes", DEFAULT_COMPRESS_TARGET)
-        status = await update.message.reply_text("⏳ Compressing…")
+        status = await Inbox.message.reply_text("⏳ Compressing…")
         try:
             raw = await _download_file(context, file_id)
             async with storage.HEAVY_JOB_SEMAPHORE:
                 out = await image_extra.compress_to_target(raw, target)
             doc = BytesIO(out); doc.name = "compressed.jpg"
-            await update.message.reply_document(document=doc, filename="compressed.jpg",
+            await Inbox.message.reply_document(document=doc, filename="compressed.jpg",
                 caption=f"✅ {len(out)/1024:.0f} KB (target ~{target//1024} KB)")
             await safe_delete(status)
-            await _record(context, update, "compress")
+            await _record(context, Inbox, "compress")
         except Exception as exc:
             await safe_edit(status, _user_hint(exc))
         finally:
@@ -2860,7 +2860,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if awaiting == "qrscan":
-        status = await update.message.reply_text("⏳ Scanning for QR codes…")
+        status = await Inbox.message.reply_text("⏳ Scanning for QR codes…")
         try:
             raw     = await _download_file(context, file_id)
             results = await qr_tools.scan_qr(raw)
@@ -2870,7 +2870,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await safe_edit(status, "✅ *Found {}:*\n\n{}".format(
                     len(results), "\n\n".join(f"🔗 `{r}`" for r in results)
                 ), parse_mode="Markdown")
-            await _record(context, update, "qr_scan")
+            await _record(context, Inbox, "qr_scan")
         except Exception as exc:
             await safe_edit(status, _user_hint(exc))
         finally:
@@ -2878,32 +2878,32 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if awaiting and awaiting not in ("effects",):
-        await _warn_wrong_media(update, context, awaiting, "photo"); return
+        await _warn_wrong_media(Inbox, context, awaiting, "photo"); return
 
     context.user_data.pop("awaiting", None)
     token = _store_token(context.bot_data, file_id)
-    await update.message.reply_text(
+    await Inbox.message.reply_text(
         "🎨 *Choose a category:*", parse_mode="Markdown",
         reply_markup=build_effect_categories_keyboard(token),
     )
 
 
-async def handle_animation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.animation: return
+async def handle_animation(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message or not Inbox.message.animation: return
     awaiting = context.user_data.get("awaiting")
     if awaiting and awaiting != "gif2frames":
-        await _warn_wrong_media(update, context, awaiting, "GIF"); return
+        await _warn_wrong_media(Inbox, context, awaiting, "GIF"); return
     if awaiting == "gif2frames":
-        await _run_gif_tool(update, context, update.message.animation.file_id)
+        await _run_gif_tool(Inbox, context, Inbox.message.animation.file_id)
         context.user_data.pop("awaiting", None)
     else:
-        await update.message.reply_text(f"🎞 GIF detected! Extracting up to {GIF_MAX_FRAMES} frames…")
-        await _run_gif_tool(update, context, update.message.animation.file_id)
+        await Inbox.message.reply_text(f"🎞 GIF detected! Extracting up to {GIF_MAX_FRAMES} frames…")
+        await _run_gif_tool(Inbox, context, Inbox.message.animation.file_id)
 
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.document: return
-    doc       = update.message.document
+async def handle_document(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message or not Inbox.message.document: return
+    doc       = Inbox.message.document
     awaiting  = context.user_data.get("awaiting")
     file_name = (doc.file_name or "").lower()
     mime      = doc.mime_type or ""
@@ -2919,26 +2919,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         }
         for ext, hint in hints.items():
             if file_name.endswith(ext):
-                await update.message.reply_text(hint, parse_mode="Markdown", reply_markup=build_main_menu_keyboard()); return
-        await update.message.reply_text("Choose a tool first via /menu.", reply_markup=build_main_menu_keyboard()); return
+                await Inbox.message.reply_text(hint, parse_mode="Markdown", reply_markup=build_main_menu_keyboard()); return
+        await Inbox.message.reply_text("Choose a tool first via /menu.", reply_markup=build_main_menu_keyboard()); return
 
     if awaiting in _SINGLE_IMAGE_TOOLS:
         if not (mime.startswith("image/") or any(file_name.endswith(e) for e in (".png",".jpg",".jpeg",".webp",".bmp",".tiff",".gif"))):
-            await update.message.reply_text("⚠️ Please send an image file."); return
-        await _run_image_tool(update, context, doc.file_id, awaiting)
+            await Inbox.message.reply_text("⚠️ Please send an image file."); return
+        await _run_image_tool(Inbox, context, doc.file_id, awaiting)
         context.user_data.pop("awaiting", None); return
 
     if awaiting == "gif2frames":
         if not (file_name.endswith(".gif") or mime == "image/gif"):
-            await update.message.reply_text("⚠️ Please send a .gif file."); return
-        await _run_gif_tool(update, context, doc.file_id)
+            await Inbox.message.reply_text("⚠️ Please send a .gif file."); return
+        await _run_gif_tool(Inbox, context, doc.file_id)
         context.user_data.pop("awaiting", None); return
 
     if awaiting == "pdf2img":
-        if not await _check_heavy_rate_limit(update, "pdf2img"): return
+        if not await _check_heavy_rate_limit(Inbox, "pdf2img"): return
         if not (file_name.endswith(".pdf") or mime == "application/pdf"):
-            await update.message.reply_text("⚠️ Please send a .pdf file."); return
-        status = await update.message.reply_text("⏳ Rendering PDF pages…")
+            await Inbox.message.reply_text("⚠️ Please send a .pdf file."); return
+        status = await Inbox.message.reply_text("⏳ Rendering PDF pages…")
         try:
             pdf_bytes = await _download_file(context, doc.file_id)
             async with storage.HEAVY_JOB_SEMAPHORE:
@@ -2947,10 +2947,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await safe_edit(status, "❌ No pages could be rendered."); return
             await safe_delete(status)
             for i in range(0, len(pages), 10):
-                await update.message.reply_media_group([InputMediaPhoto(BytesIO(p)) for p in pages[i:i+10]])
+                await Inbox.message.reply_media_group([InputMediaPhoto(BytesIO(p)) for p in pages[i:i+10]])
             if len(pages) >= PDF2IMG_MAX_PAGES:
-                await update.message.reply_text(f"ℹ️ Only the first {PDF2IMG_MAX_PAGES} pages were rendered.")
-            await _record(context, update, "pdf2img")
+                await Inbox.message.reply_text(f"ℹ️ Only the first {PDF2IMG_MAX_PAGES} pages were rendered.")
+            await _record(context, Inbox, "pdf2img")
         except Exception as exc:
             await safe_edit(status, _user_hint(exc))
             await notify_admin(context, "pdf2img", f"pdf2img failed: {exc}")
@@ -2960,22 +2960,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if awaiting == "fiver_body":
         if file_name.endswith(".txt") or mime == "text/plain":
-            status = await update.message.reply_text("⏳ Sanitising…")
+            status = await Inbox.message.reply_text("⏳ Sanitising…")
             try:
                 raw  = await _download_file(context, doc.file_id)
                 text = raw.decode("utf-8", errors="replace")
                 if len(text) > FIVER_SANITIZE_MAX_CHARS:
                     await safe_edit(status, f"⚠️ Too long ({len(text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}."); return
-                custom = await storage.get_words(update.effective_chat.id)
+                custom = await storage.get_words(Inbox.effective_chat.id)
                 san, changes, score = sanitize_fiver_text(text, custom)
                 info = context.user_data.get("fiver_info") or {
                     "profile": "—", "client": "—", "project": "—", "order_id": "—", "amount": "—",
                 }
                 final_output = build_fiver_output(info, san)
                 await safe_delete(status)
-                await update.message.reply_text(f"```\n{final_output}\n```", parse_mode="Markdown")
-                await update.message.reply_text(format_sanitizer_report(changes, score), parse_mode="Markdown")
-                await _record(context, update, "fiver_sanitize")
+                await Inbox.message.reply_text(f"```\n{final_output}\n```", parse_mode="Markdown")
+                await Inbox.message.reply_text(format_sanitizer_report(changes, score), parse_mode="Markdown")
+                await _record(context, Inbox, "fiver_sanitize")
             except Exception as exc:
                 logger.warning("fiver_sanitize (doc) failed: %s", exc)
                 await safe_edit(status, _user_hint(exc))
@@ -2983,24 +2983,24 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 context.user_data.pop("awaiting", None)
                 context.user_data.pop("fiver_info", None)
         else:
-            await update.message.reply_text("⚠️ Please send a .txt file or type the message directly.")
+            await Inbox.message.reply_text("⚠️ Please send a .txt file or type the message directly.")
         return
 
     if awaiting == "compress_image":
         if not (mime.startswith("image/") or any(file_name.endswith(e) for e in (".png",".jpg",".jpeg",".webp"))):
-            await update.message.reply_text("⚠️ Please send an image file."); return
-        if not await _check_heavy_rate_limit(update, "compress"): return
+            await Inbox.message.reply_text("⚠️ Please send an image file."); return
+        if not await _check_heavy_rate_limit(Inbox, "compress"): return
         target = context.user_data.get("compress_target_bytes", DEFAULT_COMPRESS_TARGET)
-        status = await update.message.reply_text("⏳ Compressing…")
+        status = await Inbox.message.reply_text("⏳ Compressing…")
         try:
             raw = await _download_file(context, doc.file_id)
             async with storage.HEAVY_JOB_SEMAPHORE:
                 out = await image_extra.compress_to_target(raw, target)
             out_doc = BytesIO(out); out_doc.name = "compressed.jpg"
-            await update.message.reply_document(document=out_doc, filename="compressed.jpg",
+            await Inbox.message.reply_document(document=out_doc, filename="compressed.jpg",
                 caption=f"✅ {len(out)/1024:.0f} KB (target ~{target//1024} KB)")
             await safe_delete(status)
-            await _record(context, update, "compress")
+            await _record(context, Inbox, "compress")
         except Exception as exc:
             await safe_edit(status, _user_hint(exc))
         finally:
@@ -3010,8 +3010,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if awaiting == "qrscan":
         if not (mime.startswith("image/") or any(file_name.endswith(e) for e in (".png",".jpg",".jpeg",".webp"))):
-            await update.message.reply_text("⚠️ Please send an image containing a QR code."); return
-        status = await update.message.reply_text("⏳ Scanning…")
+            await Inbox.message.reply_text("⚠️ Please send an image containing a QR code."); return
+        status = await Inbox.message.reply_text("⏳ Scanning…")
         try:
             raw     = await _download_file(context, doc.file_id)
             results = await qr_tools.scan_qr(raw)
@@ -3021,7 +3021,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await safe_edit(status, "✅ *Found {}:*\n\n{}".format(
                     len(results), "\n\n".join(f"🔗 `{r}`" for r in results)
                 ), parse_mode="Markdown")
-            await _record(context, update, "qr_scan")
+            await _record(context, Inbox, "qr_scan")
         except Exception as exc:
             await safe_edit(status, _user_hint(exc))
         finally:
@@ -3031,29 +3031,29 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if awaiting in _DOC_TOOLS or awaiting == "pptx2images":
         if not _doc_accepts(awaiting, mime, file_name):
             exts = " / ".join(_DOC_ACCEPTS.get(awaiting, ([], [".file"]))[1])
-            await update.message.reply_text(f"⚠️ Expected: `{exts}`", parse_mode="Markdown"); return
-        await _run_doc_tool(update, context, doc.file_id, awaiting)
+            await Inbox.message.reply_text(f"⚠️ Expected: `{exts}`", parse_mode="Markdown"); return
+        await _run_doc_tool(Inbox, context, doc.file_id, awaiting)
         context.user_data.pop("awaiting", None); return
 
-    await update.message.reply_text("Choose a tool first via /menu.", reply_markup=build_main_menu_keyboard())
+    await Inbox.message.reply_text("Choose a tool first via /menu.", reply_markup=build_main_menu_keyboard())
 
 
 # ── Text message handler ──────────────────────────────────────────────────────
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text: return
-    raw_text = update.message.text
+async def handle_message(Inbox: Inbox, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Inbox.message or not Inbox.message.text: return
+    raw_text = Inbox.message.text
     awaiting = context.user_data.get("awaiting")
 
     if GREETING_RE.match(raw_text.strip()) and awaiting not in ("fiver_info", "fiver_body"):
         context.user_data.pop("awaiting", None)
-        await update.message.reply_text(WELCOME_MESSAGE, parse_mode="Markdown", reply_markup=build_main_menu_keyboard()); return
+        await Inbox.message.reply_text(WELCOME_MESSAGE, parse_mode="Markdown", reply_markup=build_main_menu_keyboard()); return
 
     # ── Fiver: step 1 — combined info string ──
     if awaiting == "fiver_info":
         info = parse_fiver_info(raw_text)
         if info is None:
-            await update.message.reply_text(
+            await Inbox.message.reply_text(
                 "⚠️ ফরম্যাট মিলছে না। ঠিক এভাবে দিন:\n"
                 f"`{FIVER_INFO_PATTERN_HINT}`\n\n"
                 "উদাহরণ: `jmbattaglia_FO41C0CAC4D84_CustomerPortal_brainflux_1000`",
@@ -3062,32 +3062,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         context.user_data["fiver_info"] = info
         context.user_data["awaiting"] = "fiver_body"
-        await update.message.reply_text("✅ তথ্য সংরক্ষিত হয়েছে। এখন ক্লায়েন্ট মেসেজটি পাঠান।")
+        await Inbox.message.reply_text("✅ তথ্য সংরক্ষিত হয়েছে। এখন ক্লায়েন্ট মেসেজটি পাঠান।")
         return
 
     # ── Fiver: step 2 — the actual message body ──
     if awaiting == "fiver_body":
         text = raw_text.strip()
         if not text:
-            await update.message.reply_text("দয়া করে মেসেজ টেক্সট পাঠান।"); return
+            await Inbox.message.reply_text("দয়া করে মেসেজ টেক্সট পাঠান।"); return
         if len(text) > FIVER_SANITIZE_MAX_CHARS:
-            await update.message.reply_text(f"⚠️ Too long ({len(text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}.")
+            await Inbox.message.reply_text(f"⚠️ Too long ({len(text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}.")
             return
         try:
-            custom = await storage.get_words(update.effective_chat.id)
+            custom = await storage.get_words(Inbox.effective_chat.id)
             san, changes, score = sanitize_fiver_text(text, custom)
             info = context.user_data.get("fiver_info") or {
                 "profile": "—", "client": "—", "project": "—", "order_id": "—", "amount": "—",
             }
             final_output = build_fiver_output(info, san)
 
-            await update.message.reply_text(f"```\n{final_output}\n```", parse_mode="Markdown")
-            await update.message.reply_text(format_sanitizer_report(changes, score), parse_mode="Markdown")
+            await Inbox.message.reply_text(f"```\n{final_output}\n```", parse_mode="Markdown")
+            await Inbox.message.reply_text(format_sanitizer_report(changes, score), parse_mode="Markdown")
 
-            await _record(context, update, "fiver_sanitize")
+            await _record(context, Inbox, "fiver_sanitize")
         except Exception as exc:
             logger.warning("fiver_sanitize (v3) failed: %s", exc)
-            await update.message.reply_text(f"❌ কিছু একটা ভুল হয়েছে। আবার চেষ্টা করুন বা /cancel দিন।")
+            await Inbox.message.reply_text(f"❌ কিছু একটা ভুল হয়েছে। আবার চেষ্টা করুন বা /cancel দিন।")
             await notify_admin(context, "fiver_sanitize", f"fiver_sanitize failed: {exc}")
         finally:
             context.user_data.pop("awaiting", None)
@@ -3097,14 +3097,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ── Translate ──
     if awaiting == "translate_text":
         text = raw_text.strip()
-        if not text: await update.message.reply_text("Please send some text."); return
+        if not text: await Inbox.message.reply_text("Please send some text."); return
         if len(text) > TRANSLATE_MAX_CHARS:
-            await update.message.reply_text(f"⚠️ Too long ({len(text)} chars). Limit: {TRANSLATE_MAX_CHARS}."); return
-        status = await update.message.reply_text("🌐 Translating…")
+            await Inbox.message.reply_text(f"⚠️ Too long ({len(text)} chars). Limit: {TRANSLATE_MAX_CHARS}."); return
+        status = await Inbox.message.reply_text("🌐 Translating…")
         try:
             translated = await translate_text(text, context.user_data.get("target_lang", "en"))
             await safe_edit(status, f"✅ *Translation:*\n\n{translated}", parse_mode="Markdown")
-            await _record(context, update, "translate")
+            await _record(context, Inbox, "translate")
         except Exception as exc:
             await safe_edit(status,
                 "🚦 Service temporarily rate-limited. Please try again in a minute."
@@ -3171,9 +3171,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             rgb = hex_to_rgb(text)
             result = f"🖌 *Tints & Shades for `{text}`*\n\n```\n{tint_shade(*rgb)}\n```" if rgb else "❌ Invalid hex colour."
 
-        await update.message.reply_text(result, parse_mode="Markdown", reply_markup=build_color_input_keyboard(tool))
+        await Inbox.message.reply_text(result, parse_mode="Markdown", reply_markup=build_color_input_keyboard(tool))
         context.user_data.pop("awaiting", None)
-        await _record(context, update, f"color:{tool}"); return
+        await _record(context, Inbox, f"color:{tool}"); return
 
     # ── Dev Tools ──
     if awaiting == "dev_input":
@@ -3203,7 +3203,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         elif tool == "diff":
             if "diff_text_a" not in context.user_data:
                 context.user_data["diff_text_a"] = text
-                await update.message.reply_text("✅ Text A saved. Now send *Text B*:", parse_mode="Markdown")
+                await Inbox.message.reply_text("✅ Text A saved. Now send *Text B*:", parse_mode="Markdown")
                 return
             else:
                 result = f"```\n{diff_texts(context.user_data.pop('diff_text_a'), text)}\n```"
@@ -3213,14 +3213,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         elif tool == "case_text":
             context.user_data["case_input"] = text
             context.user_data.pop("awaiting", None)
-            await update.message.reply_text("🔤 Choose a case style:", reply_markup=build_case_keyboard()); return
+            await Inbox.message.reply_text("🔤 Choose a case style:", reply_markup=build_case_keyboard()); return
 
-        await update.message.reply_text(result or "❌ Empty result.", parse_mode="Markdown", reply_markup=build_dev_input_keyboard(tool))
+        await Inbox.message.reply_text(result or "❌ Empty result.", parse_mode="Markdown", reply_markup=build_dev_input_keyboard(tool))
         context.user_data.pop("awaiting", None)
-        await _record(context, update, f"dev:{tool}"); return
+        await _record(context, Inbox, f"dev:{tool}"); return
 
     if awaiting and awaiting not in ("translate_text", "fiver_info", "fiver_body", "color_input", "dev_input"):
-        await _warn_wrong_media(update, context, awaiting, "text message"); return
+        await _warn_wrong_media(Inbox, context, awaiting, "text message"); return
 
     # ── URL detection ──
     lummi_match = LUMMI_URL_RE.search(raw_text)
@@ -3236,25 +3236,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 url, platform = candidate, detected
 
     if not url or not platform:
-        await update.message.reply_text(
+        await Inbox.message.reply_text(
             "Send a Lummi.ai or Hugeicons link, a photo, sticker, or GIF — "
             "or use /FiverMessage to sanitise text. Type /help for examples."
         ); return
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-    status = await update.message.reply_text("⏳ Processing your link…")
+    await context.bot.send_chat_action(chat_id=Inbox.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
+    status = await Inbox.message.reply_text("⏳ Processing your link…")
 
     if platform == "lummi":
         try:
             await safe_edit(status, "⏳ Downloading Lummi asset…")
             result = await fetch_lummi_asset(url)
             doc    = BytesIO(result["bytes"]); doc.name = result["filename"]
-            await update.message.reply_document(
+            await Inbox.message.reply_document(
                 document=doc, filename=result["filename"],
                 caption=truncate_caption(f"✅ {result['size_mb']:.2f} MB — {result['direct_url']}"),
             )
             await safe_delete(status)
-            await _record(context, update, "lummi")
+            await _record(context, Inbox, "lummi")
         except Exception as exc:
             await safe_edit(status, _user_hint(exc))
     else:
@@ -3265,16 +3265,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             filename  = f"{result['icon_name']}-{result['style']}.svg"
             await safe_delete(status)
             label_md  = f"✅ *{markdown_v2_escape(result['icon_name'])}* \\({markdown_v2_escape(result['style'])}\\)"
-            await update.message.reply_text(label_md, parse_mode="MarkdownV2")
-            await update.message.reply_text(f"```xml\n{markdown_code_escape(clean_svg)}\n```", parse_mode="MarkdownV2")
+            await Inbox.message.reply_text(label_md, parse_mode="MarkdownV2")
+            await Inbox.message.reply_text(f"```xml\n{markdown_code_escape(clean_svg)}\n```", parse_mode="MarkdownV2")
             doc = BytesIO(clean_svg.encode()); doc.name = filename
-            await update.message.reply_document(document=doc, filename=filename, caption=truncate_caption(f"{filename} — ready to use."))
-            await _record(context, update, "hugeicons")
+            await Inbox.message.reply_document(document=doc, filename=filename, caption=truncate_caption(f"{filename} — ready to use."))
+            await _record(context, Inbox, "hugeicons")
         except Exception as exc:
             await safe_edit(status, _user_hint(exc))
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def error_handler(Inbox: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception:", exc_info=context.error)
     try:
         await notify_admin(context, "unhandled", f"Unhandled: {context.error}")
@@ -3303,7 +3303,7 @@ def main() -> None:
     app = (
         Application.builder()
         .token(token)
-        .concurrent_updates(True)
+        .concurrent_Inboxs(True)
         .post_shutdown(_on_shutdown)
         .build()
     )
@@ -3369,11 +3369,11 @@ def main() -> None:
         logger.info("Webhook mode — port %s", port)
         app.run_webhook(
             listen="0.0.0.0", port=port, url_path="/webhook",
-            webhook_url=f"{webhook_url}/webhook", allowed_updates=Update.ALL_TYPES,
+            webhook_url=f"{webhook_url}/webhook", allowed_Inboxs=Inbox.ALL_TYPES,
         )
     else:
         logger.info("Polling mode")
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
+        app.run_polling(allowed_Inboxs=Inbox.ALL_TYPES)
 
 
 if __name__ == "__main__":

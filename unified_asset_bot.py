@@ -1,25 +1,25 @@
 """
-BangaliIcon Bot — v3
-====================
+BangaliIcon Bot — v3.1
+=======================
 Single-file deployment.  All helper modules (storage, qr_tools,
 password_tools, image_extra) are embedded as source strings and loaded
 at import time via _load_embedded_module().
 
-New in v3
----------
-  • 40 image effects  (up from 32; +Pencil Sketch, Neon Glow,
-    Kaleidoscope, Color Splash, Stained Glass, Tilt-Shift,
-    Color Splash added to engine)
-  • Fiver Sanitizer v2  — AI-sign stripping (_ — … "" ''),
-    before/after diff, quality score, professional report card
-  • 🎨 Color Tools category  (8 tools, zero external APIs)
-  • 🔧 Dev Tools category    (12 tools, zero external APIs)
-  • Image quality fix: MAX_DIM raised 400 → 1 200 px
-  • Per-effect usage tracking  (was always logged as "effects")
-  • asyncio.Lock lazy-init    (fixes DeprecationWarning on 3.10+)
-  • Token TTL expiry          (30-minute sliding window)
-  • Watermark bytes cache     (avoids re-downloading same logo)
-  • Rate-limit log persisted  (survives bot restart)
+v3.1 changes
+------------
+  • New Fiver Sanitizer flow: collects
+    ClientName_OrderID_ProjectName_ProfileName_Amount as one combined
+    string, then the message body, and outputs a fixed template inside
+    a copyable Markdown code block, followed by a separate quality report.
+  • Markdown stripping (bold/italic/headers/links) now runs before
+    word-replacement in the sanitizer.
+  • Greeting normalization (Hi/Hey/Hello -> "Hello there,").
+  • Closing normalization: if the tail of the message has no "thank you",
+    a closing line is appended; if a sign-off (Best regards, etc.) is
+    found, it is stripped and replaced with the closing line.
+  • Old button-based "Fiver Report Card" flow removed (superseded).
+  • /cancel now also clears fiver_info, diff_text_a, case_input.
+  • Rate limiting note: "effects" heavy-tool check preserved as before.
 
 Run
 ---
@@ -47,18 +47,7 @@ def _load_embedded_module(name: str, source: str) -> types.ModuleType:
 # ════════════════════════════════════════════════════════════════════════════
 
 _STORAGE_SOURCE = r'''
-"""Lightweight JSON-backed persistence layer.
-
-data/
-  custom_words.json     {chat_id: {word: replacement}}
-  usage_stats.json      {tool_name: count}
-  user_activity.json    {chat_id: {username, counts, last_seen, log}}
-  watermarks.json       {chat_id: file_id}
-  custom_limits.json    {chat_id: int}
-  limit_requests.json   {chat_id: {username, requested, ts}}
-  blocked_users.json    [chat_id, ...]
-  rate_limit_log.json   {chat_id: [timestamp, ...]}   ← persisted
-"""
+"""Lightweight JSON-backed persistence layer."""
 
 from __future__ import annotations
 
@@ -94,7 +83,6 @@ HEAVY_TOOLS = {
     "watermark", "compress",
 }
 
-# Lazy-init locks (avoids DeprecationWarning on Python 3.10+)
 _lock: asyncio.Lock | None = None
 _rate_lock: asyncio.Lock | None = None
 
@@ -110,7 +98,6 @@ def _get_rate_lock() -> asyncio.Lock:
         _rate_lock = asyncio.Lock()
     return _rate_lock
 
-# In-memory rate-limit deques (populated from disk on first use)
 _heavy_call_log: dict[int, Deque[float]] = defaultdict(deque)
 _rate_log_loaded = False
 
@@ -141,8 +128,6 @@ def _save(path: str, data) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-
-# ── Custom words ──────────────────────────────────────────────────────────────
 
 async def add_word(chat_id: int, word: str, replacement: str) -> tuple[bool, str]:
     word, replacement = word.strip().lower(), replacement.strip()
@@ -185,8 +170,6 @@ async def reset_words(chat_id: int) -> None:
         _save(CUSTOM_WORDS_PATH, data)
 
 
-# ── Usage stats ───────────────────────────────────────────────────────────────
-
 async def record_usage(
     tool_name: str,
     chat_id: int | None = None,
@@ -194,11 +177,9 @@ async def record_usage(
 ) -> None:
     now = time.time()
     async with _get_lock():
-        # Global counter
         stats = _load(USAGE_STATS_PATH)
         stats[tool_name] = stats.get(tool_name, 0) + 1
         _save(USAGE_STATS_PATH, stats)
-        # Per-user activity
         if chat_id is not None:
             activity = _load(USER_ACTIVITY_PATH)
             entry = activity.setdefault(str(chat_id), {
@@ -239,8 +220,6 @@ async def find_chat_id_by_username(username: str) -> int | None:
     return None
 
 
-# ── Watermark ─────────────────────────────────────────────────────────────────
-
 async def set_watermark(chat_id: int, file_id: str) -> None:
     async with _get_lock():
         data = _load(WATERMARKS_PATH)
@@ -259,8 +238,6 @@ async def clear_watermark(chat_id: int) -> None:
         data.pop(str(chat_id), None)
         _save(WATERMARKS_PATH, data)
 
-
-# ── Rate limiting ─────────────────────────────────────────────────────────────
 
 def _ensure_rate_log_loaded() -> None:
     global _rate_log_loaded
@@ -360,8 +337,6 @@ async def calls_used(chat_id: int) -> tuple[int, int]:
             log.popleft()
         return len(log), limit
 
-
-# ── Limit requests ────────────────────────────────────────────────────────────
 
 async def add_limit_request(chat_id: int, username: str | None, requested: int) -> None:
     async with _get_lock():
@@ -788,7 +763,6 @@ EFFECT_CATEGORIES: dict[str, str] = {
 EFFECT_CATEGORY_ORDER = ["retro", "tone", "art", "digital", "distort"]
 
 EFFECTS: list[tuple[str, str, str]] = [
-    # Retro & Print
     ("halftone-dots",        "Halftone",       "retro"),
     ("comic-cmyk",           "Pop-Art",        "retro"),
     ("retro-8bit",           "8-Bit CRT",      "retro"),
@@ -797,7 +771,6 @@ EFFECTS: list[tuple[str, str, str]] = [
     ("bayer-dither",         "Dither",         "retro"),
     ("vhs-tape",             "VHS Tape",       "retro"),
     ("lomography",           "Lomography",     "retro"),
-    # Color & Tone
     ("duotone",              "Duotone",        "tone"),
     ("autumn-tone",          "Autumn",         "tone"),
     ("forest-green",         "Forest",         "tone"),
@@ -805,7 +778,6 @@ EFFECTS: list[tuple[str, str, str]] = [
     ("cherry-blossom",       "Cherry Blossom", "tone"),
     ("moonlight",            "Moonlight",      "tone"),
     ("frozen-ice",           "Frozen",         "tone"),
-    # Artistic
     ("watercolor",           "Watercolor",     "art"),
     ("oil-paint",            "Oil Paint",      "art"),
     ("cinematic-noir",       "Noir",           "art"),
@@ -813,7 +785,6 @@ EFFECTS: list[tuple[str, str, str]] = [
     ("pencil-sketch",        "Pencil Sketch",  "art"),
     ("color-splash",         "Color Splash",   "art"),
     ("stained-glass",        "Stained Glass",  "art"),
-    # Digital & Glitch
     ("cyber-glitch",         "Cyberpunk",      "digital"),
     ("glitch-art",           "Glitch Art",     "digital"),
     ("ascii-matrix",         "ASCII",          "digital"),
@@ -821,7 +792,6 @@ EFFECTS: list[tuple[str, str, str]] = [
     ("vaporwave",            "Vaporwave",      "digital"),
     ("neon-poster",          "Neon Poster",    "digital"),
     ("neon-glow",            "Neon Glow",      "digital"),
-    # Distort & Special
     ("swirl-distort",        "Swirl",          "distort"),
     ("mirror-reflect",       "Mirror",         "distort"),
     ("pixelate",             "Pixelate",       "distort"),
@@ -831,9 +801,7 @@ EFFECTS: list[tuple[str, str, str]] = [
     ("horror-red",           "Horror",         "distort"),
     ("tilt-shift",           "Tilt-Shift",     "distort"),
     ("kaleidoscope",         "Kaleidoscope",   "distort"),
-    ("color-splash",         "Color Splash",   "distort"),
 ]
-# Deduplicate while preserving order
 _seen: set[str] = set()
 EFFECTS = [(k, l, c) for k, l, c in EFFECTS if k not in _seen and not _seen.add(k)]  # type: ignore[func-returns-value]
 
@@ -851,16 +819,15 @@ TRANSLATE_LANGUAGES: list[tuple[str, str]] = [
 ]
 
 
-# ── Fiver Sanitizer v2 ────────────────────────────────────────────────────────
+# ── Fiver Sanitizer v3 ────────────────────────────────────────────────────────
 
-# AI-generated text signs to strip
 _AI_SIGNS = re.compile(
-    r"[\u2014\u2013\u2012\u2015]"   # em dash, en dash, figure dash, horizontal bar
-    r"|[\u2018\u2019\u201A\u201B]"  # curved single quotes
-    r"|[\u201C\u201D\u201E\u201F]"  # curved double quotes
-    r"|[\u2026]"                     # ellipsis …
-    r"|(?<!\w)_(?!\w)"              # lone underscore (not inside words)
-    r"|(?<=\s)_|_(?=\s)",           # underscore with surrounding spaces
+    r"[\u2014\u2013\u2012\u2015]"
+    r"|[\u2018\u2019\u201A\u201B]"
+    r"|[\u201C\u201D\u201E\u201F]"
+    r"|[\u2026]"
+    r"|(?<!\w)_(?!\w)"
+    r"|(?<=\s)_|_(?=\s)",
     re.UNICODE,
 )
 
@@ -905,6 +872,89 @@ def _build_patterns(word_map: dict[str, str]) -> list[tuple[str, re.Pattern]]:
 
 _FIVER_WORD_PATTERNS = _build_patterns(FIVER_WORD_MAP)
 
+FIVER_INFO_PATTERN_HINT = "ClientName_OrderID_ProjectName_ProfileName_Amount"
+
+GREETING_NORMALIZE_RE = re.compile(
+    r"^\s*(hi+|hey+|hello+)\b[\s,!.]*",
+    re.IGNORECASE,
+)
+
+SIGNOFF_RE = re.compile(
+    r"\n{1,3}\s*(best\s*regards|regards|best|thanks\s*&?\s*regards|warm\s*regards|sincerely)[\s,]*\n?.*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+THANK_YOU_CHECK_CHARS = 250
+DEFAULT_CLOSING_LINE = "Thank you again for your support, and I'll keep you updated on the progress."
+
+FIVER_TEMPLATE = (
+    "==================================\n"
+    "Status: Inbox (Update)\n"
+    "Profile Name: {profile}\n"
+    "Client Name: {client}\n"
+    "Project Name: {project}\n"
+    "Ord-er ID: {order_id}\n"
+    "Amount: {amount}\n"
+    "Quality Checked by: Me\n"
+    "==================================\n\n"
+    "{body}\n"
+    "=================================="
+)
+
+
+def parse_fiver_info(text: str) -> dict[str, str] | None:
+    """Parses 'ClientName_OrderID_ProjectName_ProfileName_Amount'."""
+    parts = [p.strip() for p in text.strip().split("_")]
+    if len(parts) != 5 or not all(parts):
+        return None
+    client, order_id, project, profile, amount = parts
+    if not amount.startswith("$"):
+        amount = f"${amount}"
+    return {
+        "client": client,
+        "order_id": order_id,
+        "project": project,
+        "profile": profile,
+        "amount": amount,
+    }
+
+
+def normalize_greeting(text: str) -> tuple[str, str | None]:
+    m = GREETING_NORMALIZE_RE.match(text)
+    if not m:
+        return text, None
+    original = m.group(0).strip().rstrip(",.! ")
+    new_text = GREETING_NORMALIZE_RE.sub("Hello there,\n\n", text, count=1)
+    return new_text, f"Greeting normalized: `{original}` → `Hello there,`"
+
+
+def normalize_closing(text: str) -> tuple[str, str | None]:
+    tail = text[-THANK_YOU_CHECK_CHARS:]
+    has_thanks_in_tail = "thank you" in tail.lower()
+
+    signoff_match = SIGNOFF_RE.search(text)
+    if signoff_match:
+        stripped = text[: signoff_match.start()].rstrip()
+        new_text = f"{stripped}\n\n{DEFAULT_CLOSING_LINE}"
+        return new_text, "Sign-off removed and replaced with a thank-you closing line."
+
+    if not has_thanks_in_tail:
+        new_text = f"{text.rstrip()}\n\n{DEFAULT_CLOSING_LINE}"
+        return new_text, "No thank-you found at the end — closing line added."
+
+    return text, None
+
+
+def build_fiver_output(info: dict[str, str], sanitized_body: str) -> str:
+    return FIVER_TEMPLATE.format(
+        profile=info["profile"],
+        client=info["client"],
+        project=info["project"],
+        order_id=info["order_id"],
+        amount=info["amount"],
+        body=sanitized_body.strip(),
+    )
+
 
 def sanitize_fiver_text(
     text: str,
@@ -912,15 +962,20 @@ def sanitize_fiver_text(
 ) -> tuple[str, list[str], int]:
     """
     Returns (sanitized_text, changes_list, quality_score_0_to_100).
-    changes_list entries look like: 'email → ema-il'  or  'em dash removed'.
     """
     changes: list[str] = []
+
+    # 0. Strip markdown formatting first (bold/italic/headers/links/code)
+    plain = markdown_to_plain_text(text)
+    if plain != text:
+        changes.append("Markdown formatting removed (bold/italic/headers/links)")
+    text = plain
 
     # 1. Strip AI signs
     ai_stripped = _AI_SIGNS.sub("", text)
     stripped_count = len(text) - len(ai_stripped)
     if stripped_count:
-        changes.append(f"AI signs removed ({stripped_count} character(s): — … "" '' _)")
+        changes.append(f"AI signs removed ({stripped_count} character(s))")
     result = ai_stripped
 
     # 2. Word replacements
@@ -936,37 +991,24 @@ def sanitize_fiver_text(
             changes.append(f"`{word}` → `{replacement}` (×{n})")
         result = new_result
 
-    # 3. Quality score: 100 minus 10 per flagged item, floor 0
-    score = max(0, 100 - len(changes) * 10)
+    # 3. Greeting normalize
+    result, greet_note = normalize_greeting(result)
+    if greet_note:
+        changes.append(greet_note)
+
+    # 4. Closing normalize
+    result, close_note = normalize_closing(result)
+    if close_note:
+        changes.append(close_note)
+
+    # 5. Quality score
+    score = max(0, 100 - len(changes) * 8)
     return result, changes, score
 
 
-def format_sanitizer_report(
-    original: str,
-    sanitized: str,
-    changes: list[str],
-    score: int,
-    profile: str = "",
-    client_name: str = "",
-    order_id: str = "",
-) -> str:
+def format_sanitizer_report(changes: list[str], score: int) -> str:
     quality_icon = "✅" if score >= 80 else ("⚠️" if score >= 50 else "❌")
-    lines = [
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
-        "🛡 *FIVER SANITIZER REPORT*",
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
-    ]
-    if profile or client_name or order_id:
-        lines += [
-            f"👤 *Profile:*      {profile or '—'}",
-            f"🧑 *Client Name:*  {client_name or '—'}",
-            f"🔖 *Order ID:*     {order_id or '—'}",
-            "──────────────────────────",
-        ]
-    lines += [
-        f"📊 *Quality Check:* {quality_icon} {score}/100",
-        "──────────────────────────",
-    ]
+    lines = [f"📊 *Quality Check:* {quality_icon} {score}/100", ""]
     if changes:
         lines.append("🔄 *What was changed:*")
         for c in changes[:15]:
@@ -975,13 +1017,6 @@ def format_sanitizer_report(
             lines.append(f"  … and {len(changes) - 15} more")
     else:
         lines.append("✅ No flagged words found — message is clean!")
-    lines += [
-        "──────────────────────────",
-        "📝 *Sanitized Message:*",
-        "",
-        sanitized,
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
-    ]
     return "\n".join(lines)
 
 
@@ -1257,7 +1292,7 @@ WELCOME_MESSAGE = (
     "```\n"
     "⚡ *@BangaliIconBot* — all modules loaded\n\n"
     "🔗 Send a *Lummi.ai* or *Hugeicons* link → instant asset\n"
-    "🖼 Send a *photo* → 40 real-time visual effects\n"
+    "🖼 Send a *photo* → 38 real-time visual effects\n"
     "😄 Send a *sticker or GIF* → extract or convert\n"
     "🛡 `/FiverMessage` → sanitize with AI-sign detection\n"
     "🎨 `/colortools` → colour conversion & CSS helpers\n"
@@ -1460,12 +1495,6 @@ def build_genpass_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def build_fiver_report_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Add Report Card", callback_data="fiver|reportcard")],
-    ])
-
-
 def build_limit_request_keyboard(chat_id: int, requested: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Approve", callback_data=f"limitreq|approve|{chat_id}|{requested}"),
@@ -1564,7 +1593,6 @@ async def safe_delete(message: Any) -> None:
 def _store_token(bot_data: dict, file_id: str) -> str:
     pending: dict[str, tuple[str, float]] = bot_data.setdefault("pending_files", {})
     now = time.monotonic()
-    # Evict expired tokens
     expired = [k for k, (_, ts) in pending.items() if now - ts > TOKEN_TTL_SECONDS]
     for k in expired:
         pending.pop(k, None)
@@ -1966,8 +1994,8 @@ _AWAITING_LABELS: dict[str, str] = {
     **{k: v[0] for k, v in _SINGLE_IMAGE_TOOLS.items()},
     "gif2frames":     "Extract GIF frames",
     "translate_text": "Translate text",
-    "fiver_sanitize": "Sanitise Fiver message",
-    "fiver_profile":  "Fiver report card",
+    "fiver_info":     "Fiver order info",
+    "fiver_body":     "Fiver message body",
     "watermark_setup":"Upload watermark logo",
     "watermark_apply":"Apply watermark to photo",
     "compress_image": "Compress image",
@@ -2132,7 +2160,10 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message: return
     had = context.user_data.pop("awaiting", None)
-    for key in ("target_lang","compress_target_bytes","watermark_position","color_tool","dev_tool","dev_tool_step","fiver_profile","fiver_client","fiver_order"):
+    for key in (
+        "target_lang", "compress_target_bytes", "watermark_position", "color_tool",
+        "dev_tool", "dev_tool_step", "fiver_info", "diff_text_a", "case_input",
+    ):
         context.user_data.pop(key, None)
     await update.message.reply_text("✅ Cancelled." if had else "Nothing to cancel.")
 
@@ -2143,11 +2174,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "📖 *BangaliIcon Bot — Help*\n\n"
         "*Asset extraction:*\n"
         "Send a Lummi.ai or Hugeicons link → instant download\n\n"
-        "*Image effects (40 total):*\n"
+        "*Image effects:*\n"
         "Send any photo → choose category → choose effect\n\n"
-        "*Fiver Sanitizer (v2):*\n"
-        "`/FiverMessage <text>` → sanitize + AI sign detection\n"
-        "Includes: before/after diff, quality score, report card\n"
+        "*Fiver Sanitizer:*\n"
+        "`/FiverMessage` → send order info, then the message text\n"
+        "Order info format: `ClientName_OrderID_ProjectName_ProfileName_Amount`\n"
+        "Output is a copy-ready template in a code block + a separate quality report.\n"
         "`/addword` · `/mywords` · `/delword` · `/resetwords`\n\n"
         "*🎨 Colour Tools (/menu → Colour Tools):*\n"
         "Color Convert · Contrast Check · Gradient · Shadow · Tint & Shade\n\n"
@@ -2165,22 +2197,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-# ── Fiver Sanitizer v2 ────────────────────────────────────────────────────────
+# ── Fiver Sanitizer v3 ────────────────────────────────────────────────────────
 
 async def fivermessage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message: return
-    args_text = " ".join(context.args) if context.args else ""
-    if args_text.strip():
-        if len(args_text) > FIVER_SANITIZE_MAX_CHARS:
-            await update.message.reply_text(f"⚠️ Too long ({len(args_text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}."); return
-        custom   = await storage.get_words(update.effective_chat.id)
-        san, changes, score = sanitize_fiver_text(args_text.strip(), custom)
-        report   = format_sanitizer_report(args_text.strip(), san, changes, score)
-        await update.message.reply_text(report, parse_mode="Markdown", reply_markup=build_fiver_report_keyboard())
-        await _record(context, update, "fiver_sanitize"); return
-
-    context.user_data["awaiting"] = "fiver_sanitize"
-    await update.message.reply_text("🛡 Send me the message to sanitize (or /cancel).")
+    context.user_data.pop("fiver_info", None)
+    context.user_data["awaiting"] = "fiver_info"
+    await update.message.reply_text(
+        "🛡 প্রথমে অর্ডার তথ্য দিন এই ফরম্যাটে (একটাই লাইনে, `_` দিয়ে আলাদা করে):\n\n"
+        f"`{FIVER_INFO_PATTERN_HINT}`\n\n"
+        "উদাহরণ: `jmbattaglia_FO41C0CAC4D84_CustomerPortal_brainflux_1000`\n\n"
+        "অথবা /cancel করে বাদ দিন।",
+        parse_mode="Markdown",
+    )
 
 
 async def addword_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2523,6 +2552,11 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
     file_id = _get_file_id(context.bot_data, token)
     if not file_id:
         await query.edit_message_text("❌ Request expired — please resend the photo."); return
+
+    # Effects are a heavy tool — enforce the rate limit here too.
+    if not await _check_heavy_rate_limit(update, "effects"):
+        return
+
     label = EFFECT_NAMES.get(effect_key, effect_key)
     status_msg = await query.edit_message_text(f"⏳ Applying *{label}*…", parse_mode="Markdown")
     try:
@@ -2538,7 +2572,7 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
         )
         await safe_edit(status_msg, f"✅ *{label}* done!", parse_mode="Markdown")
         _drop_token(context.bot_data, token)
-        await _record(context, update, f"effect:{effect_key}")  # per-effect tracking
+        await _record(context, update, f"effect:{effect_key}")
     except asyncio.TimeoutError:
         await safe_edit(status_msg, "⏱ Timed out — try a smaller image.")
     except Exception as exc:
@@ -2561,7 +2595,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "pdf2img":     ("pdf2img",         f"📄 Send me a *PDF* — I'll render up to {PDF2IMG_MAX_PAGES} pages."),
         "jpg2png":     ("jpg2png",         "🔁 Send me a *JPEG* as a file for best quality."),
         "png2jpg":     ("png2jpg",         "🔁 Send me a *PNG* as a file."),
-        "fiversanitize":("fiver_sanitize", "🛡 Send me the message to sanitise."),
+        "fiversanitize":("fiver_info",     "🛡 প্রথমে অর্ডার তথ্য দিন: `ClientName_OrderID_ProjectName_ProfileName_Amount`"),
         "compress":    ("compress_image",  f"📉 Send me the photo to compress (default ~{DEFAULT_COMPRESS_TARGET//1024} KB)."),
         "qrscan":      ("qrscan",          "🔍 Send me a photo containing a QR code."),
         **{t: (t, f"Send me the file for `{t}`.") for t in _DOC_ACCEPTS},
@@ -2594,6 +2628,8 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if action in _TOOL_PROMPTS:
         tool_key, msg = _TOOL_PROMPTS[action]
         context.user_data["awaiting"] = tool_key
+        if tool_key == "fiver_info":
+            context.user_data.pop("fiver_info", None)
         await query.edit_message_text(msg, parse_mode="Markdown")
     else:
         await query.edit_message_text("❌ Unknown option.")
@@ -2617,7 +2653,6 @@ async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT
 
 
 async def handle_color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles color|<tool> callbacks — prompts user for input."""
     query = update.callback_query; await query.answer()
     try: _, tool = query.data.split("|", 1)
     except ValueError: await query.edit_message_text("❌ Invalid."); return
@@ -2635,18 +2670,15 @@ async def handle_color_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_dev_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles dev|<tool> callbacks."""
     query = update.callback_query; await query.answer()
     try: _, tool = query.data.split("|", 1)
     except ValueError: await query.edit_message_text("❌ Invalid."); return
 
-    # Stateless / instant tools
     if tool == "uuid":
         await query.edit_message_text(f"🆔 {generate_uuid()}", parse_mode="Markdown", reply_markup=build_dev_input_keyboard(tool)); return
     if tool == "lorem":
         await query.edit_message_text(f"📝 {lorem_ipsum(50)}", reply_markup=build_dev_input_keyboard(tool)); return
 
-    # Tools that need case buttons
     if tool == "case":
         context.user_data["awaiting"]  = "dev_input"
         context.user_data["dev_tool"]  = "case_text"
@@ -2679,18 +2711,6 @@ async def handle_case_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("⚠️ No text stored. Please restart the tool."); return
     result = convert_case(text, mode)
     await query.edit_message_text(f"🔤 *{mode}:*\n\n`{result}`", parse_mode="Markdown", reply_markup=build_dev_input_keyboard("case"))
-
-
-async def handle_fiver_reportcard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query; await query.answer()
-    context.user_data["awaiting"]      = "fiver_profile"
-    context.user_data["fiver_profile"] = ""
-    context.user_data["fiver_client"]  = ""
-    context.user_data["fiver_order"]   = ""
-    await query.edit_message_text(
-        "📋 Let's fill the report card.\n\n*Step 1/3* — Send your *Profile* name:",
-        parse_mode="Markdown",
-    )
 
 
 async def handle_translate_lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2790,7 +2810,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if awaiting == "watermark_setup":
         await storage.set_watermark(update.effective_chat.id, file_id)
-        _watermark_cache[file_id] = await _download_file(context, file_id)  # pre-cache
+        _watermark_cache[file_id] = await _download_file(context, file_id)
         context.user_data["awaiting"] = "watermark_apply"
         await update.message.reply_text(
             "✅ Logo saved. Now send the *photo* to stamp, or pick a position:",
@@ -2938,7 +2958,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data.pop("awaiting", None)
         return
 
-    if awaiting == "fiver_sanitize":
+    if awaiting == "fiver_body":
         if file_name.endswith(".txt") or mime == "text/plain":
             status = await update.message.reply_text("⏳ Sanitising…")
             try:
@@ -2946,17 +2966,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 text = raw.decode("utf-8", errors="replace")
                 if len(text) > FIVER_SANITIZE_MAX_CHARS:
                     await safe_edit(status, f"⚠️ Too long ({len(text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}."); return
-                custom   = await storage.get_words(update.effective_chat.id)
+                custom = await storage.get_words(update.effective_chat.id)
                 san, changes, score = sanitize_fiver_text(text, custom)
-                report   = format_sanitizer_report(text, san, changes, score)
-                out_doc  = BytesIO(san.encode("utf-8")); out_doc.name = "sanitized.txt"
-                await update.message.reply_document(document=out_doc, filename="sanitized.txt", caption=report[:900])
+                info = context.user_data.get("fiver_info") or {
+                    "profile": "—", "client": "—", "project": "—", "order_id": "—", "amount": "—",
+                }
+                final_output = build_fiver_output(info, san)
                 await safe_delete(status)
+                await update.message.reply_text(f"```\n{final_output}\n```", parse_mode="Markdown")
+                await update.message.reply_text(format_sanitizer_report(changes, score), parse_mode="Markdown")
                 await _record(context, update, "fiver_sanitize")
             except Exception as exc:
+                logger.warning("fiver_sanitize (doc) failed: %s", exc)
                 await safe_edit(status, _user_hint(exc))
             finally:
                 context.user_data.pop("awaiting", None)
+                context.user_data.pop("fiver_info", None)
         else:
             await update.message.reply_text("⚠️ Please send a .txt file or type the message directly.")
         return
@@ -3020,48 +3045,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     raw_text = update.message.text
     awaiting = context.user_data.get("awaiting")
 
-    if GREETING_RE.match(raw_text.strip()):
+    if GREETING_RE.match(raw_text.strip()) and awaiting not in ("fiver_info", "fiver_body"):
         context.user_data.pop("awaiting", None)
         await update.message.reply_text(WELCOME_MESSAGE, parse_mode="Markdown", reply_markup=build_main_menu_keyboard()); return
 
-    # ── Fiver sanitize ──
-    if awaiting == "fiver_sanitize":
+    # ── Fiver: step 1 — combined info string ──
+    if awaiting == "fiver_info":
+        info = parse_fiver_info(raw_text)
+        if info is None:
+            await update.message.reply_text(
+                "⚠️ ফরম্যাট মিলছে না। ঠিক এভাবে দিন:\n"
+                f"`{FIVER_INFO_PATTERN_HINT}`\n\n"
+                "উদাহরণ: `jmbattaglia_FO41C0CAC4D84_CustomerPortal_brainflux_1000`",
+                parse_mode="Markdown",
+            )
+            return
+        context.user_data["fiver_info"] = info
+        context.user_data["awaiting"] = "fiver_body"
+        await update.message.reply_text("✅ তথ্য সংরক্ষিত হয়েছে। এখন ক্লায়েন্ট মেসেজটি পাঠান।")
+        return
+
+    # ── Fiver: step 2 — the actual message body ──
+    if awaiting == "fiver_body":
         text = raw_text.strip()
-        if not text: await update.message.reply_text("Please send some text."); return
+        if not text:
+            await update.message.reply_text("দয়া করে মেসেজ টেক্সট পাঠান।"); return
         if len(text) > FIVER_SANITIZE_MAX_CHARS:
-            await update.message.reply_text(f"⚠️ Too long ({len(text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}."); return
-        custom  = await storage.get_words(update.effective_chat.id)
-        san, changes, score = sanitize_fiver_text(text, custom)
-        report  = format_sanitizer_report(text, san, changes, score)
-        await update.message.reply_text(report, parse_mode="Markdown", reply_markup=build_fiver_report_keyboard())
-        await _record(context, update, "fiver_sanitize")
-        context.user_data.pop("awaiting", None); return
+            await update.message.reply_text(f"⚠️ Too long ({len(text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}.")
+            return
+        try:
+            custom = await storage.get_words(update.effective_chat.id)
+            san, changes, score = sanitize_fiver_text(text, custom)
+            info = context.user_data.get("fiver_info") or {
+                "profile": "—", "client": "—", "project": "—", "order_id": "—", "amount": "—",
+            }
+            final_output = build_fiver_output(info, san)
 
-    # ── Fiver report card steps ──
-    if awaiting == "fiver_profile":
-        context.user_data["fiver_profile"] = raw_text.strip()
-        context.user_data["awaiting"]      = "fiver_client"
-        await update.message.reply_text("*Step 2/3* — Send the *Client Name*:", parse_mode="Markdown"); return
+            await update.message.reply_text(f"```\n{final_output}\n```", parse_mode="Markdown")
+            await update.message.reply_text(format_sanitizer_report(changes, score), parse_mode="Markdown")
 
-    if awaiting == "fiver_client":
-        context.user_data["fiver_client"] = raw_text.strip()
-        context.user_data["awaiting"]     = "fiver_order"
-        await update.message.reply_text("*Step 3/3* — Send the *Order ID*:", parse_mode="Markdown"); return
-
-    if awaiting == "fiver_order":
-        context.user_data["fiver_order"] = raw_text.strip()
-        context.user_data.pop("awaiting", None)
-        # Re-run sanitizer with report card
-        last_text = context.user_data.pop("last_fiver_text", "")
-        custom    = await storage.get_words(update.effective_chat.id)
-        san, changes, score = sanitize_fiver_text(last_text, custom) if last_text else ("", [], 100)
-        report    = format_sanitizer_report(
-            last_text, san, changes, score,
-            profile     = context.user_data.pop("fiver_profile", ""),
-            client_name = context.user_data.pop("fiver_client", ""),
-            order_id    = context.user_data.pop("fiver_order", ""),
-        )
-        await update.message.reply_text(report, parse_mode="Markdown"); return
+            await _record(context, update, "fiver_sanitize")
+        except Exception as exc:
+            logger.warning("fiver_sanitize (v3) failed: %s", exc)
+            await update.message.reply_text(f"❌ কিছু একটা ভুল হয়েছে। আবার চেষ্টা করুন বা /cancel দিন।")
+            await notify_admin(context, "fiver_sanitize", f"fiver_sanitize failed: {exc}")
+        finally:
+            context.user_data.pop("awaiting", None)
+            context.user_data.pop("fiver_info", None)
+        return
 
     # ── Translate ──
     if awaiting == "translate_text":
@@ -3188,7 +3219,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data.pop("awaiting", None)
         await _record(context, update, f"dev:{tool}"); return
 
-    if awaiting and awaiting not in ("translate_text", "fiver_sanitize", "color_input", "dev_input"):
+    if awaiting and awaiting not in ("translate_text", "fiver_info", "fiver_body", "color_input", "dev_input"):
         await _warn_wrong_media(update, context, awaiting, "text message"); return
 
     # ── URL detection ──
@@ -3277,7 +3308,6 @@ def main() -> None:
         .build()
     )
 
-    # Commands
     for cmd, fn in [
         ("start",           start),
         ("help",            help_command),
@@ -3306,13 +3336,11 @@ def main() -> None:
     ]:
         app.add_handler(CommandHandler(cmd, fn))
 
-    # Media handlers
     app.add_handler(MessageHandler(filters.PHOTO,           handle_photo))
     app.add_handler(MessageHandler(filters.Sticker.ALL,     handle_sticker))
     app.add_handler(MessageHandler(filters.ANIMATION,       handle_animation))
     app.add_handler(MessageHandler(filters.Document.ALL,    handle_document))
 
-    # Callback handlers
     app.add_handler(CallbackQueryHandler(handle_effect_category_callback,  pattern=r"^fxcat\|"))
     app.add_handler(CallbackQueryHandler(handle_effect_back_callback,      pattern=r"^fxback\|"))
     app.add_handler(CallbackQueryHandler(handle_effect_callback,           pattern=r"^fx\|"))
@@ -3326,17 +3354,14 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_color_callback,            pattern=r"^color\|"))
     app.add_handler(CallbackQueryHandler(handle_dev_callback,              pattern=r"^dev\|"))
     app.add_handler(CallbackQueryHandler(handle_case_callback,             pattern=r"^case\|"))
-    app.add_handler(CallbackQueryHandler(handle_fiver_reportcard_callback, pattern=r"^fiver\|"))
 
-    # Text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Errors
     app.add_error_handler(error_handler)
 
     logger.info(
-        "BangaliIcon Bot v3 starting — "
-        "40 effects | Fiver v2 | Colour Tools | Dev Tools | "
+        "BangaliIcon Bot v3.1 starting — "
+        "Effects | Fiver Sanitizer v3 | Colour Tools | Dev Tools | "
         "Lummi + Hugeicons | QR | Passwords | Watermark | Compress"
     )
 

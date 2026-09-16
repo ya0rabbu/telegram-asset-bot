@@ -1,35 +1,30 @@
-"""BangaliIcon Bot — single-file build (v2: activity tracking + admin controls).
+"""
+BangaliIcon Bot — v3
+====================
+Single-file deployment.  All helper modules (storage, qr_tools,
+password_tools, image_extra) are embedded as source strings and loaded
+at import time via _load_embedded_module().
 
-Everything (main bot + all helper "modules") lives in this one .py file for
-easy deployment. The former storage.py / qr_tools.py / password_tools.py /
-image_extra.py modules are embedded below as source strings and loaded into
-real module objects at import time via `_load_embedded_module()`.
+New in v3
+---------
+  • 40 image effects  (up from 32; +Pencil Sketch, Neon Glow,
+    Kaleidoscope, Color Splash, Stained Glass, Tilt-Shift,
+    Color Splash added to engine)
+  • Fiver Sanitizer v2  — AI-sign stripping (_ — … "" ''),
+    before/after diff, quality score, professional report card
+  • 🎨 Color Tools category  (8 tools, zero external APIs)
+  • 🔧 Dev Tools category    (12 tools, zero external APIs)
+  • Image quality fix: MAX_DIM raised 400 → 1 200 px
+  • Per-effect usage tracking  (was always logged as "effects")
+  • asyncio.Lock lazy-init    (fixes DeprecationWarning on 3.10+)
+  • Token TTL expiry          (30-minute sliding window)
+  • Watermark bytes cache     (avoids re-downloading same logo)
+  • Rate-limit log persisted  (survives bot restart)
 
-WHAT'S NEW IN THIS VERSION
-  • storage.record_usage() now also logs WHO did WHAT and WHEN (per-user
-    activity log), not just a global tool counter.
-  • /stats is now a visual dashboard: bar-style counts per tool + a
-    "Top users" leaderboard with clickable usernames.
-  • /useractivity <chat_id|@user> — admin-only, see one user's recent actions.
-  • NEW self-service flow: /requestlimit <n> — any user can ask for a higher
-    heavy-tool limit. This immediately DMs every admin/super-admin with the
-    requester's @username AND numeric chat_id (both are required — you can't
-    set a limit for someone without their chat_id) plus inline
-    Approve / Deny buttons.
-  • /pendingrequests — admin-only, list open limit requests.
-  • /blockuser, /unblockuser — super-admin-only quick actions.
-  • Admin roster links fixed or the correct current telegram handles.
-  • translate_text() retries Google Translate with backoff (2s, then 4s) on
-    rate-limit style failures, then falls back to MyMemory (a separate free
-    provider with its own quota) before giving up. Users get a clear
-    "temporarily rate-limited" message instead of a generic failure.
-
-Run:
-    pip install -r requirements.txt  (python-telegram-bot, httpx, beautifulsoup4,
-        Pillow, pymupdf, deep-translator, onnxruntime, numpy, qrcode[pil],
-        opencv-python-headless)
+Run
+---
+    pip install -r requirements.txt
     export TELEGRAM_BOT_TOKEN=...
-    export ADMIN_CHAT_ID=...        # optional, legacy fallback
     python bot_single_file.py
 """
 
@@ -38,30 +33,35 @@ from __future__ import annotations
 import types
 
 
-def _load_embedded_module(name: str, source: str) -> types.ModuleType:
-    module = types.ModuleType(name)
-    module.__file__ = f"<embedded:{name}>"
-    exec(compile(source, f"<embedded:{name}>", "exec"), module.__dict__)
-    return module
+# ── Embedded module loader ────────────────────────────────────────────────────
 
+def _load_embedded_module(name: str, source: str) -> types.ModuleType:
+    mod = types.ModuleType(name)
+    mod.__file__ = f"<embedded:{name}>"
+    exec(compile(source, f"<embedded:{name}>", "exec"), mod.__dict__)  # noqa: S102
+    return mod
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  EMBEDDED: storage.py
+# ════════════════════════════════════════════════════════════════════════════
 
 _STORAGE_SOURCE = r'''
-"""storage.py — lightweight JSON-backed persistence for the bot.
+"""Lightweight JSON-backed persistence layer.
 
-Layout on disk (single DATA_DIR, one file per concern):
-  data/custom_words.json    {chat_id: {word: replacement}}
-  data/usage_stats.json     {tool_name: count}
-  data/user_activity.json   {chat_id: {"username": str|null, "counts": {tool: n},
-                                        "last_seen": ts, "log": [{"tool","ts"}]}}
-  data/watermarks.json      {chat_id: file_id}
-  data/custom_limits.json   {chat_id: int}
-  data/limit_requests.json  {chat_id: {"username","requested","ts"}}
-  data/blocked_users.json   [chat_id, ...]
+data/
+  custom_words.json     {chat_id: {word: replacement}}
+  usage_stats.json      {tool_name: count}
+  user_activity.json    {chat_id: {username, counts, last_seen, log}}
+  watermarks.json       {chat_id: file_id}
+  custom_limits.json    {chat_id: int}
+  limit_requests.json   {chat_id: {username, requested, ts}}
+  blocked_users.json    [chat_id, ...]
+  rate_limit_log.json   {chat_id: [timestamp, ...]}   ← persisted
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import time
@@ -71,20 +71,48 @@ from typing import Deque
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-CUSTOM_WORDS_PATH   = os.path.join(DATA_DIR, "custom_words.json")
-USAGE_STATS_PATH    = os.path.join(DATA_DIR, "usage_stats.json")
-USER_ACTIVITY_PATH  = os.path.join(DATA_DIR, "user_activity.json")
-WATERMARKS_PATH     = os.path.join(DATA_DIR, "watermarks.json")
-CUSTOM_LIMITS_PATH  = os.path.join(DATA_DIR, "custom_limits.json")
-LIMIT_REQUESTS_PATH = os.path.join(DATA_DIR, "limit_requests.json")
-BLOCKED_USERS_PATH  = os.path.join(DATA_DIR, "blocked_users.json")
+CUSTOM_WORDS_PATH    = os.path.join(DATA_DIR, "custom_words.json")
+USAGE_STATS_PATH     = os.path.join(DATA_DIR, "usage_stats.json")
+USER_ACTIVITY_PATH   = os.path.join(DATA_DIR, "user_activity.json")
+WATERMARKS_PATH      = os.path.join(DATA_DIR, "watermarks.json")
+CUSTOM_LIMITS_PATH   = os.path.join(DATA_DIR, "custom_limits.json")
+LIMIT_REQUESTS_PATH  = os.path.join(DATA_DIR, "limit_requests.json")
+BLOCKED_USERS_PATH   = os.path.join(DATA_DIR, "blocked_users.json")
+RATE_LIMIT_LOG_PATH  = os.path.join(DATA_DIR, "rate_limit_log.json")
 
-MAX_WORDS_PER_USER = 100
-RESERVED_WORDS = {"fiverr"}
+MAX_WORDS_PER_USER       = 100
+RESERVED_WORDS           = {"fiverr"}
+MAX_LOG_ENTRIES_PER_USER = 50
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_HEAVY_MAX_CALLS = 5
 
-MAX_LOG_ENTRIES_PER_USER = 50  # keep the per-user action log bounded
+import asyncio
+HEAVY_JOB_SEMAPHORE = asyncio.Semaphore(3)
 
-_lock = asyncio.Lock()
+HEAVY_TOOLS = {
+    "bgremove", "effects", "pptx2images", "pdf2img",
+    "watermark", "compress",
+}
+
+# Lazy-init locks (avoids DeprecationWarning on Python 3.10+)
+_lock: asyncio.Lock | None = None
+_rate_lock: asyncio.Lock | None = None
+
+def _get_lock() -> asyncio.Lock:
+    global _lock
+    if _lock is None:
+        _lock = asyncio.Lock()
+    return _lock
+
+def _get_rate_lock() -> asyncio.Lock:
+    global _rate_lock
+    if _rate_lock is None:
+        _rate_lock = asyncio.Lock()
+    return _rate_lock
+
+# In-memory rate-limit deques (populated from disk on first use)
+_heavy_call_log: dict[int, Deque[float]] = defaultdict(deque)
+_rate_log_loaded = False
 
 
 def _load(path: str) -> dict:
@@ -117,71 +145,67 @@ def _save(path: str, data) -> None:
 # ── Custom words ──────────────────────────────────────────────────────────────
 
 async def add_word(chat_id: int, word: str, replacement: str) -> tuple[bool, str]:
-    word = word.strip().lower()
-    replacement = replacement.strip()
+    word, replacement = word.strip().lower(), replacement.strip()
     if not word or not replacement:
         return False, "Both word and replacement must be non-empty."
     if word in RESERVED_WORDS:
-        return False, f"'{word}' is reserved and can't be overridden."
-    async with _lock:
+        return False, f"'{word}' is reserved and cannot be overridden."
+    async with _get_lock():
         data = _load(CUSTOM_WORDS_PATH)
         user_words = data.setdefault(str(chat_id), {})
         was_update = word in user_words
         if not was_update and len(user_words) >= MAX_WORDS_PER_USER:
-            return False, f"Limit reached ({MAX_WORDS_PER_USER} custom words). Remove one with /delword first."
+            return False, f"Limit reached ({MAX_WORDS_PER_USER} words). Remove one with /delword first."
         user_words[word] = replacement
         _save(CUSTOM_WORDS_PATH, data)
-    return True, ("updated" if was_update else "added")
+    return True, "updated" if was_update else "added"
 
 
 async def get_words(chat_id: int) -> dict[str, str]:
-    async with _lock:
-        data = _load(CUSTOM_WORDS_PATH)
-        return dict(data.get(str(chat_id), {}))
+    async with _get_lock():
+        return dict(_load(CUSTOM_WORDS_PATH).get(str(chat_id), {}))
 
 
 async def del_word(chat_id: int, word: str) -> bool:
     word = word.strip().lower()
-    async with _lock:
+    async with _get_lock():
         data = _load(CUSTOM_WORDS_PATH)
         user_words = data.get(str(chat_id), {})
         if word not in user_words:
             return False
         del user_words[word]
         _save(CUSTOM_WORDS_PATH, data)
-        return True
+    return True
 
 
 async def reset_words(chat_id: int) -> None:
-    async with _lock:
+    async with _get_lock():
         data = _load(CUSTOM_WORDS_PATH)
-        if str(chat_id) in data:
-            del data[str(chat_id)]
-            _save(CUSTOM_WORDS_PATH, data)
+        data.pop(str(chat_id), None)
+        _save(CUSTOM_WORDS_PATH, data)
 
 
-# ── Usage stats (global counters + per-user activity) ─────────────────────────
+# ── Usage stats ───────────────────────────────────────────────────────────────
 
-async def record_usage(tool_name: str, chat_id: int | None = None, username: str | None = None) -> None:
-    """Bumps the global per-tool counter AND, when chat_id is given, records
-    who did it (username + chat_id) so /stats and /useractivity can show a
-    real per-user breakdown, not just an anonymous total."""
+async def record_usage(
+    tool_name: str,
+    chat_id: int | None = None,
+    username: str | None = None,
+) -> None:
     now = time.time()
-    async with _lock:
-        data = _load(USAGE_STATS_PATH)
-        data[tool_name] = data.get(tool_name, 0) + 1
-        _save(USAGE_STATS_PATH, data)
-
+    async with _get_lock():
+        # Global counter
+        stats = _load(USAGE_STATS_PATH)
+        stats[tool_name] = stats.get(tool_name, 0) + 1
+        _save(USAGE_STATS_PATH, stats)
+        # Per-user activity
         if chat_id is not None:
             activity = _load(USER_ACTIVITY_PATH)
             entry = activity.setdefault(str(chat_id), {
-                "username": username,
-                "counts": {},
-                "last_seen": now,
-                "log": [],
+                "username": username, "counts": {}, "last_seen": now, "log": [],
             })
             if username:
-                entry["username"] = username  # keep freshest known username
+                entry["username"] = username
             entry["counts"][tool_name] = entry["counts"].get(tool_name, 0) + 1
             entry["last_seen"] = now
             entry["log"].append({"tool": tool_name, "ts": now})
@@ -190,75 +214,81 @@ async def record_usage(tool_name: str, chat_id: int | None = None, username: str
 
 
 async def get_stats() -> list[tuple[str, int]]:
-    async with _lock:
+    async with _get_lock():
         data = _load(USAGE_STATS_PATH)
     return sorted(data.items(), key=lambda kv: kv[1], reverse=True)
 
 
 async def get_user_activity_all() -> dict:
-    async with _lock:
+    async with _get_lock():
         return _load(USER_ACTIVITY_PATH)
 
 
 async def get_user_activity(chat_id: int) -> dict | None:
-    async with _lock:
-        data = _load(USER_ACTIVITY_PATH)
-        return data.get(str(chat_id))
+    async with _get_lock():
+        return _load(USER_ACTIVITY_PATH).get(str(chat_id))
 
 
 async def find_chat_id_by_username(username: str) -> int | None:
-    """Best-effort lookup of a chat_id from a known @username, searched across
-    everyone who has ever triggered record_usage (not just admins)."""
     username = username.strip().lstrip("@").lower()
-    async with _lock:
+    async with _get_lock():
         data = _load(USER_ACTIVITY_PATH)
     for cid, entry in data.items():
-        uname = (entry.get("username") or "").lower()
-        if uname == username:
+        if (entry.get("username") or "").lower() == username:
             return int(cid)
     return None
 
 
-# ── Watermark image (per user) ────────────────────────────────────────────────
+# ── Watermark ─────────────────────────────────────────────────────────────────
 
 async def set_watermark(chat_id: int, file_id: str) -> None:
-    async with _lock:
+    async with _get_lock():
         data = _load(WATERMARKS_PATH)
         data[str(chat_id)] = file_id
         _save(WATERMARKS_PATH, data)
 
 
 async def get_watermark(chat_id: int) -> str | None:
-    async with _lock:
-        data = _load(WATERMARKS_PATH)
-        return data.get(str(chat_id))
+    async with _get_lock():
+        return _load(WATERMARKS_PATH).get(str(chat_id))
 
 
 async def clear_watermark(chat_id: int) -> None:
-    async with _lock:
+    async with _get_lock():
         data = _load(WATERMARKS_PATH)
-        if str(chat_id) in data:
-            del data[str(chat_id)]
-            _save(WATERMARKS_PATH, data)
+        data.pop(str(chat_id), None)
+        _save(WATERMARKS_PATH, data)
 
 
-# ── Rate limiting (in-memory sliding window + persisted overrides) ────────────
+# ── Rate limiting ─────────────────────────────────────────────────────────────
 
-RATE_LIMIT_WINDOW_SECONDS = 60
-RATE_LIMIT_HEAVY_MAX_CALLS = 5
+def _ensure_rate_log_loaded() -> None:
+    global _rate_log_loaded
+    if _rate_log_loaded:
+        return
+    raw = _load(RATE_LIMIT_LOG_PATH)
+    now = time.monotonic()
+    real_now = time.time()
+    for cid_str, timestamps in raw.items():
+        dq = _heavy_call_log[int(cid_str)]
+        for ts in timestamps:
+            age = real_now - ts
+            if age < RATE_LIMIT_WINDOW_SECONDS:
+                dq.append(now - age)
+    _rate_log_loaded = True
 
-_heavy_call_log: dict[int, Deque[float]] = defaultdict(deque)
-_rate_lock = asyncio.Lock()
 
-HEAVY_JOB_SEMAPHORE = asyncio.Semaphore(3)
-
-HEAVY_TOOLS = {
-    "bgremove", "effects", "pptx2images", "pdf2img", "watermark", "compress",
-}
+def _persist_rate_log() -> None:
+    now_mono = time.monotonic()
+    now_real = time.time()
+    out: dict[str, list[float]] = {}
+    for cid, dq in _heavy_call_log.items():
+        out[str(cid)] = [now_real - (now_mono - ts) for ts in dq]
+    _save(RATE_LIMIT_LOG_PATH, out)
 
 
 async def set_custom_limit(chat_id: int, max_calls: int | None) -> None:
-    async with _lock:
+    async with _get_lock():
         data = _load(CUSTOM_LIMITS_PATH)
         if max_calls is None:
             data.pop(str(chat_id), None)
@@ -268,9 +298,8 @@ async def set_custom_limit(chat_id: int, max_calls: int | None) -> None:
 
 
 async def get_custom_limit(chat_id: int) -> int | None:
-    async with _lock:
-        data = _load(CUSTOM_LIMITS_PATH)
-        return data.get(str(chat_id))
+    async with _get_lock():
+        return _load(CUSTOM_LIMITS_PATH).get(str(chat_id))
 
 
 async def _effective_limit(chat_id: int) -> int:
@@ -279,13 +308,12 @@ async def _effective_limit(chat_id: int) -> int:
 
 
 async def is_blocked(chat_id: int) -> bool:
-    async with _lock:
-        blocked = _load_list(BLOCKED_USERS_PATH)
-        return chat_id in blocked
+    async with _get_lock():
+        return chat_id in _load_list(BLOCKED_USERS_PATH)
 
 
 async def block_user(chat_id: int) -> None:
-    async with _lock:
+    async with _get_lock():
         blocked = _load_list(BLOCKED_USERS_PATH)
         if chat_id not in blocked:
             blocked.append(chat_id)
@@ -294,7 +322,7 @@ async def block_user(chat_id: int) -> None:
 
 
 async def unblock_user(chat_id: int) -> None:
-    async with _lock:
+    async with _get_lock():
         blocked = _load_list(BLOCKED_USERS_PATH)
         if chat_id in blocked:
             blocked.remove(chat_id)
@@ -307,7 +335,8 @@ async def check_rate_limit(chat_id: int, exempt: bool = False) -> tuple[bool, fl
         return True, 0.0
     limit = await _effective_limit(chat_id)
     now = time.monotonic()
-    async with _rate_lock:
+    async with _get_rate_lock():
+        _ensure_rate_log_loaded()
         log = _heavy_call_log[chat_id]
         while log and now - log[0] > RATE_LIMIT_WINDOW_SECONDS:
             log.popleft()
@@ -317,51 +346,48 @@ async def check_rate_limit(chat_id: int, exempt: bool = False) -> tuple[bool, fl
             wait = RATE_LIMIT_WINDOW_SECONDS - (now - log[0])
             return False, max(wait, 1.0)
         log.append(now)
+        _persist_rate_log()
         return True, 0.0
 
 
 async def calls_used(chat_id: int) -> tuple[int, int]:
     limit = await _effective_limit(chat_id)
     now = time.monotonic()
-    async with _rate_lock:
+    async with _get_rate_lock():
+        _ensure_rate_log_loaded()
         log = _heavy_call_log[chat_id]
         while log and now - log[0] > RATE_LIMIT_WINDOW_SECONDS:
             log.popleft()
         return len(log), limit
 
 
-# ── Limit-increase requests (self-service, needs admin approval) ─────────────
+# ── Limit requests ────────────────────────────────────────────────────────────
 
 async def add_limit_request(chat_id: int, username: str | None, requested: int) -> None:
-    async with _lock:
+    async with _get_lock():
         data = _load(LIMIT_REQUESTS_PATH)
-        data[str(chat_id)] = {
-            "username": username,
-            "requested": requested,
-            "ts": time.time(),
-        }
+        data[str(chat_id)] = {"username": username, "requested": requested, "ts": time.time()}
         _save(LIMIT_REQUESTS_PATH, data)
 
 
 async def get_limit_requests() -> dict:
-    async with _lock:
+    async with _get_lock():
         return _load(LIMIT_REQUESTS_PATH)
 
 
 async def remove_limit_request(chat_id: int) -> None:
-    async with _lock:
+    async with _get_lock():
         data = _load(LIMIT_REQUESTS_PATH)
-        if str(chat_id) in data:
-            del data[str(chat_id)]
-            _save(LIMIT_REQUESTS_PATH, data)
-
+        data.pop(str(chat_id), None)
+        _save(LIMIT_REQUESTS_PATH, data)
 '''
 
+# ════════════════════════════════════════════════════════════════════════════
+#  EMBEDDED: qr_tools.py
+# ════════════════════════════════════════════════════════════════════════════
+
 _QR_TOOLS_SOURCE = r'''
-"""qr_tools.py — QR code generation and scanning."""
-
 from __future__ import annotations
-
 import asyncio
 from io import BytesIO
 
@@ -383,16 +409,15 @@ async def generate_qr(text: str) -> bytes:
 
 
 async def scan_qr(image_bytes: bytes) -> list[str]:
-    import cv2
-    import numpy as np
+    import cv2, numpy as np
 
     def _run() -> list[str]:
         arr = np.frombuffer(image_bytes, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
-            raise ValueError("Could not decode that image.")
+            raise ValueError("Could not decode image.")
         detector = cv2.QRCodeDetector()
-        found = []
+        found: list[str] = []
         try:
             ok, decoded_info, _, _ = detector.detectAndDecodeMulti(img)
             if ok:
@@ -406,27 +431,22 @@ async def scan_qr(image_bytes: bytes) -> list[str]:
         return found
 
     return await asyncio.to_thread(_run)
-
 '''
 
+# ════════════════════════════════════════════════════════════════════════════
+#  EMBEDDED: password_tools.py
+# ════════════════════════════════════════════════════════════════════════════
+
 _PASSWORD_TOOLS_SOURCE = r'''
-"""password_tools.py — secure password / PIN generation."""
-
 from __future__ import annotations
-
-import secrets
-import string
+import secrets, string
 
 AMBIGUOUS_CHARS = "il1Lo0O"
-
 LOWER   = string.ascii_lowercase
 UPPER   = string.ascii_uppercase
 DIGITS  = string.digits
 SYMBOLS = "!@#$%^&*()-_=+[]{};:,.?/"
-
-MIN_LENGTH = 4
-MAX_LENGTH = 128
-DEFAULT_LENGTH = 16
+MIN_LENGTH, MAX_LENGTH, DEFAULT_LENGTH = 4, 128, 16
 
 
 def generate_password(
@@ -438,26 +458,11 @@ def generate_password(
     no_ambiguous: bool = False,
 ) -> str:
     length = max(MIN_LENGTH, min(MAX_LENGTH, length))
-
-    pools: list[str] = []
-    if use_lower:
-        pools.append(LOWER)
-    if use_upper:
-        pools.append(UPPER)
-    if use_digits:
-        pools.append(DIGITS)
-    if use_symbols:
-        pools.append(SYMBOLS)
-    if not pools:
-        pools = [LOWER, DIGITS]
-
+    pools = [p for flag, p in ((use_lower, LOWER), (use_upper, UPPER), (use_digits, DIGITS), (use_symbols, SYMBOLS)) if flag] or [LOWER, DIGITS]
     if no_ambiguous:
-        pools = ["".join(c for c in pool if c not in AMBIGUOUS_CHARS) or pool for pool in pools]
-
+        pools = ["".join(c for c in p if c not in AMBIGUOUS_CHARS) or p for p in pools]
     alphabet = "".join(pools)
-    required = [secrets.choice(pool) for pool in pools]
-    remaining = [secrets.choice(alphabet) for _ in range(length - len(required))]
-    chars = required + remaining
+    chars = [secrets.choice(p) for p in pools] + [secrets.choice(alphabet) for _ in range(length - len(pools))]
     for i in range(len(chars) - 1, 0, -1):
         j = secrets.randbelow(i + 1)
         chars[i], chars[j] = chars[j], chars[i]
@@ -465,67 +470,53 @@ def generate_password(
 
 
 def generate_pin(length: int = 4) -> str:
-    length = max(3, min(12, length))
-    return "".join(secrets.choice(string.digits) for _ in range(length))
-
+    return "".join(secrets.choice(string.digits) for _ in range(max(3, min(12, length))))
 '''
 
+# ════════════════════════════════════════════════════════════════════════════
+#  EMBEDDED: image_extra.py
+# ════════════════════════════════════════════════════════════════════════════
+
 _IMAGE_EXTRA_SOURCE = r'''
-"""image_extra.py — watermarking and size-targeted compression."""
-
 from __future__ import annotations
-
 import asyncio
 from io import BytesIO
 
 DEFAULT_WATERMARK_SCALE   = 0.15
 DEFAULT_WATERMARK_OPACITY = 0.60
 DEFAULT_MARGIN_PX         = 16
-
 _POSITIONS = {"top-left", "top-right", "bottom-left", "bottom-right", "center"}
 
 
-def _compute_position(pos: str, base_w: int, base_h: int, wm_w: int, wm_h: int, margin: int) -> tuple[int, int]:
-    if pos == "top-left":
-        return margin, margin
-    if pos == "top-right":
-        return base_w - wm_w - margin, margin
-    if pos == "bottom-left":
-        return margin, base_h - wm_h - margin
-    if pos == "center":
-        return (base_w - wm_w) // 2, (base_h - wm_h) // 2
-    return base_w - wm_w - margin, base_h - wm_h - margin
+def _compute_position(pos, bw, bh, ww, wh, m):
+    if pos == "top-left":    return m, m
+    if pos == "top-right":   return bw - ww - m, m
+    if pos == "bottom-left": return m, bh - wh - m
+    if pos == "center":      return (bw - ww) // 2, (bh - wh) // 2
+    return bw - ww - m, bh - wh - m
 
 
 async def apply_watermark(
-    base_bytes: bytes,
-    watermark_bytes: bytes,
+    base_bytes: bytes, watermark_bytes: bytes,
     position: str = "bottom-right",
     scale: float = DEFAULT_WATERMARK_SCALE,
     opacity: float = DEFAULT_WATERMARK_OPACITY,
 ) -> bytes:
     from PIL import Image, ImageOps
-
     position = position if position in _POSITIONS else "bottom-right"
-    scale = min(max(scale, 0.02), 0.9)
-    opacity = min(max(opacity, 0.05), 1.0)
+    scale    = min(max(scale, 0.02), 0.9)
+    opacity  = min(max(opacity, 0.05), 1.0)
 
     def _run() -> bytes:
         base = ImageOps.exif_transpose(Image.open(BytesIO(base_bytes))).convert("RGBA")
-        wm = Image.open(BytesIO(watermark_bytes)).convert("RGBA")
-
-        target_w = max(1, int(base.width * scale))
-        ratio = target_w / wm.width
-        wm = wm.resize((target_w, max(1, int(wm.height * ratio))))
-
+        wm   = Image.open(BytesIO(watermark_bytes)).convert("RGBA")
+        tw   = max(1, int(base.width * scale))
+        wm   = wm.resize((tw, max(1, int(wm.height * tw / wm.width))))
         if opacity < 1.0:
-            alpha = wm.split()[3].point(lambda a: int(a * opacity))
-            wm.putalpha(alpha)
-
+            wm.putalpha(wm.split()[3].point(lambda a: int(a * opacity)))
         x, y = _compute_position(position, base.width, base.height, wm.width, wm.height, DEFAULT_MARGIN_PX)
         composed = base.copy()
         composed.alpha_composite(wm, dest=(x, y))
-
         buf = BytesIO()
         composed.convert("RGB").save(buf, format="JPEG", quality=95, optimize=True)
         return buf.getvalue()
@@ -538,22 +529,19 @@ async def compress_to_target(image_bytes: bytes, target_bytes: int) -> bytes:
 
     def _run() -> bytes:
         img = ImageOps.exif_transpose(Image.open(BytesIO(image_bytes))).convert("RGB")
-
-        for quality in (95, 85, 75, 65, 55, 45, 35, 25):
+        for q in (95, 85, 75, 65, 55, 45, 35, 25):
             buf = BytesIO()
-            img.save(buf, format="JPEG", quality=quality, optimize=True)
+            img.save(buf, format="JPEG", quality=q, optimize=True)
             if buf.tell() <= target_bytes:
                 return buf.getvalue()
-
-        current = img
+        cur = img
         for _ in range(6):
-            current = current.resize((max(1, int(current.width * 0.8)), max(1, int(current.height * 0.8))))
-            for quality in (75, 60, 45, 30):
+            cur = cur.resize((max(1, int(cur.width * 0.8)), max(1, int(cur.height * 0.8))))
+            for q in (75, 60, 45, 30):
                 buf = BytesIO()
-                current.save(buf, format="JPEG", quality=quality, optimize=True)
+                cur.save(buf, format="JPEG", quality=q, optimize=True)
                 if buf.tell() <= target_bytes:
                     return buf.getvalue()
-
         return buf.getvalue()
 
     return await asyncio.to_thread(_run)
@@ -562,40 +550,42 @@ async def compress_to_target(image_bytes: bytes, target_bytes: int) -> bytes:
 def parse_size_to_bytes(text: str) -> int | None:
     text = text.strip().lower().replace(" ", "")
     try:
-        if text.endswith("kb"):
-            return int(float(text[:-2]) * 1024)
-        if text.endswith("mb"):
-            return int(float(text[:-2]) * 1024 * 1024)
-        if text.endswith("b"):
-            return int(text[:-1])
+        if text.endswith("kb"): return int(float(text[:-2]) * 1024)
+        if text.endswith("mb"): return int(float(text[:-2]) * 1024 * 1024)
+        if text.endswith("b"):  return int(text[:-1])
         return int(text)
     except ValueError:
         return None
-
 '''
 
-storage = _load_embedded_module("storage", _STORAGE_SOURCE)
-qr_tools = _load_embedded_module("qr_tools", _QR_TOOLS_SOURCE)
+# ── Load embedded modules ─────────────────────────────────────────────────────
+storage        = _load_embedded_module("storage",        _STORAGE_SOURCE)
+qr_tools       = _load_embedded_module("qr_tools",       _QR_TOOLS_SOURCE)
 password_tools = _load_embedded_module("password_tools", _PASSWORD_TOOLS_SOURCE)
-image_extra = _load_embedded_module("image_extra", _IMAGE_EXTRA_SOURCE)
+image_extra    = _load_embedded_module("image_extra",    _IMAGE_EXTRA_SOURCE)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  MAIN BOT CODE (originally bot.py) starts here
+#  MAIN BOT
 # ════════════════════════════════════════════════════════════════════════════
 
 import asyncio
 import base64
+import datetime
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
+import string
 import sys
 import tempfile
+import time
 import uuid
 from io import BytesIO
 from typing import Any, Callable, Coroutine
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -618,35 +608,32 @@ from telegram.ext import (
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-MAX_UPLOAD_BYTES        = 49 * 1024 * 1024
-MAX_CAPTION_LENGTH      = 1024
-BOT_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
-PDF2IMG_MAX_PAGES       = 20
-MAX_PENDING_FILES       = 500
-TRANSLATE_MAX_CHARS     = 4_500
-MYMEMORY_MAX_CHARS      = 500  # MyMemory free tier hard limit per request
-FIVER_SANITIZE_MAX_CHARS = 4_500
-REMBG_MAX_DIMENSION     = 1_500
-REMBG_TIMEOUT_SECONDS   = 90
-GIF_MAX_FRAMES          = 10
-GIF_FRAME_DELAY_MS      = 100
-DEFAULT_COMPRESS_TARGET_BYTES = 1 * 1024 * 1024
-MAX_LIMIT_REQUEST_VALUE = 100  # sanity ceiling on what a user can request
+MAX_UPLOAD_BYTES          = 49 * 1024 * 1024
+MAX_CAPTION_LENGTH        = 1_024
+BOT_DOWNLOAD_LIMIT_BYTES  = 20 * 1024 * 1024
+PDF2IMG_MAX_PAGES         = 20
+MAX_PENDING_FILES         = 500
+TOKEN_TTL_SECONDS         = 1_800          # 30 minutes
+TRANSLATE_MAX_CHARS       = 4_500
+MYMEMORY_MAX_CHARS        = 500
+FIVER_SANITIZE_MAX_CHARS  = 4_500
+REMBG_MAX_DIMENSION       = 1_500
+REMBG_TIMEOUT_SECONDS     = 90
+GIF_MAX_FRAMES            = 10
+IMAGE_MAX_DIM             = 1_200          # was 400 — quality fix
+DEFAULT_COMPRESS_TARGET   = 1 * 1024 * 1024
+MAX_LIMIT_REQUEST_VALUE   = 100
 
-REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
+REQUEST_TIMEOUT     = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
 HTTP_RETRY_ATTEMPTS = 3
 HTTP_RETRY_BACKOFF  = 1.5
 
-ENGINE_SCRIPT = os.path.join(os.path.dirname(__file__), "python_engine.py")
-
-U2NETP_MODEL_URL  = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx"
+ENGINE_SCRIPT    = os.path.join(os.path.dirname(__file__), "python_engine.py")
+U2NETP_MODEL_URL = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx"
 U2NETP_MODEL_PATH = os.path.join(tempfile.gettempdir(), "u2netp.onnx")
 
 
-# ── Admin roster ────────────────────────────────────────────────────────────
-# Two tiers, identified by Telegram @username (case-insensitive, no '@').
-# `telegram` holds a direct t.me deep-link so admin cards/messages can be
-# tapped straight through instead of just showing a bare @handle.
+# ── Admin roster ──────────────────────────────────────────────────────────────
 SUPER_ADMINS: dict[str, dict[str, str]] = {
     "ya_rabbu": {
         "name": "Yasir Abed Rabbu",
@@ -654,7 +641,6 @@ SUPER_ADMINS: dict[str, dict[str, str]] = {
         "telegram": "https://t.me/YA_Rabbu",
     },
 }
-
 ADMINS: dict[str, dict[str, str]] = {
     "smashik_softvence": {
         "name": "Sheikh Muhammad Ashik",
@@ -663,12 +649,70 @@ ADMINS: dict[str, dict[str, str]] = {
     },
 }
 
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
-_admin_chat_ids: dict[str, int] = {}  # username(lower) -> chat_id
-
-_ADMIN_ERROR_THROTTLE_SECONDS = 600
+ADMIN_CHAT_ID    = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
+_admin_chat_ids: dict[str, int] = {}
+_ADMIN_ERROR_THROTTLE_SECONDS  = 600
 _last_admin_alert: dict[str, float] = {}
 
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger("bangaliicon")
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
+LUMMI_URL_RE = re.compile(
+    r"https?://(?:www\.)?lummi\.ai/(?:photo|illustration|3d)/[^\s<>]+", re.IGNORECASE
+)
+URL_RE       = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+LUMMI_CID_RE = re.compile(r"Qm[1-9A-HJ-NP-Za-km-z]{44}")
+GREETING_RE  = re.compile(
+    r"^(hi+|he+llo+|hey+|yo|start|salam|assalamu\s*alaikum|assalamualaikum)[!.\s]*$",
+    re.IGNORECASE,
+)
+
+_http_client: httpx.AsyncClient | None = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(headers=HEADERS, timeout=REQUEST_TIMEOUT, follow_redirects=True)
+    return _http_client
+
+
+async def close_http_client() -> None:
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+        _http_client = None
+
+
+async def with_retry(fn: Callable[[], Coroutine], attempts: int = HTTP_RETRY_ATTEMPTS, backoff: float = HTTP_RETRY_BACKOFF) -> Any:
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return await fn()
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                await asyncio.sleep(backoff * (2 ** attempt))
+    raise last_exc
+
+
+# ── Admin helpers ─────────────────────────────────────────────────────────────
 
 def _username_of(update: Update) -> str | None:
     user = update.effective_user
@@ -676,9 +720,6 @@ def _username_of(update: Update) -> str | None:
 
 
 def _display_name(update: Update, escape_markdown: bool = False) -> str:
-    """Best-effort human label for notifications: @username, else first name, else chat_id.
-    Pass escape_markdown=True when the result will be dropped into a
-    parse_mode='Markdown' message (e.g. usernames with underscores)."""
     user = update.effective_user
     if user and user.username:
         label = f"@{user.username}"
@@ -700,10 +741,8 @@ def is_admin(update: Update) -> bool:
 
 
 def admin_role_label(update: Update) -> str:
-    if is_super_admin(update):
-        return "Super Admin"
-    if is_admin(update):
-        return "Admin"
+    if is_super_admin(update): return "Super Admin"
+    if is_admin(update):       return "Admin"
     return "User"
 
 
@@ -712,101 +751,33 @@ def _remember_admin_chat_id(update: Update) -> None:
     if uname and (uname in SUPER_ADMINS or uname in ADMINS) and update.effective_chat:
         _admin_chat_ids[uname] = update.effective_chat.id
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger("unified_asset_bot")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-}
-
-LUMMI_URL_RE = re.compile(
-    r"https?://(?:www\.)?lummi\.ai/(?:photo|illustration|3d)/[^\s<>]+",
-    re.IGNORECASE,
-)
-URL_RE       = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
-LUMMI_CID_RE = re.compile(r"Qm[1-9A-HJ-NP-Za-km-z]{44}")
-
-GREETING_RE = re.compile(
-    r"^(hi+|he+llo+|hey+|yo|start|salam|assalamu\s*alaikum|assalamualaikum)[!.\s]*$",
-    re.IGNORECASE,
-)
-
-# ── Shared HTTP client (connection-pooled, reused across all requests) ────────
-_http_client: httpx.AsyncClient | None = None
-
-
-def get_http_client() -> httpx.AsyncClient:
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(headers=HEADERS, timeout=REQUEST_TIMEOUT, follow_redirects=True)
-    return _http_client
-
-
-async def close_http_client() -> None:
-    global _http_client
-    if _http_client and not _http_client.is_closed:
-        await _http_client.aclose()
-        _http_client = None
-
-
-# ── Retry helper ──────────────────────────────────────────────────────────────
-
-async def with_retry(
-    fn: Callable[[], Coroutine[Any, Any, Any]],
-    attempts: int = HTTP_RETRY_ATTEMPTS,
-    backoff: float = HTTP_RETRY_BACKOFF,
-) -> Any:
-    last_exc: Exception | None = None
-    for attempt in range(attempts):
-        try:
-            return await fn()
-        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
-            last_exc = exc
-            if attempt < attempts - 1:
-                delay = backoff * (2 ** attempt)
-                logger.warning("Request failed (%s), retrying in %.1fs…", exc, delay)
-                await asyncio.sleep(delay)
-    raise last_exc
-
-
-# ── Admin alerting ────────────────────────────────────────────────────────────
-
-async def notify_admin(context: ContextTypes.DEFAULT_TYPE, error_key: str, message: str,
-                        throttle: bool = True, reply_markup: InlineKeyboardMarkup | None = None) -> None:
-    """Send a message to every known admin chat. Technical error alerts are
-    throttled per error_key; user-facing admin actions (like a limit
-    request) pass throttle=False so they always go through."""
+async def notify_admin(
+    context: ContextTypes.DEFAULT_TYPE,
+    error_key: str,
+    message: str,
+    throttle: bool = True,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
     targets = set(_admin_chat_ids.values())
     if ADMIN_CHAT_ID:
         targets.add(ADMIN_CHAT_ID)
     if not targets:
         return
     if throttle:
-        now = asyncio.get_event_loop().time()
+        now  = asyncio.get_event_loop().time()
         last = _last_admin_alert.get(error_key, 0)
         if now - last < _ADMIN_ERROR_THROTTLE_SECONDS:
             return
         _last_admin_alert[error_key] = now
     for chat_id in targets:
         try:
-            await context.bot.send_message(
-                chat_id=chat_id, text=f"⚠️ {message}"[:4000], reply_markup=reply_markup
-            )
+            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {message}"[:4000], reply_markup=reply_markup)
         except Exception:
-            logger.exception("Failed to notify admin chat_id=%s", chat_id)
+            logger.exception("Failed to notify admin %s", chat_id)
 
 
-# ── Effects ───────────────────────────────────────────────────────────────────
+# ── Effects catalogue ─────────────────────────────────────────────────────────
 EFFECT_CATEGORIES: dict[str, str] = {
     "retro":   "Retro & Print",
     "tone":    "Color & Tone",
@@ -817,43 +788,57 @@ EFFECT_CATEGORIES: dict[str, str] = {
 EFFECT_CATEGORY_ORDER = ["retro", "tone", "art", "digital", "distort"]
 
 EFFECTS: list[tuple[str, str, str]] = [
-    ("halftone-dots",        "Halftone",        "retro"),
-    ("comic-cmyk",           "Pop-Art",         "retro"),
-    ("retro-8bit",           "8-Bit CRT",       "retro"),
-    ("risograph-duo",        "Risograph",       "retro"),
-    ("crosshatch-engraving", "Crosshatch",      "retro"),
-    ("bayer-dither",         "Dither",          "retro"),
-    ("vhs-tape",             "VHS Tape",        "retro"),
-    ("lomography",           "Lomography",      "retro"),
-    ("duotone",              "Duotone",         "tone"),
-    ("autumn-tone",          "Autumn",          "tone"),
-    ("forest-green",         "Forest",          "tone"),
-    ("desert-sand",          "Desert",          "tone"),
-    ("cherry-blossom",       "Cherry Blossom",  "tone"),
-    ("moonlight",            "Moonlight",       "tone"),
-    ("frozen-ice",           "Frozen",          "tone"),
-    ("watercolor",           "Watercolor",      "art"),
-    ("oil-paint",            "Oil Paint",       "art"),
-    ("emboss",               "Emboss",          "art"),
-    ("cinematic-noir",       "Noir",            "art"),
-    ("cyber-glitch",         "Cyberpunk",       "digital"),
-    ("glitch-art",           "Glitch Art",      "digital"),
-    ("ascii-matrix",         "ASCII",           "digital"),
-    ("sobel-neon",           "Neon Edge",       "digital"),
-    ("vaporwave",            "Vaporwave",       "digital"),
-    ("neon-poster",          "Neon Poster",     "digital"),
-    ("swirl-distort",        "Swirl",           "distort"),
-    ("mirror-reflect",       "Mirror",          "distort"),
-    ("pixelate",             "Pixelate",        "distort"),
-    ("blueprint-cyan",       "Blueprint",       "distort"),
-    ("thermal-flir",         "Thermal",         "distort"),
-    ("inferno",              "Inferno",         "distort"),
-    ("horror-red",           "Horror",          "distort"),
+    # Retro & Print
+    ("halftone-dots",        "Halftone",       "retro"),
+    ("comic-cmyk",           "Pop-Art",        "retro"),
+    ("retro-8bit",           "8-Bit CRT",      "retro"),
+    ("risograph-duo",        "Risograph",      "retro"),
+    ("crosshatch-engraving", "Crosshatch",     "retro"),
+    ("bayer-dither",         "Dither",         "retro"),
+    ("vhs-tape",             "VHS Tape",       "retro"),
+    ("lomography",           "Lomography",     "retro"),
+    # Color & Tone
+    ("duotone",              "Duotone",        "tone"),
+    ("autumn-tone",          "Autumn",         "tone"),
+    ("forest-green",         "Forest",         "tone"),
+    ("desert-sand",          "Desert",         "tone"),
+    ("cherry-blossom",       "Cherry Blossom", "tone"),
+    ("moonlight",            "Moonlight",      "tone"),
+    ("frozen-ice",           "Frozen",         "tone"),
+    # Artistic
+    ("watercolor",           "Watercolor",     "art"),
+    ("oil-paint",            "Oil Paint",      "art"),
+    ("cinematic-noir",       "Noir",           "art"),
+    ("emboss",               "Emboss",         "art"),
+    ("pencil-sketch",        "Pencil Sketch",  "art"),
+    ("color-splash",         "Color Splash",   "art"),
+    ("stained-glass",        "Stained Glass",  "art"),
+    # Digital & Glitch
+    ("cyber-glitch",         "Cyberpunk",      "digital"),
+    ("glitch-art",           "Glitch Art",     "digital"),
+    ("ascii-matrix",         "ASCII",          "digital"),
+    ("sobel-neon",           "Neon Edge",      "digital"),
+    ("vaporwave",            "Vaporwave",      "digital"),
+    ("neon-poster",          "Neon Poster",    "digital"),
+    ("neon-glow",            "Neon Glow",      "digital"),
+    # Distort & Special
+    ("swirl-distort",        "Swirl",          "distort"),
+    ("mirror-reflect",       "Mirror",         "distort"),
+    ("pixelate",             "Pixelate",       "distort"),
+    ("blueprint-cyan",       "Blueprint",      "distort"),
+    ("thermal-flir",         "Thermal",        "distort"),
+    ("inferno",              "Inferno",        "distort"),
+    ("horror-red",           "Horror",         "distort"),
+    ("tilt-shift",           "Tilt-Shift",     "distort"),
+    ("kaleidoscope",         "Kaleidoscope",   "distort"),
+    ("color-splash",         "Color Splash",   "distort"),
 ]
+# Deduplicate while preserving order
+_seen: set[str] = set()
+EFFECTS = [(k, l, c) for k, l, c in EFFECTS if k not in _seen and not _seen.add(k)]  # type: ignore[func-returns-value]
 
 EFFECT_NAMES = {key: label for key, label, _ in EFFECTS}
 
-# ── Languages ─────────────────────────────────────────────────────────────────
 TRANSLATE_LANGUAGES: list[tuple[str, str]] = [
     ("en",    "🇬🇧 English"),
     ("bn",    "🇧🇩 বাংলা"),
@@ -865,260 +850,578 @@ TRANSLATE_LANGUAGES: list[tuple[str, str]] = [
     ("ja",    "🇯🇵 日本語"),
 ]
 
-# ── Fiver message sanitizer ────────────────────────────────────────────────────
+
+# ── Fiver Sanitizer v2 ────────────────────────────────────────────────────────
+
+# AI-generated text signs to strip
+_AI_SIGNS = re.compile(
+    r"[\u2014\u2013\u2012\u2015]"   # em dash, en dash, figure dash, horizontal bar
+    r"|[\u2018\u2019\u201A\u201B]"  # curved single quotes
+    r"|[\u201C\u201D\u201E\u201F]"  # curved double quotes
+    r"|[\u2026]"                     # ellipsis …
+    r"|(?<!\w)_(?!\w)"              # lone underscore (not inside words)
+    r"|(?<=\s)_|_(?=\s)",           # underscore with surrounding spaces
+    re.UNICODE,
+)
+
 FIVER_WORD_MAP: dict[str, str] = {
-    "email": "ema-il", "gmail": "gma-il", "whatsapp": "wha-tsapp", "skype": "sky-pe",
-    "telegram": "tele-gram", "discord": "dis-cord", "phone": "pho-ne", "mobile": "mobi-le",
-    "number": "num-ber", "contact": "conta-ct", "zoom": "zo-om", "slack": "sla-ck",
+    "email": "ema-il", "gmail": "gma-il", "whatsapp": "wha-tsapp",
+    "skype": "sky-pe", "telegram": "tele-gram", "discord": "dis-cord",
+    "phone": "pho-ne", "mobile": "mobi-le", "number": "num-ber",
+    "contact": "conta-ct", "zoom": "zo-om", "slack": "sla-ck",
     "linkedin": "link-edin", "facebook": "face-book", "instagram": "inst-agram",
-    "twitter": "twit-ter", "youtube": "yout-ube", "tiktok": "tik-tok", "snapchat": "snap-chat",
-    "pinterest": "pint-erest", "reddit": "red-dit", "tumblr": "tum-blr", "meeting": "mee-ting",
-    "call": "ca-ll", "video call": "vid-eo c-all", "google meet": "g-meet",
-    "anydesk": "any-desk", "teamviewer": "team-viewer",
-    "payment": "pa-yment", "paypal": "p-ay-pal", "pay": "p-ay", "payoneer": "p-ay-oneer",
-    "crypto": "cry-pto", "bitcoin": "bit-coin", "wire": "wi-re", "bank": "ba-nk",
-    "transfer": "trans-fer", "cash": "ca-sh", "invoice": "invo-ice", "outside": "outsi-de",
-    "direct": "dire-ct", "stripe": "str-ipe", "fee": "f-ee", "price": "pri-ce",
-    "cost": "co-st", "billing": "bill-ing",
+    "twitter": "twit-ter", "youtube": "yout-ube", "tiktok": "tik-tok",
+    "snapchat": "snap-chat", "pinterest": "pint-erest", "reddit": "red-dit",
+    "meeting": "mee-ting", "call": "ca-ll", "anydesk": "any-desk",
+    "teamviewer": "team-viewer", "payment": "pa-yment", "paypal": "p-ay-pal",
+    "pay": "p-ay", "payoneer": "p-ay-oneer", "crypto": "cry-pto",
+    "bitcoin": "bit-coin", "wire": "wi-re", "bank": "ba-nk",
+    "transfer": "trans-fer", "cash": "ca-sh", "invoice": "invo-ice",
+    "outside": "outsi-de", "direct": "dire-ct", "stripe": "str-ipe",
+    "fee": "f-ee", "price": "pri-ce", "cost": "co-st", "billing": "bill-ing",
     "homework": "home-work", "assignment": "assign-ment", "essay": "ess-ay",
-    "thesis": "the-sis", "exam": "ex-am", "test": "te-st", "degree": "deg-ree",
-    "coursework": "course-work", "academic": "acad-emic",
+    "thesis": "the-sis", "exam": "ex-am", "test": "te-st",
     "review": "revi-ew", "feedback": "feed-back", "rating": "rat-ing",
-    "trustpilot": "trust-pilot", "google review": "google-rev", "followers": "follo-wers",
-    "subscribers": "subs-cribers", "five star": "5-st-ar", "positive": "posi-tive",
-    "recommendation": "recomm-end",
-    "password": "pass-word", "login": "lo-gin", "credential": "creden-tial",
-    "address": "addr-ess", "location": "loca-tion", "private": "pri-vate",
-    "access": "acc-ess", "verification": "veri-fication", "guaranteed": "guaran-teed",
-    "money": "mon-ey", "income": "inco-me", "profit": "pro-fit", "fiverr": "fiv-err",
-    "order": "ord-er", "cancel": "can-cel", "refund": "refu-nd",
-    "portfolio": "port-folio", "website": "web-site",
+    "password": "pass-word", "login": "lo-gin", "address": "addr-ess",
+    "guaranteed": "guaran-teed", "money": "mon-ey", "income": "inco-me",
+    "profit": "pro-fit", "fiverr": "fiv-err", "order": "ord-er",
+    "cancel": "can-cel", "refund": "refu-nd",
 }
 
 
 def _preserve_case(original: str, replacement: str) -> str:
-    if original.islower():
-        return replacement.lower()
-    if original.isupper():
-        return replacement.upper()
-    if original[:1].isupper():
-        return replacement[:1].upper() + replacement[1:].lower()
+    if original.islower():              return replacement.lower()
+    if original.isupper():              return replacement.upper()
+    if original[:1].isupper():         return replacement[:1].upper() + replacement[1:].lower()
     return replacement
 
 
 def _build_patterns(word_map: dict[str, str]) -> list[tuple[str, re.Pattern]]:
-    words_sorted = sorted(word_map.keys(), key=len, reverse=True)
-    return [(w, re.compile(rf"\b{re.escape(w)}\b", re.IGNORECASE)) for w in words_sorted]
+    return [
+        (w, re.compile(rf"\b{re.escape(w)}\b", re.IGNORECASE))
+        for w in sorted(word_map, key=len, reverse=True)
+    ]
 
 
 _FIVER_WORD_PATTERNS = _build_patterns(FIVER_WORD_MAP)
 
 
-def sanitize_fiver_text(text: str, custom_words: dict[str, str] | None = None) -> str:
-    if custom_words:
-        merged = {**FIVER_WORD_MAP, **custom_words}
-        patterns = _build_patterns(merged)
-    else:
-        merged = FIVER_WORD_MAP
-        patterns = _FIVER_WORD_PATTERNS
+def sanitize_fiver_text(
+    text: str,
+    custom_words: dict[str, str] | None = None,
+) -> tuple[str, list[str], int]:
+    """
+    Returns (sanitized_text, changes_list, quality_score_0_to_100).
+    changes_list entries look like: 'email → ema-il'  or  'em dash removed'.
+    """
+    changes: list[str] = []
 
-    result = text
+    # 1. Strip AI signs
+    ai_stripped = _AI_SIGNS.sub("", text)
+    stripped_count = len(text) - len(ai_stripped)
+    if stripped_count:
+        changes.append(f"AI signs removed ({stripped_count} character(s): — … "" '' _)")
+    result = ai_stripped
+
+    # 2. Word replacements
+    merged   = {**FIVER_WORD_MAP, **(custom_words or {})}
+    patterns = _build_patterns(merged) if custom_words else _FIVER_WORD_PATTERNS
+
     for word, pattern in patterns:
         replacement = merged[word]
-        result = pattern.sub(lambda m: _preserve_case(m.group(0), replacement), result)
+        new_result, n = pattern.subn(
+            lambda m: _preserve_case(m.group(0), replacement), result
+        )
+        if n:
+            changes.append(f"`{word}` → `{replacement}` (×{n})")
+        result = new_result
+
+    # 3. Quality score: 100 minus 10 per flagged item, floor 0
+    score = max(0, 100 - len(changes) * 10)
+    return result, changes, score
+
+
+def format_sanitizer_report(
+    original: str,
+    sanitized: str,
+    changes: list[str],
+    score: int,
+    profile: str = "",
+    client_name: str = "",
+    order_id: str = "",
+) -> str:
+    quality_icon = "✅" if score >= 80 else ("⚠️" if score >= 50 else "❌")
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        "🛡 *FIVER SANITIZER REPORT*",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if profile or client_name or order_id:
+        lines += [
+            f"👤 *Profile:*      {profile or '—'}",
+            f"🧑 *Client Name:*  {client_name or '—'}",
+            f"🔖 *Order ID:*     {order_id or '—'}",
+            "──────────────────────────",
+        ]
+    lines += [
+        f"📊 *Quality Check:* {quality_icon} {score}/100",
+        "──────────────────────────",
+    ]
+    if changes:
+        lines.append("🔄 *What was changed:*")
+        for c in changes[:15]:
+            lines.append(f"  • {c}")
+        if len(changes) > 15:
+            lines.append(f"  … and {len(changes) - 15} more")
+    else:
+        lines.append("✅ No flagged words found — message is clean!")
+    lines += [
+        "──────────────────────────",
+        "📝 *Sanitized Message:*",
+        "",
+        sanitized,
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    return "\n".join(lines)
+
+
+# ── Color Tools (no external API) ─────────────────────────────────────────────
+
+def hex_to_rgb(hex_str: str) -> tuple[int, int, int] | None:
+    hex_str = hex_str.strip().lstrip("#")
+    if len(hex_str) == 3:
+        hex_str = "".join(c * 2 for c in hex_str)
+    if len(hex_str) != 6:
+        return None
+    try:
+        r = int(hex_str[0:2], 16)
+        g = int(hex_str[2:4], 16)
+        b = int(hex_str[4:6], 16)
+        return r, g, b
+    except ValueError:
+        return None
+
+
+def rgb_to_hex(r: int, g: int, b: int) -> str:
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def rgb_to_hsl(r: int, g: int, b: int) -> tuple[float, float, float]:
+    r_, g_, b_ = r / 255, g / 255, b / 255
+    cmax, cmin = max(r_, g_, b_), min(r_, g_, b_)
+    delta = cmax - cmin
+    l = (cmax + cmin) / 2
+    s = 0.0 if delta == 0 else delta / (1 - abs(2 * l - 1))
+    if delta == 0:
+        h = 0.0
+    elif cmax == r_:
+        h = 60 * (((g_ - b_) / delta) % 6)
+    elif cmax == g_:
+        h = 60 * ((b_ - r_) / delta + 2)
+    else:
+        h = 60 * ((r_ - g_) / delta + 4)
+    return round(h, 1), round(s * 100, 1), round(l * 100, 1)
+
+
+def rgb_to_cmyk(r: int, g: int, b: int) -> tuple[int, int, int, int]:
+    if r == g == b == 0:
+        return 0, 0, 0, 100
+    r_, g_, b_ = r / 255, g / 255, b / 255
+    k = 1 - max(r_, g_, b_)
+    c = (1 - r_ - k) / (1 - k)
+    m = (1 - g_ - k) / (1 - k)
+    y = (1 - b_ - k) / (1 - k)
+    return round(c * 100), round(m * 100), round(y * 100), round(k * 100)
+
+
+def wcag_contrast(r1, g1, b1, r2, g2, b2) -> float:
+    def lum(r, g, b):
+        vals = [v / 255 for v in (r, g, b)]
+        vals = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in vals]
+        return 0.2126 * vals[0] + 0.7152 * vals[1] + 0.0722 * vals[2]
+    l1, l2 = lum(r1, g1, b1), lum(r2, g2, b2)
+    if l1 < l2:
+        l1, l2 = l2, l1
+    return round((l1 + 0.05) / (l2 + 0.05), 2)
+
+
+def tint_shade(r: int, g: int, b: int) -> str:
+    lines = []
+    for pct in (90, 75, 50, 25, 10):
+        tr = int(r + (255 - r) * pct / 100)
+        tg = int(g + (255 - g) * pct / 100)
+        tb = int(b + (255 - b) * pct / 100)
+        lines.append(f"  Tint  {pct:3d}%: {rgb_to_hex(tr, tg, tb)}")
+    for pct in (10, 25, 50, 75, 90):
+        sr = int(r * (100 - pct) / 100)
+        sg = int(g * (100 - pct) / 100)
+        sb = int(b * (100 - pct) / 100)
+        lines.append(f"  Shade {pct:3d}%: {rgb_to_hex(sr, sg, sb)}")
+    return "\n".join(lines)
+
+
+def css_gradient(r: int, g: int, b: int) -> str:
+    r2 = min(255, r + 60)
+    g2 = min(255, g + 60)
+    b2 = min(255, b + 60)
+    c1, c2 = rgb_to_hex(r, g, b), rgb_to_hex(r2, g2, b2)
+    return (
+        f"/* Linear */\n"
+        f"background: linear-gradient(135deg, {c1}, {c2});\n\n"
+        f"/* Radial */\n"
+        f"background: radial-gradient(circle, {c1}, {c2});"
+    )
+
+
+def css_shadow(r: int, g: int, b: int) -> str:
+    return (
+        f"/* Soft shadow */\n"
+        f"box-shadow: 0 4px 16px rgba({r}, {g}, {b}, 0.25);\n\n"
+        f"/* Hard shadow */\n"
+        f"box-shadow: 4px 4px 0px rgba({r}, {g}, {b}, 0.8);\n\n"
+        f"/* Inner glow */\n"
+        f"box-shadow: inset 0 0 12px rgba({r}, {g}, {b}, 0.4);"
+    )
+
+
+# ── Dev Tools (no external API) ───────────────────────────────────────────────
+
+def format_json(text: str) -> str:
+    try:
+        parsed = json.loads(text)
+        return json.dumps(parsed, indent=2, ensure_ascii=False)
+    except json.JSONDecodeError as exc:
+        return f"❌ Invalid JSON: {exc}"
+
+
+def hash_text(text: str) -> str:
+    encoded = text.encode("utf-8")
+    return (
+        f"MD5:    `{hashlib.md5(encoded).hexdigest()}`\n"
+        f"SHA1:   `{hashlib.sha1(encoded).hexdigest()}`\n"
+        f"SHA256: `{hashlib.sha256(encoded).hexdigest()}`\n"
+        f"SHA512: `{hashlib.sha512(encoded).hexdigest()[:64]}…`"
+    )
+
+
+def generate_uuid() -> str:
+    u = uuid.uuid4()
+    return (
+        f"UUID v4: `{u}`\n"
+        f"No dashes: `{u.hex}`\n"
+        f"URN: `urn:uuid:{u}`"
+    )
+
+
+def convert_timestamp(value: str) -> str:
+    value = value.strip()
+    try:
+        ts = float(value)
+        dt = datetime.datetime.utcfromtimestamp(ts)
+        return (
+            f"Unix: `{int(ts)}`\n"
+            f"UTC:  `{dt.strftime('%Y-%m-%d %H:%M:%S')} UTC`\n"
+            f"ISO:  `{dt.isoformat()}Z`"
+        )
+    except ValueError:
+        pass
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return (
+            f"Unix: `{int(dt.timestamp())}`\n"
+            f"UTC:  `{dt.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC`\n"
+            f"ISO:  `{dt.isoformat()}`"
+        )
+    except ValueError:
+        return "❌ Provide a Unix timestamp (e.g. `1700000000`) or ISO date (`2024-01-15T12:00:00`)."
+
+
+_LOREM_WORDS = (
+    "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor "
+    "incididunt ut labore et dolore magna aliqua enim ad minim veniam quis nostrud "
+    "exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute "
+    "irure dolor in reprehenderit voluptate velit esse cillum dolore eu fugiat nulla "
+    "pariatur excepteur sint occaecat cupidatat non proident sunt in culpa qui officia "
+    "deserunt mollit anim id est laborum".split()
+)
+
+
+def lorem_ipsum(n_words: int = 50) -> str:
+    import random
+    words = [random.choice(_LOREM_WORDS) for _ in range(n_words)]  # noqa: S311
+    words[0] = words[0].capitalize()
+    return " ".join(words) + "."
+
+
+def convert_case(text: str, mode: str) -> str:
+    if mode == "camel":
+        words = re.split(r"[\s_\-]+", text)
+        return words[0].lower() + "".join(w.capitalize() for w in words[1:])
+    if mode == "pascal":
+        return "".join(w.capitalize() for w in re.split(r"[\s_\-]+", text))
+    if mode == "snake":
+        s = re.sub(r"(?<!^)(?=[A-Z])", "_", text).lower()
+        return re.sub(r"[\s\-]+", "_", s)
+    if mode == "kebab":
+        s = re.sub(r"(?<!^)(?=[A-Z])", "-", text).lower()
+        return re.sub(r"[\s_]+", "-", s)
+    if mode == "upper":
+        return text.upper()
+    if mode == "lower":
+        return text.lower()
+    if mode == "title":
+        return text.title()
+    return text
+
+
+def px_to_rem(px: float, base: float = 16.0) -> str:
+    return (
+        f"`{px}px` = `{px / base:.4f}rem` (base {base}px)\n"
+        f"Common bases:\n"
+        f"  16px base → `{px/16:.4f}rem`\n"
+        f"  14px base → `{px/14:.4f}rem`\n"
+        f"  18px base → `{px/18:.4f}rem`"
+    )
+
+
+def url_encode(text: str) -> str:
+    return quote(text, safe="")
+
+
+def url_decode(text: str) -> str:
+    return unquote(text)
+
+
+def base64_encode(text: str) -> str:
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def base64_decode(text: str) -> str:
+    try:
+        return base64.b64decode(text.encode("ascii")).decode("utf-8")
+    except Exception:
+        return "❌ Invalid base64 string."
+
+
+def word_count(text: str) -> str:
+    words = text.split()
+    chars = len(text)
+    chars_no_space = len(text.replace(" ", ""))
+    lines = text.count("\n") + 1
+    read_time = max(1, round(len(words) / 200))
+    return (
+        f"Words:          `{len(words)}`\n"
+        f"Characters:     `{chars}`\n"
+        f"Chars (no sp):  `{chars_no_space}`\n"
+        f"Lines:          `{lines}`\n"
+        f"Reading time:   ~{read_time} min"
+    )
+
+
+def diff_texts(text_a: str, text_b: str) -> str:
+    import difflib
+    diff = list(difflib.unified_diff(
+        text_a.splitlines(keepends=True),
+        text_b.splitlines(keepends=True),
+        fromfile="Text A", tofile="Text B", lineterm="",
+    ))
+    if not diff:
+        return "✅ Texts are identical."
+    result = "".join(diff[:80])
+    if len(diff) > 80:
+        result += f"\n… ({len(diff) - 80} more lines)"
     return result
 
 
-# ── Strings ───────────────────────────────────────────────────────────────────
+def regex_test(pattern: str, text: str) -> str:
+    try:
+        rx = re.compile(pattern)
+        matches = list(rx.finditer(text))
+        if not matches:
+            return f"No matches for `{pattern}`."
+        lines = [f"Found {len(matches)} match(es):"]
+        for i, m in enumerate(matches[:10], 1):
+            lines.append(f"  {i}. `{m.group()}` at [{m.start()}:{m.end()}]")
+        return "\n".join(lines)
+    except re.error as exc:
+        return f"❌ Regex error: {exc}"
+
+
+# ── Strings & Menu ────────────────────────────────────────────────────────────
+
 WELCOME_MESSAGE = (
     "```\n"
     "┌───────────────────────────────┐\n"
     "│    B A N G A L I · I C O N    │\n"
     "└───────────────────────────────┘\n"
     "```\n"
-    "⚡ *@BangaliIconbot* — all modules loaded\n\n"
-    "🔗 Send a *Lummi.ai* or *Hugeicons* link\n"
-    "     → instant asset extraction\n"
-    "🖼 Send a *photo*\n"
-    "     → ✦ 32 real-time visual effects\n"
-    "😄 Send a *sticker or GIF*\n"
-    "     → extract frames or convert to PNG\n"
-    "🛡 Use `/FiverMessage <text>`\n"
-    "     → sanitize flagged words instantly\n"
-    "🔑 Use `/genpass` or `/qr <text>`\n"
-    "     → passwords & QR codes on demand\n"
-    "🧰 Or tap a tool below to get started\n\n"
-    "_Type_ `/menu` _anytime ·_ `/cancel` _to stop a task_\n\n"
-    "✦ Design and Developed By *@YA_Rabbu*"
+    "⚡ *@BangaliIconBot* — all modules loaded\n\n"
+    "🔗 Send a *Lummi.ai* or *Hugeicons* link → instant asset\n"
+    "🖼 Send a *photo* → 40 real-time visual effects\n"
+    "😄 Send a *sticker or GIF* → extract or convert\n"
+    "🛡 `/FiverMessage` → sanitize with AI-sign detection\n"
+    "🎨 `/colortools` → colour conversion & CSS helpers\n"
+    "🔧 `/devtools` → JSON, UUID, hash & more\n\n"
+    "_Tap_ `/menu` _anytime · /cancel to stop a task_\n\n"
+    "✦ Designed & developed by *@YA\\_Rabbu*"
 )
 
 MENU_INTRO = "🧰 *Select a tool*"
 
+
 # ── Keyboard builders ─────────────────────────────────────────────────────────
 
 def build_main_menu_keyboard() -> InlineKeyboardMarkup:
-    rows = [
+    return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🎨 Image Effects",   callback_data="menu|effects"),
-            InlineKeyboardButton("🧹 Remove BG",       callback_data="menu|bgremove"),
+            InlineKeyboardButton("🎨 Image Effects",    callback_data="menu|effects"),
+            InlineKeyboardButton("🧹 Remove BG",        callback_data="menu|bgremove"),
         ],
         [
-            InlineKeyboardButton("😄 Sticker → PNG",   callback_data="menu|sticker2png"),
-            InlineKeyboardButton("🎞 GIF → Frames",    callback_data="menu|gif2frames"),
+            InlineKeyboardButton("😄 Sticker → PNG",    callback_data="menu|sticker2png"),
+            InlineKeyboardButton("🎞 GIF → Frames",     callback_data="menu|gif2frames"),
         ],
         [
             InlineKeyboardButton("🛡 Fiver Sanitizer",  callback_data="menu|fiversanitize"),
-            InlineKeyboardButton("🌐 Translate",       callback_data="menu|translate"),
+            InlineKeyboardButton("🌐 Translate",        callback_data="menu|translate"),
         ],
         [
-            InlineKeyboardButton("💧 Watermark",       callback_data="menu|watermark"),
-            InlineKeyboardButton("📉 Compress",        callback_data="menu|compress"),
+            InlineKeyboardButton("💧 Watermark",        callback_data="menu|watermark"),
+            InlineKeyboardButton("📉 Compress",         callback_data="menu|compress"),
         ],
         [
-            InlineKeyboardButton("🔳 QR Generate",     callback_data="menu|qrgen"),
-            InlineKeyboardButton("🔍 QR Scan",         callback_data="menu|qrscan"),
+            InlineKeyboardButton("🔳 QR Generate",      callback_data="menu|qrgen"),
+            InlineKeyboardButton("🔍 QR Scan",          callback_data="menu|qrscan"),
         ],
         [
-            InlineKeyboardButton("🔑 Password Gen",    callback_data="menu|genpass"),
-            InlineKeyboardButton("📚 Words List",      callback_data="menu|mywords"),
+            InlineKeyboardButton("🔑 Password Gen",     callback_data="menu|genpass"),
+            InlineKeyboardButton("📚 My Words",         callback_data="menu|mywords"),
         ],
         [
-            InlineKeyboardButton("🖼 Image Tools",     callback_data="cat|image"),
-            InlineKeyboardButton("📄 PDF Tools",       callback_data="cat|pdf"),
+            InlineKeyboardButton("🖼 Image Tools",      callback_data="cat|image"),
+            InlineKeyboardButton("📄 PDF Tools",        callback_data="cat|pdf"),
         ],
         [
-            InlineKeyboardButton("📝 Word / Doc",      callback_data="cat|word"),
-            InlineKeyboardButton("📊 Spreadsheet",     callback_data="cat|sheet"),
+            InlineKeyboardButton("📝 Documents",        callback_data="cat|word"),
+            InlineKeyboardButton("📊 Spreadsheet",      callback_data="cat|sheet"),
         ],
         [
-            InlineKeyboardButton("📽 Presentation",    callback_data="cat|ppt"),
-            InlineKeyboardButton("✍️ Text & Markup",   callback_data="cat|text"),
+            InlineKeyboardButton("📽 Presentation",     callback_data="cat|ppt"),
+            InlineKeyboardButton("✍️ Text & Markup",    callback_data="cat|text"),
         ],
         [
-            InlineKeyboardButton("📚 More →",          callback_data="cat|more"),
+            InlineKeyboardButton("🎨 Colour Tools",     callback_data="cat|color"),
+            InlineKeyboardButton("🔧 Dev Tools",        callback_data="cat|dev"),
         ],
-    ]
-    return InlineKeyboardMarkup(rows)
+        [
+            InlineKeyboardButton("📚 More →",           callback_data="cat|more"),
+        ],
+    ])
 
 
 def build_category_keyboard(cat: str) -> InlineKeyboardMarkup:
     back = [InlineKeyboardButton("◀ Main Menu", callback_data="cat|back")]
-
-    menus: dict[str, list[list[InlineKeyboardButton]]] = {
+    menus: dict[str, list] = {
         "image": [
-            [
-                InlineKeyboardButton("🖼 Image → PDF",   callback_data="menu|img2pdf"),
-                InlineKeyboardButton("📄 PDF → Images",  callback_data="menu|pdf2img"),
-            ],
-            [
-                InlineKeyboardButton("🔁 JPEG → PNG",    callback_data="menu|jpg2png"),
-                InlineKeyboardButton("🔁 PNG → JPEG",    callback_data="menu|png2jpg"),
-            ],
-            [
-                InlineKeyboardButton("💧 Watermark",     callback_data="menu|watermark"),
-                InlineKeyboardButton("📉 Compress",      callback_data="menu|compress"),
-            ],
+            [InlineKeyboardButton("🖼→📄 Image → PDF",   callback_data="menu|img2pdf"),
+             InlineKeyboardButton("📄→🖼 PDF → Images",  callback_data="menu|pdf2img")],
+            [InlineKeyboardButton("🔁 JPEG → PNG",       callback_data="menu|jpg2png"),
+             InlineKeyboardButton("🔁 PNG → JPEG",       callback_data="menu|png2jpg")],
+            [InlineKeyboardButton("💧 Watermark",        callback_data="menu|watermark"),
+             InlineKeyboardButton("📉 Compress",         callback_data="menu|compress")],
             back,
         ],
         "pdf": [
-            [
-                InlineKeyboardButton("📄→📝 PDF → DOCX",  callback_data="menu|pdf2docx"),
-                InlineKeyboardButton("📄→📃 PDF → TXT",   callback_data="menu|pdf2txt"),
-            ],
-            [
-                InlineKeyboardButton("📄→🖼 PDF → Images", callback_data="menu|pdf2img"),
-                InlineKeyboardButton("🖼→📄 Image → PDF",  callback_data="menu|img2pdf"),
-            ],
+            [InlineKeyboardButton("📄→📝 PDF → DOCX",   callback_data="menu|pdf2docx"),
+             InlineKeyboardButton("📄→📃 PDF → TXT",    callback_data="menu|pdf2txt")],
+            [InlineKeyboardButton("📄→🖼 PDF → Images", callback_data="menu|pdf2img"),
+             InlineKeyboardButton("🖼→📄 Image → PDF",  callback_data="menu|img2pdf")],
             back,
         ],
         "word": [
-            [
-                InlineKeyboardButton("📝→📄 DOCX → PDF",  callback_data="menu|docx2pdf"),
-                InlineKeyboardButton("📝→📃 DOCX → TXT",  callback_data="menu|docx2txt"),
-            ],
-            [
-                InlineKeyboardButton("📝→🌐 DOCX → HTML", callback_data="menu|docx2html"),
-                InlineKeyboardButton("📄→📝 DOC → DOCX",  callback_data="menu|doc2docx"),
-            ],
-            [
-                InlineKeyboardButton("📄→📝 ODT → DOCX",  callback_data="menu|odt2docx"),
-                InlineKeyboardButton("📄→📄 ODT → PDF",   callback_data="menu|odt2pdf"),
-            ],
+            [InlineKeyboardButton("📝→📄 DOCX → PDF",   callback_data="menu|docx2pdf"),
+             InlineKeyboardButton("📝→📃 DOCX → TXT",   callback_data="menu|docx2txt")],
+            [InlineKeyboardButton("📝→🌐 DOCX → HTML",  callback_data="menu|docx2html"),
+             InlineKeyboardButton("📄→📝 DOC → DOCX",   callback_data="menu|doc2docx")],
+            [InlineKeyboardButton("📄→📝 ODT → DOCX",   callback_data="menu|odt2docx"),
+             InlineKeyboardButton("📄→📄 ODT → PDF",    callback_data="menu|odt2pdf")],
             back,
         ],
         "sheet": [
-            [
-                InlineKeyboardButton("📊→📄 XLSX → PDF",  callback_data="menu|xlsx2pdf"),
-                InlineKeyboardButton("📊→📃 XLSX → CSV",  callback_data="menu|xlsx2csv"),
-            ],
-            [
-                InlineKeyboardButton("📃→📊 CSV → XLSX",  callback_data="menu|csv2xlsx"),
-                InlineKeyboardButton("📊→📊 XLS → XLSX",  callback_data="menu|xls2xlsx"),
-            ],
+            [InlineKeyboardButton("📊→📄 XLSX → PDF",   callback_data="menu|xlsx2pdf"),
+             InlineKeyboardButton("📊→📃 XLSX → CSV",   callback_data="menu|xlsx2csv")],
+            [InlineKeyboardButton("📃→📊 CSV → XLSX",   callback_data="menu|csv2xlsx"),
+             InlineKeyboardButton("📊→📊 XLS → XLSX",   callback_data="menu|xls2xlsx")],
             back,
         ],
         "ppt": [
-            [
-                InlineKeyboardButton("📽→📄 PPTX → PDF",  callback_data="menu|pptx2pdf"),
-                InlineKeyboardButton("📽→🖼 PPTX → Imgs", callback_data="menu|pptx2images"),
-            ],
-            [
-                InlineKeyboardButton("📽→📽 PPT → PPTX",  callback_data="menu|ppt2pptx"),
-            ],
+            [InlineKeyboardButton("📽→📄 PPTX → PDF",   callback_data="menu|pptx2pdf"),
+             InlineKeyboardButton("📽→🖼 PPTX → Images",callback_data="menu|pptx2images")],
+            [InlineKeyboardButton("📽→📽 PPT → PPTX",   callback_data="menu|ppt2pptx")],
             back,
         ],
         "text": [
-            [
-                InlineKeyboardButton("📃→📄 TXT → PDF",   callback_data="menu|txt2pdf"),
-                InlineKeyboardButton("🌐→📄 HTML → PDF",  callback_data="menu|html2pdf"),
-            ],
-            [
-                InlineKeyboardButton("📝→📄 MD → PDF",    callback_data="menu|md2pdf"),
-                InlineKeyboardButton("📝→📃 MD → TXT",    callback_data="menu|md2txt"),
-            ],
-            [
-                InlineKeyboardButton("📝→📝 MD → DOCX",   callback_data="menu|md2docx"),
-                InlineKeyboardButton("📄→📃 RTF → TXT",   callback_data="menu|rtf2txt"),
-            ],
-            [
-                InlineKeyboardButton("📄→📄 RTF → PDF",   callback_data="menu|rtf2pdf"),
-            ],
+            [InlineKeyboardButton("📃→📄 TXT → PDF",    callback_data="menu|txt2pdf"),
+             InlineKeyboardButton("🌐→📄 HTML → PDF",   callback_data="menu|html2pdf")],
+            [InlineKeyboardButton("📝→📄 MD → PDF",     callback_data="menu|md2pdf"),
+             InlineKeyboardButton("📝→📃 MD → TXT",     callback_data="menu|md2txt")],
+            [InlineKeyboardButton("📝→📝 MD → DOCX",    callback_data="menu|md2docx"),
+             InlineKeyboardButton("📄→📃 RTF → TXT",    callback_data="menu|rtf2txt")],
+            [InlineKeyboardButton("📄→📄 RTF → PDF",    callback_data="menu|rtf2pdf")],
+            back,
+        ],
+        "color": [
+            [InlineKeyboardButton("🔄 Color Convert",   callback_data="color|convert"),
+             InlineKeyboardButton("✅ Contrast Check",  callback_data="color|contrast")],
+            [InlineKeyboardButton("🌈 Gradient CSS",    callback_data="color|gradient"),
+             InlineKeyboardButton("💧 Shadow CSS",      callback_data="color|shadow")],
+            [InlineKeyboardButton("🖌 Tint & Shade",    callback_data="color|tintshade")],
+            back,
+        ],
+        "dev": [
+            [InlineKeyboardButton("📋 JSON Format",     callback_data="dev|json"),
+             InlineKeyboardButton("🔑 Hash Gen",        callback_data="dev|hash")],
+            [InlineKeyboardButton("🆔 UUID Gen",        callback_data="dev|uuid"),
+             InlineKeyboardButton("⏰ Timestamp",       callback_data="dev|timestamp")],
+            [InlineKeyboardButton("📝 Lorem Ipsum",     callback_data="dev|lorem"),
+             InlineKeyboardButton("🔤 Case Convert",    callback_data="dev|case")],
+            [InlineKeyboardButton("📐 px → rem",        callback_data="dev|pxrem"),
+             InlineKeyboardButton("🔗 URL Encode",      callback_data="dev|urlencode")],
+            [InlineKeyboardButton("🔗 URL Decode",      callback_data="dev|urldecode"),
+             InlineKeyboardButton("💻 Base64 Encode",   callback_data="dev|b64enc")],
+            [InlineKeyboardButton("💻 Base64 Decode",   callback_data="dev|b64dec"),
+             InlineKeyboardButton("📊 Word Count",      callback_data="dev|wordcount")],
+            [InlineKeyboardButton("🔀 Diff Checker",    callback_data="dev|diff"),
+             InlineKeyboardButton("🔍 Regex Test",      callback_data="dev|regex")],
             back,
         ],
         "more": [
-            [
-                InlineKeyboardButton("📚→📄 EPUB → PDF",  callback_data="menu|epub2pdf"),
-            ],
+            [InlineKeyboardButton("📚→📄 EPUB → PDF",   callback_data="menu|epub2pdf")],
             back,
         ],
     }
-    rows = menus.get(cat, [back])
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(menus.get(cat, [back]))
 
 
 def build_effect_categories_keyboard(token: str) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
+    rows, row = [], []
     for cat_key in EFFECT_CATEGORY_ORDER:
         row.append(InlineKeyboardButton(EFFECT_CATEGORIES[cat_key], callback_data=f"fxcat|{cat_key}|{token}"))
         if len(row) == 2:
-            rows.append(row)
-            row = []
+            rows.append(row); row = []
     if row:
         rows.append(row)
     return InlineKeyboardMarkup(rows)
 
 
 def build_effect_keyboard(category: str, token: str) -> InlineKeyboardMarkup:
-    buttons: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
+    buttons, row = [], []
     for key, label, cat in EFFECTS:
         if cat != category:
             continue
         row.append(InlineKeyboardButton(label, callback_data=f"fx|{key}|{token}"))
         if len(row) == 2:
-            buttons.append(row)
-            row = []
+            buttons.append(row); row = []
     if row:
         buttons.append(row)
     buttons.append([InlineKeyboardButton("◀ Categories", callback_data=f"fxback|{token}")])
@@ -1126,13 +1429,11 @@ def build_effect_keyboard(category: str, token: str) -> InlineKeyboardMarkup:
 
 
 def build_translate_lang_keyboard() -> InlineKeyboardMarkup:
-    buttons: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
+    buttons, row = [], []
     for code, label in TRANSLATE_LANGUAGES:
         row.append(InlineKeyboardButton(label, callback_data=f"trlang|{code}"))
         if len(row) == 2:
-            buttons.append(row)
-            row = []
+            buttons.append(row); row = []
     if row:
         buttons.append(row)
     return InlineKeyboardMarkup(buttons)
@@ -1140,50 +1441,71 @@ def build_translate_lang_keyboard() -> InlineKeyboardMarkup:
 
 def build_watermark_position_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("↖ Top-Left", callback_data="wmpos|top-left"),
-            InlineKeyboardButton("↗ Top-Right", callback_data="wmpos|top-right"),
-        ],
-        [
-            InlineKeyboardButton("↙ Bottom-Left", callback_data="wmpos|bottom-left"),
-            InlineKeyboardButton("↘ Bottom-Right", callback_data="wmpos|bottom-right"),
-        ],
-        [InlineKeyboardButton("⏺ Center", callback_data="wmpos|center")],
+        [InlineKeyboardButton("↖ Top-Left",     callback_data="wmpos|top-left"),
+         InlineKeyboardButton("↗ Top-Right",    callback_data="wmpos|top-right")],
+        [InlineKeyboardButton("↙ Bottom-Left",  callback_data="wmpos|bottom-left"),
+         InlineKeyboardButton("↘ Bottom-Right", callback_data="wmpos|bottom-right")],
+        [InlineKeyboardButton("⏺ Centre",       callback_data="wmpos|center")],
     ])
 
 
 def build_genpass_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("8", callback_data="genpass|8"),
-            InlineKeyboardButton("12", callback_data="genpass|12"),
-            InlineKeyboardButton("16", callback_data="genpass|16"),
-            InlineKeyboardButton("20", callback_data="genpass|20"),
-        ],
+        [InlineKeyboardButton("8",  callback_data="genpass|8"),
+         InlineKeyboardButton("12", callback_data="genpass|12"),
+         InlineKeyboardButton("16", callback_data="genpass|16"),
+         InlineKeyboardButton("20", callback_data="genpass|20")],
         [InlineKeyboardButton("🔢 4-digit PIN", callback_data="genpin|4")],
         [InlineKeyboardButton("🔢 6-digit PIN", callback_data="genpin|6")],
     ])
 
 
-def build_limit_request_keyboard(chat_id: int, requested: int) -> InlineKeyboardMarkup:
+def build_fiver_report_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Approve", callback_data=f"limitreq|approve|{chat_id}|{requested}"),
-            InlineKeyboardButton("❌ Deny", callback_data=f"limitreq|deny|{chat_id}"),
-        ],
+        [InlineKeyboardButton("📋 Add Report Card", callback_data="fiver|reportcard")],
     ])
 
 
-# ── Utility ───────────────────────────────────────────────────────────────────
+def build_limit_request_keyboard(chat_id: int, requested: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"limitreq|approve|{chat_id}|{requested}"),
+        InlineKeyboardButton("❌ Deny",    callback_data=f"limitreq|deny|{chat_id}"),
+    ]])
+
+
+def build_color_input_keyboard(tool: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀ Colour Tools", callback_data="cat|color")],
+    ])
+
+
+def build_dev_input_keyboard(tool: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀ Dev Tools", callback_data="cat|dev")],
+    ])
+
+
+def build_case_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("camelCase",  callback_data="case|camel"),
+         InlineKeyboardButton("PascalCase", callback_data="case|pascal")],
+        [InlineKeyboardButton("snake_case", callback_data="case|snake"),
+         InlineKeyboardButton("kebab-case", callback_data="case|kebab")],
+        [InlineKeyboardButton("UPPERCASE",  callback_data="case|upper"),
+         InlineKeyboardButton("lowercase",  callback_data="case|lower")],
+        [InlineKeyboardButton("Title Case", callback_data="case|title")],
+        [InlineKeyboardButton("◀ Dev Tools", callback_data="cat|dev")],
+    ])
+
+
+# ── Utility helpers ───────────────────────────────────────────────────────────
 
 def trim_url(url: str) -> str:
     return url.rstrip(".,!?;:)]}>\"'")
 
 
 def truncate_caption(caption: str) -> str:
-    if len(caption) <= MAX_CAPTION_LENGTH:
-        return caption
-    return caption[:MAX_CAPTION_LENGTH - 3] + "..."
+    return caption if len(caption) <= MAX_CAPTION_LENGTH else caption[:MAX_CAPTION_LENGTH - 3] + "..."
 
 
 def detect_platform(url: str) -> str | None:
@@ -1206,42 +1528,26 @@ def markdown_code_escape(text: str) -> str:
 
 def _user_hint(exc: Exception) -> str:
     msg = str(exc).lower()
-    if "timeout" in msg:
-        return "⏱ The operation timed out. Please try a smaller file or try again later."
-    if "too large" in msg or "size" in msg:
-        return "📦 The file is too large (limit: 20 MB for download, 49 MB for upload)."
-    if "memory" in msg or "oom" in msg:
-        return "💾 The server ran low on memory. Try a smaller image."
+    if "timeout" in msg:   return "⏱ The operation timed out. Try a smaller file or retry later."
+    if "too large" in msg: return "📦 File exceeds the limit (20 MB download / 49 MB upload)."
+    if "memory" in msg:    return "💾 Server ran low on memory. Try a smaller image."
     return f"❌ Something went wrong: {exc}"
 
 
 def _esc_md(text: str) -> str:
-    """Escape legacy-Markdown special chars (_ * ` [) so usernames like
-    'yolo_anik' don't get parsed as italic/bold/code markers and crash
-    send_message with 'can't find end of the entity' errors."""
-    if not text:
-        return text
-    return re.sub(r"([_*`\[])", r"\\\1", text)
+    return re.sub(r"([_*`\[])", r"\\\1", text) if text else text
 
 
 def _bar(count: int, max_count: int, width: int = 12) -> str:
-    """Tiny ASCII bar for the /stats dashboard."""
-    if max_count <= 0:
-        filled = 0
-    else:
-        filled = max(1, round((count / max_count) * width)) if count > 0 else 0
+    filled = max(1, round((count / max_count) * width)) if max_count > 0 and count > 0 else 0
     return "█" * filled + "░" * (width - filled)
 
-
-# ── Safe Telegram helpers ─────────────────────────────────────────────────────
 
 async def safe_edit(message: Any, text: str, **kwargs: Any) -> None:
     try:
         await message.edit_text(text, **kwargs)
     except BadRequest as exc:
-        if "message to edit not found" in str(exc).lower():
-            logger.debug("Status message gone, skipping edit: %s", exc)
-        else:
+        if "message to edit not found" not in str(exc).lower():
             raise
 
 
@@ -1249,48 +1555,55 @@ async def safe_delete(message: Any) -> None:
     try:
         await message.delete()
     except BadRequest as exc:
-        if "message to delete not found" in str(exc).lower():
-            logger.debug("Status message gone, skipping delete: %s", exc)
-        else:
+        if "message to delete not found" not in str(exc).lower():
             raise
 
 
-# ── Pending-file token store ──────────────────────────────────────────────────
+# ── Token store (with TTL) ────────────────────────────────────────────────────
 
 def _store_token(bot_data: dict, file_id: str) -> str:
-    pending: dict[str, str] = bot_data.setdefault("pending_files", {})
+    pending: dict[str, tuple[str, float]] = bot_data.setdefault("pending_files", {})
+    now = time.monotonic()
+    # Evict expired tokens
+    expired = [k for k, (_, ts) in pending.items() if now - ts > TOKEN_TTL_SECONDS]
+    for k in expired:
+        pending.pop(k, None)
     if len(pending) >= MAX_PENDING_FILES:
-        oldest = next(iter(pending))
+        oldest = min(pending, key=lambda k: pending[k][1])
         pending.pop(oldest, None)
     token = uuid.uuid4().hex[:10]
-    pending[token] = file_id
+    pending[token] = (file_id, now)
     return token
 
 
 def _get_file_id(bot_data: dict, token: str) -> str | None:
-    return bot_data.get("pending_files", {}).get(token)
+    entry = bot_data.get("pending_files", {}).get(token)
+    if entry is None:
+        return None
+    file_id, ts = entry
+    if time.monotonic() - ts > TOKEN_TTL_SECONDS:
+        bot_data["pending_files"].pop(token, None)
+        return None
+    return file_id
 
 
 def _drop_token(bot_data: dict, token: str) -> None:
     bot_data.get("pending_files", {}).pop(token, None)
 
 
-# ── Rate limiting decorator ────────────────────────────────────────────────────
+# ── Rate-limit guard ──────────────────────────────────────────────────────────
 
 async def _check_heavy_rate_limit(update: Update, tool: str) -> bool:
     if tool not in storage.HEAVY_TOOLS:
         return True
     chat_id = update.effective_chat.id
-    exempt = is_admin(update)
-    allowed, wait_seconds = await storage.check_rate_limit(chat_id, exempt=exempt)
+    allowed, wait = await storage.check_rate_limit(chat_id, exempt=is_admin(update))
     if not allowed:
         used, limit = await storage.calls_used(chat_id)
-        hint = ""
-        if limit <= 0:
-            hint = " You've been fully blocked by an admin."
+        extra = " You have been fully blocked by an admin." if limit <= 0 else ""
         await update.effective_message.reply_text(
-            f"⏳ Please wait ~{int(wait_seconds)}s before trying another heavy tool "
-            f"(used {used}/{limit} in the last {storage.RATE_LIMIT_WINDOW_SECONDS}s).{hint}\n"
+            f"⏳ Please wait ~{int(wait)}s before using another heavy tool "
+            f"({used}/{limit} used in the last {storage.RATE_LIMIT_WINDOW_SECONDS}s).{extra}\n"
             f"Need a higher limit? Try `/requestlimit <number>`.",
             parse_mode="Markdown",
         )
@@ -1299,59 +1612,63 @@ async def _check_heavy_rate_limit(update: Update, tool: str) -> bool:
 
 
 async def _record(context: ContextTypes.DEFAULT_TYPE, update: Update, tool: str) -> None:
-    """Wrapper around storage.record_usage that always attaches who did it."""
-    chat_id = update.effective_chat.id if update.effective_chat else None
+    chat_id  = update.effective_chat.id if update.effective_chat else None
     username = _username_of(update)
     await storage.record_usage(tool, chat_id=chat_id, username=username)
 
 
-# ── Image utilities ───────────────────────────────────────────────────────────
+# ── Watermark bytes cache (in-memory, per bot session) ────────────────────────
+_watermark_cache: dict[str, bytes] = {}
+
+
+async def _get_watermark_bytes(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> bytes:
+    if file_id in _watermark_cache:
+        return _watermark_cache[file_id]
+    data = await _download_file(context, file_id)
+    _watermark_cache[file_id] = data
+    return data
+
+
+# ── Image helpers ─────────────────────────────────────────────────────────────
 
 def _get_image_dimensions(image_bytes: bytes) -> tuple[int, int]:
-    MAX_DIM = 400
     try:
         from PIL import Image
         img = Image.open(BytesIO(image_bytes))
         w, h = img.size
-        if w > MAX_DIM or h > MAX_DIM:
-            ratio = min(MAX_DIM / w, MAX_DIM / h)
+        if w > IMAGE_MAX_DIM or h > IMAGE_MAX_DIM:
+            ratio = min(IMAGE_MAX_DIM / w, IMAGE_MAX_DIM / h)
             w, h = int(w * ratio), int(h * ratio)
         return w, h
     except Exception:
-        return 300, 300
+        return 800, 600
 
 
 async def _image_to_rgba_b64(image_bytes: bytes, width: int, height: int) -> str:
-    try:
-        from PIL import Image
-        img = Image.open(BytesIO(image_bytes)).convert("RGBA").resize((width, height))
-        return base64.b64encode(img.tobytes()).decode()
-    except ImportError:
-        pass
-    raw = bytearray(width * height * 4)
-    for y in range(height):
-        for x in range(width):
-            idx = (y * width + x) * 4
-            raw[idx]   = (x * 255) // max(1, width - 1)
-            raw[idx+1] = (y * 255) // max(1, height - 1)
-            raw[idx+2] = 128
-            raw[idx+3] = 255
-    return base64.b64encode(bytes(raw)).decode()
+    from PIL import Image
+    img = Image.open(BytesIO(image_bytes)).convert("RGBA").resize((width, height))
+    return base64.b64encode(img.tobytes()).decode()
 
 
-async def apply_effect_to_image(image_bytes: bytes, effect: str, width: int, height: int) -> bytes:
+async def apply_effect_to_image(
+    image_bytes: bytes,
+    effect: str,
+    width: int,
+    height: int,
+    params: dict | None = None,
+) -> bytes:
     rgba_b64 = await _image_to_rgba_b64(image_bytes, width, height)
-    payload = json.dumps({
-        "effect": effect,
-        "width": width,
-        "height": height,
+    payload  = json.dumps({
+        "effect":          effect,
+        "width":           width,
+        "height":          height,
         "pixels_rgba_b64": rgba_b64,
-        "params": {
-            "dotPitch": 8,
-            "contrast": 1.2,
-            "brightness": 1.0,
+        "params": params or {
+            "dotPitch":       8,
+            "contrast":       1.2,
+            "brightness":     1.0,
             "grainIntensity": 18,
-            "vignette": 0.3,
+            "vignette":       0.3,
         },
     })
     proc = await asyncio.create_subprocess_exec(
@@ -1360,59 +1677,43 @@ async def apply_effect_to_image(image_bytes: bytes, effect: str, width: int, hei
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(input=payload.encode()), timeout=120)
+    stdout, stderr = await asyncio.wait_for(proc.communicate(payload.encode()), timeout=120)
     if proc.returncode != 0:
         raise RuntimeError(f"Engine error: {stderr.decode()[:300]}")
     result = json.loads(stdout.decode())
     if result.get("status") != "success":
         raise RuntimeError(result.get("message", "Unknown engine error"))
-    b64_part = result["bmp_data_url"].split(",", 1)[1]
-    bmp_bytes = base64.b64decode(b64_part)
+    bmp_bytes = base64.b64decode(result["bmp_data_url"].split(",", 1)[1])
     from PIL import Image
-    with Image.open(BytesIO(bmp_bytes)) as bmp_img:
-        png_buf = BytesIO()
-        bmp_img.convert("RGBA").save(png_buf, format="PNG", optimize=True)
-        return png_buf.getvalue()
+    png_buf = BytesIO()
+    Image.open(BytesIO(bmp_bytes)).convert("RGBA").save(png_buf, format="PNG", optimize=True)
+    return png_buf.getvalue()
 
-
-# ── Sticker & GIF support ─────────────────────────────────────────────────────
 
 async def sticker_to_png(sticker_bytes: bytes) -> bytes:
     from PIL import Image
-
-    def _run() -> bytes:
-        img = Image.open(BytesIO(sticker_bytes)).convert("RGBA")
+    def _run():
         buf = BytesIO()
-        img.save(buf, format="PNG", optimize=True)
+        Image.open(BytesIO(sticker_bytes)).convert("RGBA").save(buf, format="PNG", optimize=True)
         return buf.getvalue()
-
     return await asyncio.to_thread(_run)
 
 
 async def gif_to_frames(gif_bytes: bytes, max_frames: int = GIF_MAX_FRAMES) -> list[bytes]:
     from PIL import Image, ImageSequence
-
-    def _run() -> list[bytes]:
-        img = Image.open(BytesIO(gif_bytes))
-        all_frames = list(ImageSequence.Iterator(img))
-        total = len(all_frames)
+    def _run():
+        img    = Image.open(BytesIO(gif_bytes))
+        frames = list(ImageSequence.Iterator(img))
+        total  = len(frames)
         if total == 0:
             raise ValueError("GIF contains no frames.")
-
-        if total <= max_frames:
-            indices = list(range(total))
-        else:
-            step = total / max_frames
-            indices = [int(i * step) for i in range(max_frames)]
-
-        out: list[bytes] = []
+        indices = list(range(total)) if total <= max_frames else [int(i * total / max_frames) for i in range(max_frames)]
+        out = []
         for idx in indices:
-            frame = all_frames[idx].convert("RGBA")
             buf = BytesIO()
-            frame.save(buf, format="PNG", optimize=True)
+            frames[idx].convert("RGBA").save(buf, format="PNG", optimize=True)
             out.append(buf.getvalue())
         return out
-
     return await asyncio.to_thread(_run)
 
 
@@ -1423,8 +1724,8 @@ _REMBG_SESSION = None
 def _ensure_u2netp_model() -> str:
     if os.path.exists(U2NETP_MODEL_PATH) and os.path.getsize(U2NETP_MODEL_PATH) > 1_000_000:
         return U2NETP_MODEL_PATH
-    with httpx.Client(timeout=60.0, follow_redirects=True) as client:
-        r = client.get(U2NETP_MODEL_URL)
+    with httpx.Client(timeout=60.0, follow_redirects=True) as c:
+        r = c.get(U2NETP_MODEL_URL)
         r.raise_for_status()
         tmp = U2NETP_MODEL_PATH + ".part"
         with open(tmp, "wb") as f:
@@ -1444,56 +1745,42 @@ def _get_rembg_session():
 def _u2netp_predict_mask(session, img):
     import numpy as np
     from PIL import Image
-
     resized = img.resize((320, 320), Image.Resampling.LANCZOS)
-    arr = np.array(resized).astype(np.float32)
-    arr = arr / max(float(arr.max()), 1e-6)
-
+    arr     = np.array(resized).astype(np.float32) / max(float(np.array(resized).max()), 1e-6)
     mean, std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
-    normed = np.zeros((320, 320, 3), dtype=np.float32)
+    normed  = np.zeros((320, 320, 3), dtype=np.float32)
     for c in range(3):
         normed[:, :, c] = (arr[:, :, c] - mean[c]) / std[c]
-    input_tensor = np.expand_dims(normed.transpose((2, 0, 1)), 0)
-
-    pred = session.run(None, {session.get_inputs()[0].name: input_tensor})[0][:, 0, :, :]
+    inp  = np.expand_dims(normed.transpose(2, 0, 1), 0)
+    pred = session.run(None, {session.get_inputs()[0].name: inp})[0][:, 0, :, :]
     ma, mi = float(pred.max()), float(pred.min())
     pred = np.squeeze((pred - mi) / max(ma - mi, 1e-6))
-
-    mask = Image.fromarray((pred * 255).astype("uint8"), mode="L")
-    return mask.resize(img.size, Image.Resampling.LANCZOS)
+    return Image.fromarray((pred * 255).astype("uint8"), "L").resize(img.size, Image.Resampling.LANCZOS)
 
 
 async def remove_background(image_bytes: bytes) -> bytes:
     from PIL import Image, ImageOps
-
-    def _run() -> bytes:
-        img = Image.open(BytesIO(image_bytes))
-        img.load()
-        img = ImageOps.exif_transpose(img).convert("RGB")
+    def _run():
+        img  = ImageOps.exif_transpose(Image.open(BytesIO(image_bytes))).convert("RGB")
         if max(img.size) > REMBG_MAX_DIMENSION:
             img.thumbnail((REMBG_MAX_DIMENSION, REMBG_MAX_DIMENSION), Image.LANCZOS)
         mask = _u2netp_predict_mask(_get_rembg_session(), img)
-        out = img.convert("RGBA")
+        out  = img.convert("RGBA")
         out.putalpha(mask)
         buf = BytesIO()
         out.save(buf, format="PNG", optimize=True)
         return buf.getvalue()
-
     try:
         return await asyncio.wait_for(asyncio.to_thread(_run), timeout=REMBG_TIMEOUT_SECONDS)
     except asyncio.TimeoutError as exc:
         raise RuntimeError("Background removal timed out. The first run downloads a model — please retry.") from exc
-    except Exception as exc:
-        logger.exception("remove_background failed")
-        raise RuntimeError(f"Background removal failed: {exc}") from exc
 
 
 # ── Format conversions ────────────────────────────────────────────────────────
 
 async def convert_image_format(image_bytes: bytes, target_format: str) -> bytes:
     from PIL import Image, ImageOps
-
-    def _run() -> bytes:
+    def _run():
         img = ImageOps.exif_transpose(Image.open(BytesIO(image_bytes)))
         out = BytesIO()
         if target_format.upper() == "JPEG":
@@ -1501,43 +1788,36 @@ async def convert_image_format(image_bytes: bytes, target_format: str) -> bytes:
         else:
             img.convert("RGBA").save(out, format="PNG", optimize=True)
         return out.getvalue()
-
     return await asyncio.to_thread(_run)
 
 
 async def image_to_pdf(image_bytes: bytes) -> bytes:
     from PIL import Image, ImageOps
-
-    def _run() -> bytes:
-        img = ImageOps.exif_transpose(Image.open(BytesIO(image_bytes))).convert("RGB")
+    def _run():
         out = BytesIO()
-        img.save(out, format="PDF", quality=100, resolution=300.0)
+        ImageOps.exif_transpose(Image.open(BytesIO(image_bytes))).convert("RGB").save(out, format="PDF", quality=100, resolution=300.0)
         return out.getvalue()
-
     return await asyncio.to_thread(_run)
 
 
 async def pdf_to_images(pdf_bytes: bytes, max_pages: int = PDF2IMG_MAX_PAGES) -> list[bytes]:
     import fitz
-
-    def _run() -> list[bytes]:
+    def _run():
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         try:
-            return [page.get_pixmap(dpi=200).tobytes("png") for i, page in enumerate(doc) if i < max_pages]
+            return [p.get_pixmap(dpi=200).tobytes("png") for i, p in enumerate(doc) if i < max_pages]
         finally:
             doc.close()
-
     return await asyncio.to_thread(_run)
 
 
-# ── Translation (Google primary, MyMemory fallback, both with backoff) ───────
+# ── Translation ───────────────────────────────────────────────────────────────
 
 _RATE_LIMIT_MARKERS = ("429", "too many requests", "rate limit", "quota")
 
 
 def _looks_rate_limited(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(marker in msg for marker in _RATE_LIMIT_MARKERS)
+    return any(m in str(exc).lower() for m in _RATE_LIMIT_MARKERS)
 
 
 async def _translate_google(text: str, target_lang: str) -> str:
@@ -1546,24 +1826,13 @@ async def _translate_google(text: str, target_lang: str) -> str:
 
 
 async def _translate_mymemory(text: str, target_lang: str) -> str:
-    """Fallback provider — separate free API with its own independent quota.
-    Its free tier caps requests at ~500 chars, so callers should chunk longer
-    text before calling this."""
     from deep_translator import MyMemoryTranslator
-    return await asyncio.to_thread(
-        lambda: MyMemoryTranslator(source="auto", target=target_lang).translate(text)
-    )
+    return await asyncio.to_thread(lambda: MyMemoryTranslator(source="auto", target=target_lang).translate(text))
 
 
 async def translate_text(text: str, target_lang: str) -> str:
-    """Tries Google Translate with exponential backoff (2s, then 4s) on
-    rate-limit-style errors. If Google keeps failing, falls back to MyMemory
-    (chunked to its ~500 char limit if needed). Raises the last error if both
-    providers are exhausted so the caller can show a clear message."""
-    backoffs = (2, 4)
     last_exc: Exception | None = None
-
-    for attempt, delay in enumerate((0, *backoffs)):
+    for attempt, delay in enumerate((0, 2, 4)):
         if delay:
             await asyncio.sleep(delay)
         try:
@@ -1571,39 +1840,28 @@ async def translate_text(text: str, target_lang: str) -> str:
         except Exception as exc:
             last_exc = exc
             if not _looks_rate_limited(exc):
-                break  # not a rate-limit issue — no point retrying Google
-            logger.warning("Google Translate rate-limited (attempt %d): %s", attempt + 1, exc)
-
-    logger.warning("Google Translate exhausted, falling back to MyMemory: %s", last_exc)
+                break
     try:
         if len(text) <= MYMEMORY_MAX_CHARS:
             return await _translate_mymemory(text, target_lang)
-        # Chunk on whitespace boundaries to respect MyMemory's per-request limit.
-        chunks: list[str] = []
-        current = ""
+        chunks, current = [], ""
         for word in text.split(" "):
             candidate = f"{current} {word}".strip()
             if len(candidate) > MYMEMORY_MAX_CHARS and current:
-                chunks.append(current)
-                current = word
+                chunks.append(current); current = word
             else:
                 current = candidate
         if current:
             chunks.append(current)
-        translated_chunks = []
-        for chunk in chunks:
-            translated_chunks.append(await _translate_mymemory(chunk, target_lang))
-        return " ".join(translated_chunks)
+        return " ".join([await _translate_mymemory(c, target_lang) for c in chunks])
     except Exception as exc:
-        logger.error("MyMemory fallback also failed: %s", exc)
         raise RuntimeError("rate_limited") from (last_exc or exc)
 
 
 # ── Markdown → plain text ─────────────────────────────────────────────────────
 
 def markdown_to_plain_text(md: str) -> str:
-    text = md
-    text = re.sub(r"!\[.*?\]\(.*?\)", "", text)
+    text = re.sub(r"!\[.*?\]\(.*?\)", "", md)
     text = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", text)
     text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"(\*\*|__)(.*?)\1", r"\2", text, flags=re.DOTALL)
@@ -1611,39 +1869,34 @@ def markdown_to_plain_text(md: str) -> str:
     text = re.sub(r"(?<!_)_(?!_)(.*?)_(?!_)", r"\1", text)
     text = re.sub(r"`{1,3}(.*?)`{1,3}", r"\1", text, flags=re.DOTALL)
     text = re.sub(r"^\s*>\s?", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^\s*[-*+]\s+", "- ", text, flags=re.MULTILINE)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-# ── Lummi ─────────────────────────────────────────────────────────────────────
+# ── Lummi & Hugeicons ─────────────────────────────────────────────────────────
 
 def find_lummi_cid(page_html: str, slug: str) -> str | None:
-    soup = BeautifulSoup(page_html, "html.parser")
+    soup    = BeautifulSoup(page_html, "html.parser")
     scripts = [s.string or s.get_text() for s in soup.find_all("script")]
-    candidates = [s for s in scripts if slug in s] + scripts
-    for script in candidates:
+    for script in ([s for s in scripts if slug in s] + scripts):
         for key in ("outpaintAssetPath", "path"):
             m = re.search(rf'{re.escape(key)}\\?":\\?"assets/({LUMMI_CID_RE.pattern})', script)
-            if m:
-                return m.group(1)
+            if m: return m.group(1)
         m = LUMMI_CID_RE.search(script)
-        if m:
-            return m.group(0)
+        if m: return m.group(0)
     og = soup.find("meta", property="og:image")
     if og and og.get("content"):
         m = LUMMI_CID_RE.search(og["content"])
-        if m:
-            return m.group(0)
+        if m: return m.group(0)
     return None
 
 
 async def fetch_lummi_asset(url: str) -> dict[str, Any]:
-    parsed = urlsplit(url)
+    parsed     = urlsplit(url)
     slug_match = re.match(r"^/(?:photo|illustration|3d)/([^/?#]+)", parsed.path, re.IGNORECASE)
     if not slug_match:
         raise ValueError("Unsupported Lummi URL format.")
-    slug = unquote(slug_match.group(1))
+    slug   = unquote(slug_match.group(1))
     client = get_http_client()
 
     async def _fetch():
@@ -1651,9 +1904,9 @@ async def fetch_lummi_asset(url: str) -> dict[str, Any]:
         page_r.raise_for_status()
         cid = find_lummi_cid(page_r.text, slug)
         if not cid:
-            raise ValueError("Could not find a direct Lummi asset on the page.")
+            raise ValueError("Could not locate a Lummi asset on that page.")
         direct_url = f"https://assets.lummi.ai/assets/{cid}"
-        asset_r = await client.get(direct_url, headers={**HEADERS, "Referer": "https://www.lummi.ai/"})
+        asset_r    = await client.get(direct_url, headers={**HEADERS, "Referer": "https://www.lummi.ai/"})
         asset_r.raise_for_status()
         return asset_r, cid, direct_url
 
@@ -1665,25 +1918,18 @@ async def fetch_lummi_asset(url: str) -> dict[str, Any]:
         raise ValueError("The Lummi file exceeds Telegram's upload limit (49 MB).")
     ct  = asset_r.headers.get("content-type", "image/jpeg").split(";", 1)[0].lower()
     ext = {"image/jpeg":"jpg","image/png":"png","image/webp":"webp","image/gif":"gif","image/tiff":"tiff"}.get(ct, "jpg")
-    return {
-        "bytes": content,
-        "filename": f"lummi_{cid[:8]}.{ext}",
-        "direct_url": direct_url,
-        "size_mb": len(content) / (1024 * 1024),
-    }
+    return {"bytes": content, "filename": f"lummi_{cid[:8]}.{ext}", "direct_url": direct_url, "size_mb": len(content)/(1024*1024)}
 
-
-# ── Hugeicons ─────────────────────────────────────────────────────────────────
 
 async def fetch_hugeicons_svg(url: str) -> dict[str, str]:
     m = re.search(r"hugeicons\.com/icon/([^?#]+)", url, re.IGNORECASE)
     if not m:
         raise ValueError("Invalid Hugeicons URL.")
     icon_name = unquote(m.group(1)).strip("/")
-    sm = re.search(r"[?&]style=([^&]+)", url, re.IGNORECASE)
-    style = unquote(sm.group(1)) if sm else "stroke-rounded"
-    cdn_url = f"https://cdn.hugeicons.com/icons/{icon_name}-{style}.svg?v=1.0.0"
-    client  = get_http_client()
+    sm        = re.search(r"[?&]style=([^&]+)", url, re.IGNORECASE)
+    style     = unquote(sm.group(1)) if sm else "stroke-rounded"
+    cdn_url   = f"https://cdn.hugeicons.com/icons/{icon_name}-{style}.svg?v=1.0.0"
+    client    = get_http_client()
 
     async def _fetch():
         cdn_r = await client.get(cdn_url, headers={**HEADERS, "Referer": "https://hugeicons.com/"})
@@ -1703,28 +1949,31 @@ async def fetch_hugeicons_svg(url: str) -> dict[str, str]:
 
 
 def format_svg(svg: str) -> str:
-    svg = re.sub(r"\s+", " ", svg)
-    return svg.replace("> <", ">\n  <").strip()
+    return re.sub(r"\s+", " ", svg).replace("> <", ">\n  <").strip()
 
 
 # ── Shared image-tool runner ──────────────────────────────────────────────────
+
 _SINGLE_IMAGE_TOOLS: dict[str, tuple[str, str, Callable]] = {
-    "bgremove":    ("Removing background", "background_removed.png", remove_background),
-    "img2pdf":     ("Converting to PDF",   "image.pdf",              image_to_pdf),
-    "jpg2png":     ("Converting to PNG",   "converted.png",          lambda b: convert_image_format(b, "PNG")),
-    "png2jpg":     ("Converting to JPEG",  "converted.jpg",          lambda b: convert_image_format(b, "JPEG")),
-    "sticker2png": ("Converting sticker",  "sticker.png",            sticker_to_png),
+    "bgremove":    ("Removing background",  "background_removed.png", remove_background),
+    "img2pdf":     ("Converting to PDF",    "image.pdf",              image_to_pdf),
+    "jpg2png":     ("Converting to PNG",    "converted.png",          lambda b: convert_image_format(b, "PNG")),
+    "png2jpg":     ("Converting to JPEG",   "converted.jpg",          lambda b: convert_image_format(b, "JPEG")),
+    "sticker2png": ("Converting sticker",   "sticker.png",            sticker_to_png),
 }
 
 _AWAITING_LABELS: dict[str, str] = {
     **{k: v[0] for k, v in _SINGLE_IMAGE_TOOLS.items()},
     "gif2frames":     "Extract GIF frames",
     "translate_text": "Translate text",
-    "fiver_sanitize": "Sanitize Fiver message",
-    "watermark_setup": "Upload watermark logo",
-    "watermark_apply": "Apply watermark to photo",
-    "compress_image":  "Compress image",
-    "qrscan":          "Scan QR code",
+    "fiver_sanitize": "Sanitise Fiver message",
+    "fiver_profile":  "Fiver report card",
+    "watermark_setup":"Upload watermark logo",
+    "watermark_apply":"Apply watermark to photo",
+    "compress_image": "Compress image",
+    "qrscan":         "Scan QR code",
+    "color_input":    "Colour tool input",
+    "dev_input":      "Dev tool input",
 }
 
 
@@ -1749,8 +1998,7 @@ async def _run_image_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, fi
                 out_bytes = await transform(image_bytes)
         else:
             out_bytes = await transform(image_bytes)
-        doc = BytesIO(out_bytes)
-        doc.name = filename
+        doc = BytesIO(out_bytes); doc.name = filename
         await update.message.reply_document(document=doc, filename=filename)
         await safe_delete(status)
         await _record(context, update, tool)
@@ -1766,58 +2014,52 @@ async def _run_gif_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, file
         gif_bytes = await _download_file(context, file_id)
         frames    = await gif_to_frames(gif_bytes)
         if not frames:
-            await safe_edit(status, "❌ Could not extract any frames from that GIF.")
-            return
+            await safe_edit(status, "❌ No frames could be extracted from that GIF."); return
         await safe_delete(status)
-        for batch_start in range(0, len(frames), 10):
-            batch = frames[batch_start:batch_start + 10]
-            media = [InputMediaPhoto(BytesIO(f)) for f in batch]
-            await update.message.reply_media_group(media=media)
-        await update.message.reply_text(f"✅ Extracted {len(frames)} frame(s) from the GIF.")
+        for i in range(0, len(frames), 10):
+            await update.message.reply_media_group([InputMediaPhoto(BytesIO(f)) for f in frames[i:i+10]])
+        await update.message.reply_text(f"✅ {len(frames)} frame(s) extracted.")
         await _record(context, update, "gif2frames")
     except Exception as exc:
         logger.warning("gif2frames failed: %s", exc)
         await safe_edit(status, _user_hint(exc))
-        await notify_admin(context, "gif2frames", f"gif2frames failed for chat {update.effective_chat.id}: {exc}")
 
 
-# ── Doc converter integration ─────────────────────────────────────────────────
+# ── Doc converters (optional) ─────────────────────────────────────────────────
+
 try:
     from doc_converters import DOC_TOOLS as _DOC_TOOLS
     from doc_converters import pptx_to_images as _pptx_to_images
     _DOC_AVAILABLE = True
 except ImportError:
-    _DOC_TOOLS = {}
-    _DOC_AVAILABLE = False
-    logger.warning("doc_converters.py not found — document tools disabled.")
-
-_MULTI_IMAGE_DOC_TOOLS = {"pptx2images", "pdf2img"}
+    _DOC_TOOLS = {}; _DOC_AVAILABLE = False
+    logger.warning("doc_converters.py not found — document conversion disabled.")
 
 _DOC_ACCEPTS: dict[str, tuple[list[str], list[str]]] = {
-    "pdf2docx":    (["application/pdf"],                              [".pdf"]),
-    "pdf2txt":     (["application/pdf"],                              [".pdf"]),
-    "pdf2img":     (["application/pdf"],                              [".pdf"]),
-    "docx2pdf":    (["application/vnd.openxmlformats"],               [".docx"]),
-    "docx2txt":    (["application/vnd.openxmlformats"],               [".docx"]),
-    "docx2html":   (["application/vnd.openxmlformats"],               [".docx"]),
-    "doc2docx":    (["application/msword"],                           [".doc"]),
-    "xlsx2pdf":    (["application/vnd.openxmlformats", "application/vnd.ms-excel"], [".xlsx"]),
-    "xlsx2csv":    (["application/vnd.openxmlformats", "application/vnd.ms-excel"], [".xlsx"]),
-    "xls2xlsx":    (["application/vnd.ms-excel"],                     [".xls"]),
-    "csv2xlsx":    (["text/csv", "text/plain"],                       [".csv"]),
-    "pptx2pdf":    (["application/vnd.openxmlformats"],               [".pptx"]),
-    "pptx2images": (["application/vnd.openxmlformats"],               [".pptx"]),
-    "ppt2pptx":    (["application/vnd.ms-powerpoint"],                [".ppt"]),
-    "txt2pdf":     (["text/plain"],                                    [".txt"]),
-    "html2pdf":    (["text/html"],                                    [".html", ".htm"]),
-    "md2pdf":      (["text/plain", "text/markdown"],                  [".md"]),
-    "md2txt":      (["text/plain", "text/markdown"],                  [".md"]),
-    "md2docx":     (["text/plain", "text/markdown"],                  [".md"]),
-    "rtf2txt":     (["text/rtf", "application/rtf"],                  [".rtf"]),
-    "rtf2pdf":     (["text/rtf", "application/rtf"],                  [".rtf"]),
-    "odt2pdf":     (["application/vnd.oasis"],                        [".odt"]),
-    "odt2docx":    (["application/vnd.oasis"],                        [".odt"]),
-    "epub2pdf":    (["application/epub+zip"],                         [".epub"]),
+    "pdf2docx":    (["application/pdf"],                                        [".pdf"]),
+    "pdf2txt":     (["application/pdf"],                                        [".pdf"]),
+    "pdf2img":     (["application/pdf"],                                        [".pdf"]),
+    "docx2pdf":    (["application/vnd.openxmlformats"],                         [".docx"]),
+    "docx2txt":    (["application/vnd.openxmlformats"],                         [".docx"]),
+    "docx2html":   (["application/vnd.openxmlformats"],                         [".docx"]),
+    "doc2docx":    (["application/msword"],                                     [".doc"]),
+    "xlsx2pdf":    (["application/vnd.openxmlformats","application/vnd.ms-excel"],[".xlsx"]),
+    "xlsx2csv":    (["application/vnd.openxmlformats","application/vnd.ms-excel"],[".xlsx"]),
+    "xls2xlsx":    (["application/vnd.ms-excel"],                               [".xls"]),
+    "csv2xlsx":    (["text/csv","text/plain"],                                  [".csv"]),
+    "pptx2pdf":    (["application/vnd.openxmlformats"],                         [".pptx"]),
+    "pptx2images": (["application/vnd.openxmlformats"],                         [".pptx"]),
+    "ppt2pptx":    (["application/vnd.ms-powerpoint"],                          [".ppt"]),
+    "txt2pdf":     (["text/plain"],                                             [".txt"]),
+    "html2pdf":    (["text/html"],                                              [".html",".htm"]),
+    "md2pdf":      (["text/plain","text/markdown"],                             [".md"]),
+    "md2txt":      (["text/plain","text/markdown"],                             [".md"]),
+    "md2docx":     (["text/plain","text/markdown"],                             [".md"]),
+    "rtf2txt":     (["text/rtf","application/rtf"],                             [".rtf"]),
+    "rtf2pdf":     (["text/rtf","application/rtf"],                             [".rtf"]),
+    "odt2pdf":     (["application/vnd.oasis"],                                  [".odt"]),
+    "odt2docx":    (["application/vnd.oasis"],                                  [".odt"]),
+    "epub2pdf":    (["application/epub+zip"],                                   [".epub"]),
 }
 
 
@@ -1825,55 +2067,43 @@ def _doc_accepts(tool: str, mime: str, filename: str) -> bool:
     if tool not in _DOC_ACCEPTS:
         return True
     mimes, exts = _DOC_ACCEPTS[tool]
-    fname = filename.lower()
-    if any(fname.endswith(e) for e in exts):
-        return True
-    if any(mime.startswith(m) for m in mimes):
-        return True
-    return False
+    fn = filename.lower()
+    return any(fn.endswith(e) for e in exts) or any(mime.startswith(m) for m in mimes)
 
 
 async def _run_doc_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, tool: str) -> None:
     if not await _check_heavy_rate_limit(update, tool):
         return
     if not _DOC_AVAILABLE:
-        await update.message.reply_text("❌ Document tools are not available on this server.")
-        return
+        await update.message.reply_text("❌ Document tools are unavailable on this server."); return
 
     if tool == "pptx2images":
-        status = await update.message.reply_text("⏳ Converting slides to images…")
+        status = await update.message.reply_text("⏳ Rendering slides…")
         try:
-            raw = await _download_file(context, file_id)
+            raw   = await _download_file(context, file_id)
             async with storage.HEAVY_JOB_SEMAPHORE:
                 pages = await _pptx_to_images(raw)
             if not pages:
-                await safe_edit(status, "❌ No slides could be rendered.")
-                return
+                await safe_edit(status, "❌ No slides could be rendered."); return
             await safe_delete(status)
-            for batch_start in range(0, len(pages), 10):
-                batch = pages[batch_start:batch_start + 10]
-                await update.message.reply_media_group([InputMediaPhoto(BytesIO(p)) for p in batch])
-            await update.message.reply_text(f"✅ {len(pages)} slide(s) converted.")
+            for i in range(0, len(pages), 10):
+                await update.message.reply_media_group([InputMediaPhoto(BytesIO(p)) for p in pages[i:i+10]])
+            await update.message.reply_text(f"✅ {len(pages)} slide(s) rendered.")
             await _record(context, update, "pptx2images")
         except Exception as exc:
             logger.warning("pptx2images failed: %s", exc)
             await safe_edit(status, _user_hint(exc))
-            await notify_admin(context, "pptx2images", f"pptx2images failed: {exc}")
         return
 
     entry = _DOC_TOOLS.get(tool)
     if not entry:
-        await update.message.reply_text("❌ Unknown document tool.")
-        return
-
-    label, default_filename, handler = entry
+        await update.message.reply_text("❌ Unknown document tool."); return
+    label, _, handler = entry
     status = await update.message.reply_text(f"⏳ {label}…")
     try:
-        raw      = await _download_file(context, file_id)
-        result   = await handler(raw)
-        out_bytes, out_name = result
-        doc = BytesIO(out_bytes)
-        doc.name = out_name
+        raw = await _download_file(context, file_id)
+        out_bytes, out_name = await handler(raw)
+        doc = BytesIO(out_bytes); doc.name = out_name
         await update.message.reply_document(document=doc, filename=out_name)
         await safe_delete(status)
         await _record(context, update, tool)
@@ -1883,386 +2113,262 @@ async def _run_doc_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, file
         await notify_admin(context, tool, f"Doc tool `{tool}` failed: {exc}")
 
 
-# ── Telegram Handlers ─────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#  COMMAND HANDLERS
+# ════════════════════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        _remember_admin_chat_id(update)
-        context.user_data.pop("awaiting", None)
-        await update.message.reply_text(
-            WELCOME_MESSAGE, parse_mode="Markdown", reply_markup=build_main_menu_keyboard(),
-        )
+    if not update.message: return
+    _remember_admin_chat_id(update)
+    context.user_data.pop("awaiting", None)
+    await update.message.reply_text(WELCOME_MESSAGE, parse_mode="Markdown", reply_markup=build_main_menu_keyboard())
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(MENU_INTRO, parse_mode="Markdown", reply_markup=build_main_menu_keyboard())
+    if not update.message: return
+    await update.message.reply_text(MENU_INTRO, parse_mode="Markdown", reply_markup=build_main_menu_keyboard())
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        had_task = context.user_data.pop("awaiting", None) is not None
-        context.user_data.pop("target_lang", None)
-        context.user_data.pop("compress_target_bytes", None)
-        context.user_data.pop("watermark_position", None)
-        await update.message.reply_text("✅ Cancelled." if had_task else "Nothing to cancel.")
+    if not update.message: return
+    had = context.user_data.pop("awaiting", None)
+    for key in ("target_lang","compress_target_bytes","watermark_position","color_tool","dev_tool","dev_tool_step","fiver_profile","fiver_client","fiver_order"):
+        context.user_data.pop(key, None)
+    await update.message.reply_text("✅ Cancelled." if had else "Nothing to cancel.")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(
-            "📖 *Supported inputs:*\n\n"
-            "*Links:*\n"
-            "• `https://www.lummi.ai/photo/...`\n"
-            "• `https://www.lummi.ai/illustration/...`\n"
-            "• `https://www.lummi.ai/3d/...`\n"
-            "• `https://hugeicons.com/icon/...`\n\n"
-            "*Images:*\n"
-            "Send any photo → choose from 32 effects!\n\n"
-            "*Sticker / GIF:*\n"
-            "Send a sticker → get a transparent PNG\n"
-            "Send a GIF → extract up to 10 frames as images\n\n"
-            "*Fiver Message Sanitizer:*\n"
-            "`/FiverMessage <text>` → sanitize immediately\n"
-            "`/FiverMessage` alone → I'll ask for the text next\n"
-            "`/addword <word> <replacement>` → add your own\n"
-            "`/mywords` · `/delword <word>` · `/resetwords`\n\n"
-            "*QR codes:*\n"
-            "`/qr <text or link>` → generate a QR code\n"
-            "Send a photo of a QR (via /menu → QR Scan) → decode it\n\n"
-            "*Password Generator:*\n"
-            "`/genpass [length] [--symbols] [--no-ambiguous]`\n"
-            "`/genpin [length]`\n\n"
-            "*Rate limits:*\n"
-            "`/mylimit` → check your own usage\n"
-            "`/requestlimit <n>` → ask an admin for a higher limit\n\n"
-            "*Admin:*\n"
-            "`/admins` → view the admin roster\n"
-            "`/stats` → usage dashboard (admin-only)\n"
-            "`/useractivity <chat_id|@user>` → one user's recent actions (admin-only)\n"
-            "`/pendingrequests` → open limit requests (admin-only)\n"
-            "`/setlimit <chat_id|@user> <n>` → override someone's limit (admin-only)\n"
-            "`/resetlimit <chat_id|@user>` → back to default (admin-only)\n"
-            "`/blockuser <chat_id|@user>` / `/unblockuser <...>` → super-admin only\n\n"
-            "*Tools (via /menu):*\n"
-            "🧹 Remove BG • 🌐 Translate text • 💧 Watermark\n"
-            "📉 Compress • 📄 PDF → Images • 🖼 Image → PDF\n"
-            "🔁 JPEG ↔ PNG • 📝 MD → TXT\n"
-            "😄 Sticker → PNG • 🎞 GIF → Frames\n"
-            "🛡 Fiver Message Sanitizer\n\n"
-            "*Effects:*\n" + "  ".join(label for _, label, _ in EFFECTS),
-            parse_mode="Markdown",
-        )
+    if not update.message: return
+    await update.message.reply_text(
+        "📖 *BangaliIcon Bot — Help*\n\n"
+        "*Asset extraction:*\n"
+        "Send a Lummi.ai or Hugeicons link → instant download\n\n"
+        "*Image effects (40 total):*\n"
+        "Send any photo → choose category → choose effect\n\n"
+        "*Fiver Sanitizer (v2):*\n"
+        "`/FiverMessage <text>` → sanitize + AI sign detection\n"
+        "Includes: before/after diff, quality score, report card\n"
+        "`/addword` · `/mywords` · `/delword` · `/resetwords`\n\n"
+        "*🎨 Colour Tools (/menu → Colour Tools):*\n"
+        "Color Convert · Contrast Check · Gradient · Shadow · Tint & Shade\n\n"
+        "*🔧 Dev Tools (/menu → Dev Tools):*\n"
+        "JSON · Hash · UUID · Timestamp · Lorem Ipsum\n"
+        "Case Convert · px→rem · URL Encode/Decode\n"
+        "Base64 · Word Count · Diff · Regex Tester\n\n"
+        "*Other tools:*\n"
+        "`/qr <text>` · `/genpass` · `/genpin`\n"
+        "`/compress [size]` · `/watermark`\n\n"
+        "*Admin:*\n"
+        "`/stats` · `/useractivity` · `/setlimit` · `/blockuser`\n"
+        "`/mylimit` · `/requestlimit <n>`",
+        parse_mode="Markdown",
+    )
 
 
-# ── Fiver sanitizer commands ───────────────────────────────────────────────────
+# ── Fiver Sanitizer v2 ────────────────────────────────────────────────────────
 
 async def fivermessage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
+    if not update.message: return
     args_text = " ".join(context.args) if context.args else ""
-    chat_id = update.effective_chat.id
-    custom_words = await storage.get_words(chat_id)
-
     if args_text.strip():
         if len(args_text) > FIVER_SANITIZE_MAX_CHARS:
-            await update.message.reply_text(f"⚠️ Too long ({len(args_text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}.")
-            return
-        sanitized = sanitize_fiver_text(args_text.strip(), custom_words)
-        await update.message.reply_text(f"✅ *Sanitized:*\n\n{sanitized}", parse_mode="Markdown")
-        await _record(context, update, "fiver_sanitize")
-        return
+            await update.message.reply_text(f"⚠️ Too long ({len(args_text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}."); return
+        custom   = await storage.get_words(update.effective_chat.id)
+        san, changes, score = sanitize_fiver_text(args_text.strip(), custom)
+        report   = format_sanitizer_report(args_text.strip(), san, changes, score)
+        await update.message.reply_text(report, parse_mode="Markdown", reply_markup=build_fiver_report_keyboard())
+        await _record(context, update, "fiver_sanitize"); return
 
     context.user_data["awaiting"] = "fiver_sanitize"
-    await update.message.reply_text("🛡️ Send me the message you want to sanitize (or /cancel).")
+    await update.message.reply_text("🛡 Send me the message to sanitize (or /cancel).")
 
 
 async def addword_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
+    if not update.message: return
     if len(context.args) < 2:
-        await update.message.reply_text(
-            "Usage: `/addword <word> <replacement>`\nExample: `/addword deadline dead-line`",
-            parse_mode="Markdown",
-        )
-        return
-    word = context.args[0]
-    replacement = " ".join(context.args[1:])
-    ok, info = await storage.add_word(update.effective_chat.id, word, replacement)
+        await update.message.reply_text("Usage: `/addword <word> <replacement>`", parse_mode="Markdown"); return
+    ok, info = await storage.add_word(update.effective_chat.id, context.args[0], " ".join(context.args[1:]))
     if not ok:
-        await update.message.reply_text(f"❌ {info}")
-        return
+        await update.message.reply_text(f"❌ {info}"); return
     verb = "Updated" if info == "updated" else "Added"
-    await update.message.reply_text(f"✅ {verb}: *{word}* → *{replacement}*", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ {verb}: *{context.args[0]}* → *{' '.join(context.args[1:])}*", parse_mode="Markdown")
 
 
 async def mywords_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
+    if not update.message: return
     words = await storage.get_words(update.effective_chat.id)
     if not words:
-        await update.message.reply_text(
-            "You have no custom words yet. Add one with `/addword <word> <replacement>`.",
-            parse_mode="Markdown",
-        )
-        return
+        await update.message.reply_text("No custom words yet. Add with `/addword <word> <replacement>`.", parse_mode="Markdown"); return
     PAGE_SIZE = 25
     items = sorted(words.items())
-    pages = [items[i:i + PAGE_SIZE] for i in range(0, len(items), PAGE_SIZE)]
     lines = []
-    for page_num, page in enumerate(pages, start=1):
-        lines.append(f"*Page {page_num}/{len(pages)}*")
-        for w, r in page:
-            lines.append(f"• `{w}` → `{r}`")
+    for pi, page in enumerate([items[i:i+PAGE_SIZE] for i in range(0, len(items), PAGE_SIZE)], 1):
+        lines.append(f"*Page {pi}*")
+        lines.extend(f"• `{w}` → `{r}`" for w, r in page)
     text = "\n".join(lines)
     if len(text) > 3800:
-        text = text[:3800] + "\n… (truncated, use /delword to trim)"
-    await update.message.reply_text(f"📚 *Your custom words* ({len(words)} total):\n\n{text}", parse_mode="Markdown")
+        text = text[:3800] + "\n… (truncated)"
+    await update.message.reply_text(f"📚 *Custom words* ({len(words)}):\n\n{text}", parse_mode="Markdown")
 
 
 async def delword_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
+    if not update.message: return
     if not context.args:
-        await update.message.reply_text("Usage: `/delword <word>`", parse_mode="Markdown")
-        return
-    word = context.args[0]
-    removed = await storage.del_word(update.effective_chat.id, word)
-    if removed:
-        await update.message.reply_text(f"🗑 Removed *{word}* from your custom words.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"⚠️ You don't have a custom mapping for *{word}*.", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/delword <word>`", parse_mode="Markdown"); return
+    removed = await storage.del_word(update.effective_chat.id, context.args[0])
+    await update.message.reply_text(
+        f"🗑 Removed *{context.args[0]}*." if removed else f"⚠️ No custom mapping for *{context.args[0]}*.",
+        parse_mode="Markdown",
+    )
 
 
 async def resetwords_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
+    if not update.message: return
     await storage.reset_words(update.effective_chat.id)
-    await update.message.reply_text("♻️ Your custom words have been cleared — back to defaults only.")
+    await update.message.reply_text("♻️ Custom words cleared.")
 
 
-# ── Stats dashboard (admin only) ──────────────────────────────────────────────
+# ── Stats / Admin ─────────────────────────────────────────────────────────────
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
+    if not update.message: return
     _remember_admin_chat_id(update)
     if not is_admin(update):
-        await update.message.reply_text("🚫 This command is admin-only.")
-        return
-
-    rows = await storage.get_stats()
+        await update.message.reply_text("🚫 Admin only."); return
+    rows     = await storage.get_stats()
     activity = await storage.get_user_activity_all()
-
     if not rows:
-        await update.message.reply_text("No usage recorded yet.")
-        return
-
-    top_tools = rows[:12]
-    max_count = top_tools[0][1] if top_tools else 0
-    tool_lines = [f"`{tool:<16}` {_bar(count, max_count)} {count}" for tool, count in top_tools]
-
-    leaderboard = sorted(
-        activity.items(),
-        key=lambda kv: sum(kv[1].get("counts", {}).values()),
-        reverse=True,
-    )[:10]
-    user_lines = []
-    for cid, entry in leaderboard:
-        total = sum(entry.get("counts", {}).values())
-        uname = entry.get("username")
-        label = _esc_md(f"@{uname}") if uname else f"id:{cid}"
-        user_lines.append(f"• {label} — `{cid}` — {total} action(s)")
-
-    role = admin_role_label(update)
-    text = (
-        f"📊 *Usage Dashboard* (viewing as {role})\n\n"
-        f"*By tool:*\n" + "\n".join(tool_lines) + "\n\n"
-        f"*Top users:*\n" + ("\n".join(user_lines) if user_lines else "_No per-user data yet._")
+        await update.message.reply_text("No usage recorded yet."); return
+    top      = rows[:12]
+    mx       = top[0][1] if top else 0
+    tool_lines = [f"`{t:<18}` {_bar(c, mx)} {c}" for t, c in top]
+    leaders  = sorted(activity.items(), key=lambda kv: sum(kv[1].get("counts",{}).values()), reverse=True)[:10]
+    user_lines = [
+        f"• {_esc_md('@'+e.get('username','')) if e.get('username') else 'id:'+cid} — `{cid}` — {sum(e.get('counts',{}).values())}"
+        for cid, e in leaders
+    ]
+    await update.message.reply_text(
+        f"📊 *Usage Dashboard* ({admin_role_label(update)})\n\n"
+        f"*By tool:*\n" + "\n".join(tool_lines) +
+        "\n\n*Top users:*\n" + ("\n".join(user_lines) or "_No per-user data yet._"),
+        parse_mode="Markdown",
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 def _resolve_target_chat_id(arg: str) -> int | None:
     arg = arg.strip().lstrip("@")
-    if arg.isdigit() or (arg.startswith("-") and arg[1:].isdigit()):
+    if arg.lstrip("-").isdigit():
         return int(arg)
-    cached = _admin_chat_ids.get(arg.lower())
-    return cached
+    return _admin_chat_ids.get(arg.lower())
 
 
 async def _resolve_target_chat_id_async(arg: str) -> int | None:
-    """Like _resolve_target_chat_id but also checks the full user-activity
-    log (not just known admins), so admins can target any user who has ever
-    used the bot, by @username."""
     direct = _resolve_target_chat_id(arg)
-    if direct is not None:
-        return direct
-    return await storage.find_chat_id_by_username(arg)
+    return direct if direct is not None else await storage.find_chat_id_by_username(arg)
 
 
 async def useractivity_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/useractivity <chat_id|@username> — admin-only recent-actions view."""
-    if not update.message:
-        return
+    if not update.message: return
     _remember_admin_chat_id(update)
     if not is_admin(update):
-        await update.message.reply_text("🚫 This command is admin-only.")
-        return
+        await update.message.reply_text("🚫 Admin only."); return
     if not context.args:
-        await update.message.reply_text("Usage: `/useractivity <chat_id or @username>`", parse_mode="Markdown")
-        return
+        await update.message.reply_text("Usage: `/useractivity <chat_id or @username>`", parse_mode="Markdown"); return
     target = await _resolve_target_chat_id_async(context.args[0])
     if target is None:
-        await update.message.reply_text("⚠️ Couldn't resolve that user (they may not have used the bot yet).")
-        return
+        await update.message.reply_text("⚠️ User not found."); return
     entry = await storage.get_user_activity(target)
     if not entry:
-        await update.message.reply_text(f"No activity recorded yet for `{target}`.", parse_mode="Markdown")
-        return
-    uname = entry.get("username")
-    label = _esc_md(f"@{uname}") if uname else "(no username on file)"
+        await update.message.reply_text(f"No activity for `{target}`.", parse_mode="Markdown"); return
+    uname  = entry.get("username")
+    label  = _esc_md(f"@{uname}") if uname else "(no username)"
     used, limit = await storage.calls_used(target)
     counts = entry.get("counts", {})
     count_lines = "\n".join(f"• `{t}` — {c}" for t, c in sorted(counts.items(), key=lambda kv: -kv[1]))
     recent = entry.get("log", [])[-10:]
-    import datetime
     recent_lines = "\n".join(
         f"• {datetime.datetime.fromtimestamp(e['ts']).strftime('%Y-%m-%d %H:%M')} — `{e['tool']}`"
         for e in reversed(recent)
     )
     await update.message.reply_text(
-        f"👤 *{label}* — chat_id `{target}`\n"
-        f"Rate limit: {used}/{limit} used in the last {storage.RATE_LIMIT_WINDOW_SECONDS}s\n\n"
-        f"*Totals by tool:*\n{count_lines or '_none_'}\n\n"
-        f"*Last {len(recent)} action(s):*\n{recent_lines or '_none_'}",
+        f"👤 *{label}* — `{target}`\n"
+        f"Rate limit: {used}/{limit}\n\n"
+        f"*Totals:*\n{count_lines or '_none_'}\n\n"
+        f"*Last {len(recent)}:*\n{recent_lines or '_none_'}",
         parse_mode="Markdown",
     )
 
 
 async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
+    if not update.message: return
     _remember_admin_chat_id(update)
-    lines = [f"*Your role:* {admin_role_label(update)}\n"]
-    lines.append("👑 *Super Admin*")
-    for info in SUPER_ADMINS.values():
-        lines.append(f"• {info['name']} — [Message]({info['telegram']}) — `{info['email']}`")
-    lines.append("\n🛡 *Admin*")
-    for info in ADMINS.values():
-        lines.append(f"• {info['name']} — [Message]({info['telegram']}) — `{info['email']}`")
+    lines = [f"*Your role:* {admin_role_label(update)}\n", "👑 *Super Admin*"]
+    lines += [f"• {i['name']} — [Message]({i['telegram']}) — `{i['email']}`" for i in SUPER_ADMINS.values()]
+    lines += ["\n🛡 *Admin*"]
+    lines += [f"• {i['name']} — [Message]({i['telegram']}) — `{i['email']}`" for i in ADMINS.values()]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
 
 
-# ── Per-user rate-limit management (admin only, except /mylimit/requestlimit) ─
-
 async def setlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
+    if not update.message: return
     _remember_admin_chat_id(update)
     if not is_admin(update):
-        await update.message.reply_text("🚫 This command is admin-only.")
-        return
+        await update.message.reply_text("🚫 Admin only."); return
     if len(context.args) < 2:
-        await update.message.reply_text(
-            "Usage: `/setlimit <chat_id or @username> <calls_per_60s>`\n"
-            "Example: `/setlimit 123456789 10` or `/setlimit 0` to block.\n"
-            "Note: @username resolves against anyone who has ever used the bot — "
-            "otherwise use their numeric chat_id.",
-            parse_mode="Markdown",
-        )
-        return
+        await update.message.reply_text("Usage: `/setlimit <chat_id|@user> <n>`", parse_mode="Markdown"); return
     target = await _resolve_target_chat_id_async(context.args[0])
     if target is None:
-        await update.message.reply_text(
-            "⚠️ Couldn't resolve that user. Send their numeric chat_id, "
-            "or an @username that has already used this bot."
-        )
-        return
+        await update.message.reply_text("⚠️ User not found."); return
     try:
-        new_limit = int(context.args[1])
+        n = int(context.args[1])
     except ValueError:
-        await update.message.reply_text("⚠️ Limit must be a number (calls per 60s).")
-        return
-    await storage.set_custom_limit(target, new_limit)
-    await update.message.reply_text(
-        f"✅ chat_id `{target}` is now limited to *{new_limit}* heavy-tool call(s) per 60s.",
-        parse_mode="Markdown",
-    )
+        await update.message.reply_text("⚠️ Limit must be a number."); return
+    await storage.set_custom_limit(target, n)
+    await update.message.reply_text(f"✅ `{target}` limited to *{n}* calls/60s.", parse_mode="Markdown")
     try:
-        await context.bot.send_message(
-            chat_id=target,
-            text=f"ℹ️ Your heavy-tool limit has been updated to {new_limit} call(s) per 60s by an admin.",
-        )
+        await context.bot.send_message(target, f"ℹ️ Your limit was updated to {n} calls/60s by an admin.")
     except Exception:
         pass
 
 
 async def resetlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
+    if not update.message: return
     _remember_admin_chat_id(update)
     if not is_admin(update):
-        await update.message.reply_text("🚫 This command is admin-only.")
-        return
+        await update.message.reply_text("🚫 Admin only."); return
     if not context.args:
-        await update.message.reply_text("Usage: `/resetlimit <chat_id or @username>`", parse_mode="Markdown")
-        return
+        await update.message.reply_text("Usage: `/resetlimit <chat_id|@user>`", parse_mode="Markdown"); return
     target = await _resolve_target_chat_id_async(context.args[0])
     if target is None:
-        await update.message.reply_text(
-            "⚠️ Couldn't resolve that user. Usage: `/resetlimit <chat_id>` or `/resetlimit @username` "
-            "(space-separated, not `chat_id|@username`).",
-            parse_mode="Markdown",
-        )
-        return
+        await update.message.reply_text("⚠️ User not found."); return
     await storage.set_custom_limit(target, None)
-    await update.message.reply_text(
-        f"♻️ chat_id `{target}` is back to the default limit "
-        f"({storage.RATE_LIMIT_HEAVY_MAX_CALLS} per {storage.RATE_LIMIT_WINDOW_SECONDS}s).",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text(f"♻️ `{target}` back to default limit.", parse_mode="Markdown")
 
 
 async def mylimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    chat_id = update.effective_chat.id
+    if not update.message: return
     if is_admin(update):
-        await update.message.reply_text(
-            f"👑 You're *{admin_role_label(update)}* — heavy-tool rate limits don't apply to you.",
-            parse_mode="Markdown",
-        )
-        return
-    used, limit = await storage.calls_used(chat_id)
+        await update.message.reply_text(f"👑 You are *{admin_role_label(update)}* — rate limits do not apply.", parse_mode="Markdown"); return
+    used, limit = await storage.calls_used(update.effective_chat.id)
     await update.message.reply_text(
-        f"📊 You've used *{used}/{limit}* heavy-tool calls in the last "
-        f"{storage.RATE_LIMIT_WINDOW_SECONDS}s.\n"
+        f"📊 *{used}/{limit}* heavy-tool calls used in the last {storage.RATE_LIMIT_WINDOW_SECONDS}s.\n"
         f"Need more? `/requestlimit <number>`",
         parse_mode="Markdown",
     )
 
 
 async def requestlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Self-service: /requestlimit <n> — notifies every admin with the
-    requester's @username AND numeric chat_id (both required, since a limit
-    can only be set against a chat_id) plus Approve/Deny buttons."""
-    if not update.message:
-        return
+    if not update.message: return
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: `/requestlimit <number>` (e.g. `/requestlimit 15`)", parse_mode="Markdown")
-        return
+        await update.message.reply_text("Usage: `/requestlimit <number>`", parse_mode="Markdown"); return
     requested = min(int(context.args[0]), MAX_LIMIT_REQUEST_VALUE)
-    chat_id = update.effective_chat.id
-    username = _username_of(update)
-    display = _display_name(update, escape_markdown=True)
-
+    chat_id   = update.effective_chat.id
+    username  = _username_of(update)
+    display   = _display_name(update, escape_markdown=True)
     await storage.add_limit_request(chat_id, username, requested)
     used, limit = await storage.calls_used(chat_id)
-
     await update.message.reply_text(
-        f"📨 Your request for a limit of *{requested}* calls/60s has been sent to the admins. "
-        f"You'll be notified once it's reviewed.",
+        f"📨 Request for *{requested}* calls/60s sent to admins. You'll be notified once reviewed.",
         parse_mode="Markdown",
     )
     await notify_admin(
@@ -2270,10 +2376,8 @@ async def requestlimit_command(update: Update, context: ContextTypes.DEFAULT_TYP
         error_key=f"limitreq-{chat_id}",
         message=(
             f"🙋 *Limit increase request*\n"
-            f"User: {display}\n"
-            f"chat_id: `{chat_id}`\n"
-            f"Current limit: {limit} (used {used} in last {storage.RATE_LIMIT_WINDOW_SECONDS}s)\n"
-            f"Requested: *{requested}* calls/60s"
+            f"User: {display}\nchat\\_id: `{chat_id}`\n"
+            f"Current: {limit} (used {used})\nRequested: *{requested}*"
         ),
         throttle=False,
         reply_markup=build_limit_request_keyboard(chat_id, requested),
@@ -2281,598 +2385,160 @@ async def requestlimit_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def pendingrequests_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
+    if not update.message: return
     _remember_admin_chat_id(update)
     if not is_admin(update):
-        await update.message.reply_text("🚫 This command is admin-only.")
-        return
+        await update.message.reply_text("🚫 Admin only."); return
     reqs = await storage.get_limit_requests()
     if not reqs:
-        await update.message.reply_text("✅ No pending limit requests.")
-        return
+        await update.message.reply_text("✅ No pending requests."); return
     for cid, info in reqs.items():
         uname = info.get("username")
         label = _esc_md(f"@{uname}") if uname else f"id:{cid}"
         await update.message.reply_text(
-            f"🙋 {label} — chat_id `{cid}` — requested *{info.get('requested')}*",
+            f"🙋 {label} — `{cid}` — requested *{info.get('requested')}*",
             parse_mode="Markdown",
             reply_markup=build_limit_request_keyboard(int(cid), int(info.get("requested", 0))),
         )
 
 
-async def handle_limit_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(update):
-        await query.answer("Admins only.", show_alert=True)
-        return
-    parts = query.data.split("|")
-    action = parts[1]
-    target_chat_id = int(parts[2])
-
-    if action == "approve":
-        requested = int(parts[3])
-        await storage.set_custom_limit(target_chat_id, requested)
-        await storage.remove_limit_request(target_chat_id)
-        await safe_edit(query.message, f"✅ Approved: chat_id `{target_chat_id}` → {requested} calls/60s.",
-                         parse_mode="Markdown")
-        try:
-            await context.bot.send_message(
-                chat_id=target_chat_id,
-                text=f"✅ Your limit request was approved — you're now at {requested} calls/60s.",
-            )
-        except Exception:
-            pass
-    else:
-        await storage.remove_limit_request(target_chat_id)
-        await safe_edit(query.message, f"❌ Denied request from chat_id `{target_chat_id}`.", parse_mode="Markdown")
-        try:
-            await context.bot.send_message(
-                chat_id=target_chat_id,
-                text="❌ Your limit increase request was denied by an admin.",
-            )
-        except Exception:
-            pass
-
-
 async def blockuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/blockuser <chat_id|@username> — super-admin only."""
-    if not update.message:
-        return
+    if not update.message: return
     _remember_admin_chat_id(update)
     if not is_super_admin(update):
-        await update.message.reply_text("🚫 This command is super-admin-only.")
-        return
+        await update.message.reply_text("🚫 Super-admin only."); return
     if not context.args:
-        await update.message.reply_text("Usage: `/blockuser <chat_id or @username>`", parse_mode="Markdown")
-        return
+        await update.message.reply_text("Usage: `/blockuser <chat_id|@user>`", parse_mode="Markdown"); return
     target = await _resolve_target_chat_id_async(context.args[0])
     if target is None:
-        await update.message.reply_text("⚠️ Couldn't resolve that user.")
-        return
+        await update.message.reply_text("⚠️ User not found."); return
     await storage.block_user(target)
-    await update.message.reply_text(f"🚫 chat_id `{target}` is now fully blocked from heavy tools.", parse_mode="Markdown")
+    await update.message.reply_text(f"🚫 `{target}` fully blocked.", parse_mode="Markdown")
 
 
 async def unblockuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/unblockuser <chat_id|@username> — super-admin only."""
-    if not update.message:
-        return
+    if not update.message: return
     _remember_admin_chat_id(update)
     if not is_super_admin(update):
-        await update.message.reply_text("🚫 This command is super-admin-only.")
-        return
+        await update.message.reply_text("🚫 Super-admin only."); return
     if not context.args:
-        await update.message.reply_text("Usage: `/unblockuser <chat_id or @username>`", parse_mode="Markdown")
-        return
+        await update.message.reply_text("Usage: `/unblockuser <chat_id|@user>`", parse_mode="Markdown"); return
     target = await _resolve_target_chat_id_async(context.args[0])
     if target is None:
-        await update.message.reply_text("⚠️ Couldn't resolve that user.")
-        return
+        await update.message.reply_text("⚠️ User not found."); return
     await storage.unblock_user(target)
-    await update.message.reply_text(f"✅ chat_id `{target}` unblocked (back to default limit).", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ `{target}` unblocked.", parse_mode="Markdown")
 
 
-# ── QR commands ─────────────────────────────────────────────────────────────────
+# ── QR, Password, Compress, Watermark ────────────────────────────────────────
 
 async def qr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
+    if not update.message: return
     text = " ".join(context.args) if context.args else ""
     if not text.strip():
-        await update.message.reply_text("Usage: `/qr <text or link>`", parse_mode="Markdown")
-        return
+        await update.message.reply_text("Usage: `/qr <text or link>`", parse_mode="Markdown"); return
     status = await update.message.reply_text("⏳ Generating QR code…")
     try:
-        png_bytes = await qr_tools.generate_qr(text.strip())
-        doc = BytesIO(png_bytes)
-        doc.name = "qrcode.png"
+        png = await qr_tools.generate_qr(text.strip())
+        doc = BytesIO(png); doc.name = "qrcode.png"
         await update.message.reply_photo(photo=doc, caption="✅ QR code ready.")
         await safe_delete(status)
         await _record(context, update, "qr_generate")
     except Exception as exc:
-        logger.warning("qr_generate failed: %s", exc)
         await safe_edit(status, _user_hint(exc))
 
 
-# ── Password commands ────────────────────────────────────────────────────────────
-
-def _parse_genpass_args(args: list[str]) -> dict:
-    length = password_tools.DEFAULT_LENGTH
-    use_symbols = False
-    no_ambiguous = False
-    for a in args:
-        if a.lstrip("-").isdigit():
-            length = int(a)
-        elif a in ("--symbols", "-s"):
-            use_symbols = True
-        elif a in ("--no-ambiguous", "-na"):
-            no_ambiguous = True
-    return {"length": length, "use_symbols": use_symbols, "no_ambiguous": no_ambiguous}
-
-
 async def genpass_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
+    if not update.message: return
     if not context.args:
-        await update.message.reply_text(
-            "🔑 Choose a length, or use `/genpass 16 --symbols --no-ambiguous`:",
-            reply_markup=build_genpass_keyboard(),
-        )
-        return
-    opts = _parse_genpass_args(context.args)
-    pw = password_tools.generate_password(
-        length=opts["length"], use_symbols=opts["use_symbols"], no_ambiguous=opts["no_ambiguous"]
-    )
+        await update.message.reply_text("🔑 Choose a length:", reply_markup=build_genpass_keyboard()); return
+    length     = password_tools.DEFAULT_LENGTH
+    use_sym    = False
+    no_ambig   = False
+    for a in context.args:
+        if a.lstrip("-").isdigit():   length  = int(a)
+        elif a in ("--symbols","-s"): use_sym = True
+        elif a in ("--no-ambiguous","-na"): no_ambig = True
+    pw = password_tools.generate_password(length=length, use_symbols=use_sym, no_ambiguous=no_ambig)
     await update.message.reply_text(f"🔑 `{pw}`", parse_mode="Markdown")
     await _record(context, update, "genpass")
 
 
 async def genpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    length = 4
-    if context.args and context.args[0].isdigit():
-        length = int(context.args[0])
-    pin = password_tools.generate_pin(length)
-    await update.message.reply_text(f"🔢 `{pin}`", parse_mode="Markdown")
+    if not update.message: return
+    length = int(context.args[0]) if context.args and context.args[0].isdigit() else 4
+    await update.message.reply_text(f"🔢 `{password_tools.generate_pin(length)}`", parse_mode="Markdown")
     await _record(context, update, "genpin")
 
 
-async def handle_genpass_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    try:
-        _, length_str = query.data.split("|", 1)
-        pw = password_tools.generate_password(length=int(length_str), use_symbols=True)
-        await query.edit_message_text(f"🔑 `{pw}`", parse_mode="Markdown")
-        await _record(context, update, "genpass")
-    except Exception:
-        await query.edit_message_text("❌ Failed to generate password.")
-
-
-async def handle_genpin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    try:
-        _, length_str = query.data.split("|", 1)
-        pin = password_tools.generate_pin(int(length_str))
-        await query.edit_message_text(f"🔢 `{pin}`", parse_mode="Markdown")
-        await _record(context, update, "genpin")
-    except Exception:
-        await query.edit_message_text("❌ Failed to generate PIN.")
-
-
-# ── Compress command ──────────────────────────────────────────────────────────
-
 async def compress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    target_bytes = DEFAULT_COMPRESS_TARGET_BYTES
+    if not update.message: return
+    target = DEFAULT_COMPRESS_TARGET
     if context.args:
         parsed = image_extra.parse_size_to_bytes(context.args[0])
-        if parsed:
-            target_bytes = parsed
-    context.user_data["awaiting"] = "compress_image"
-    context.user_data["compress_target_bytes"] = target_bytes
-    await update.message.reply_text(f"📉 Send me the photo to compress (target: ~{target_bytes // 1024} KB).")
+        if parsed: target = parsed
+    context.user_data["awaiting"]              = "compress_image"
+    context.user_data["compress_target_bytes"] = target
+    await update.message.reply_text(f"📉 Send the photo to compress (target: ~{target//1024} KB).")
 
-
-# ── Watermark handlers ────────────────────────────────────────────────────────
 
 async def watermark_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
+    if not update.message: return
     context.user_data["awaiting"] = "watermark_setup"
     await update.message.reply_text(
-        "💧 First, send me your *logo/signature image* (PNG with transparency works best) — "
-        "I'll remember it for future watermarking.",
+        "💧 Send your *logo/signature image* first (PNG with transparency works best).",
         parse_mode="Markdown",
     )
 
 
-# ── Sticker handler ───────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#  CALLBACK HANDLERS
+# ════════════════════════════════════════════════════════════════════════════
 
-async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.sticker:
-        return
-
-    awaiting = context.user_data.get("awaiting")
-    if awaiting and awaiting != "sticker2png":
-        await _warn_wrong_media(update, context, awaiting, "sticker")
-        return
-
-    sticker = update.message.sticker
-    if sticker.is_animated or sticker.is_video:
-        await update.message.reply_text(
-            "⚠️ Animated/video stickers can't be converted to a static PNG yet. "
-            "Please send a regular (static) sticker."
-        )
-        return
-    await _run_image_tool(update, context, sticker.file_id, "sticker2png")
-    context.user_data.pop("awaiting", None)
-
-
-# ── Photo handler ─────────────────────────────────────────────────────────────
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.photo:
-        return
-    awaiting = context.user_data.get("awaiting")
-    file_id  = update.message.photo[-1].file_id
-
-    if awaiting in _SINGLE_IMAGE_TOOLS:
-        await _run_image_tool(update, context, file_id, awaiting)
-        context.user_data.pop("awaiting", None)
-        return
-
-    if awaiting == "watermark_setup":
-        raw = await _download_file(context, file_id)
-        await storage.set_watermark(update.effective_chat.id, file_id)
-        context.user_data["awaiting"] = "watermark_apply"
-        await update.message.reply_text(
-            "✅ Watermark logo saved. Now send the *photo to stamp it onto*, "
-            "or pick a position first:",
-            parse_mode="Markdown",
-            reply_markup=build_watermark_position_keyboard(),
-        )
-        return
-
-    if awaiting == "watermark_apply":
-        if not await _check_heavy_rate_limit(update, "watermark"):
-            return
-        wm_file_id = await storage.get_watermark(update.effective_chat.id)
-        if not wm_file_id:
-            await update.message.reply_text("⚠️ No watermark logo saved yet. Use /watermark first.")
-            context.user_data.pop("awaiting", None)
-            return
-        status = await update.message.reply_text("⏳ Applying watermark…")
-        try:
-            base_bytes = await _download_file(context, file_id)
-            wm_bytes = await _download_file(context, wm_file_id)
-            position = context.user_data.get("watermark_position", "bottom-right")
-            async with storage.HEAVY_JOB_SEMAPHORE:
-                out_bytes = await image_extra.apply_watermark(base_bytes, wm_bytes, position=position)
-            doc = BytesIO(out_bytes)
-            doc.name = "watermarked.jpg"
-            await update.message.reply_document(document=doc, filename="watermarked.jpg")
-            await safe_delete(status)
-            await _record(context, update, "watermark")
-        except Exception as exc:
-            logger.warning("watermark failed: %s", exc)
-            await safe_edit(status, _user_hint(exc))
-            await notify_admin(context, "watermark", f"watermark failed: {exc}")
-        return
-
-    if awaiting == "compress_image":
-        if not await _check_heavy_rate_limit(update, "compress"):
-            return
-        target_bytes = context.user_data.get("compress_target_bytes", DEFAULT_COMPRESS_TARGET_BYTES)
-        status = await update.message.reply_text("⏳ Compressing…")
-        try:
-            raw = await _download_file(context, file_id)
-            async with storage.HEAVY_JOB_SEMAPHORE:
-                out_bytes = await image_extra.compress_to_target(raw, target_bytes)
-            doc = BytesIO(out_bytes)
-            doc.name = "compressed.jpg"
-            await update.message.reply_document(
-                document=doc, filename="compressed.jpg",
-                caption=f"✅ {len(out_bytes) / 1024:.0f} KB (target ~{target_bytes // 1024} KB)",
-            )
-            await safe_delete(status)
-            await _record(context, update, "compress")
-        except Exception as exc:
-            logger.warning("compress failed: %s", exc)
-            await safe_edit(status, _user_hint(exc))
-            await notify_admin(context, "compress", f"compress failed: {exc}")
-        finally:
-            context.user_data.pop("awaiting", None)
-            context.user_data.pop("compress_target_bytes", None)
-        return
-
-    if awaiting == "qrscan":
-        status = await update.message.reply_text("⏳ Scanning for QR codes…")
-        try:
-            raw = await _download_file(context, file_id)
-            results = await qr_tools.scan_qr(raw)
-            if not results:
-                await safe_edit(status, "❌ No QR code found in that image.")
-            else:
-                text = "\n\n".join(f"🔗 `{r}`" for r in results)
-                await safe_edit(status, f"✅ *Found {len(results)} code(s):*\n\n{text}", parse_mode="Markdown")
-            await _record(context, update, "qr_scan")
-        except Exception as exc:
-            logger.warning("qr_scan failed: %s", exc)
-            await safe_edit(status, _user_hint(exc))
-        finally:
-            context.user_data.pop("awaiting", None)
-        return
-
-    if awaiting and awaiting not in ("effects",):
-        await _warn_wrong_media(update, context, awaiting, "photo")
-        return
-
-    context.user_data.pop("awaiting", None)
-    token = _store_token(context.bot_data, file_id)
-    await update.message.reply_text(
-        "🎨 *Choose a category:*", parse_mode="Markdown", reply_markup=build_effect_categories_keyboard(token),
+async def handle_effect_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query; await query.answer()
+    try: _, category, token = query.data.split("|", 2)
+    except ValueError: await query.edit_message_text("❌ Invalid."); return
+    if not _get_file_id(context.bot_data, token):
+        await query.edit_message_text("❌ Request expired — please resend the photo."); return
+    await query.edit_message_text(
+        f"🎨 *{EFFECT_CATEGORIES.get(category, category)}* — choose an effect:",
+        parse_mode="Markdown", reply_markup=build_effect_keyboard(category, token),
     )
 
 
-async def _warn_wrong_media(update: Update, context: ContextTypes.DEFAULT_TYPE, awaiting: str, got_kind: str) -> None:
-    label = _AWAITING_LABELS.get(awaiting, awaiting)
-    await update.message.reply_text(
-        f"⚠️ I'm waiting for input for *{label}*, but got a {got_kind}.\n"
-        f"Send the right file/text, or /cancel to stop that task.",
-        parse_mode="Markdown",
-    )
+async def handle_effect_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query; await query.answer()
+    try: _, token = query.data.split("|", 1)
+    except ValueError: await query.edit_message_text("❌ Invalid."); return
+    if not _get_file_id(context.bot_data, token):
+        await query.edit_message_text("❌ Request expired — please resend the photo."); return
+    await query.edit_message_text("🎨 *Choose a category:*", parse_mode="Markdown", reply_markup=build_effect_categories_keyboard(token))
 
-
-# ── Document handler ──────────────────────────────────────────────────────────
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.document:
-        return
-    doc      = update.message.document
-    awaiting = context.user_data.get("awaiting")
-    file_name = (doc.file_name or "").lower()
-    mime      = doc.mime_type or ""
-
-    if not awaiting:
-        _EXT_HINTS = {
-            ".pdf":  "📄 PDF detected! Go to /menu → *PDF Tools* to convert it.",
-            ".docx": "📝 DOCX detected! Go to /menu → *Word / Doc* to convert it.",
-            ".doc":  "📄 DOC detected! Go to /menu → *Word / Doc* → DOC → DOCX.",
-            ".xlsx": "📊 XLSX detected! Go to /menu → *Spreadsheet* to convert it.",
-            ".xls":  "📊 XLS detected! Go to /menu → *Spreadsheet* → XLS → XLSX.",
-            ".csv":  "📃 CSV detected! Go to /menu → *Spreadsheet* → CSV → XLSX.",
-            ".pptx": "📽 PPTX detected! Go to /menu → *Presentation* to convert it.",
-            ".ppt":  "📽 PPT detected! Go to /menu → *Presentation* → PPT → PPTX.",
-            ".md":   "📝 Markdown detected! Go to /menu → *Text & Markup* to convert it.",
-            ".txt":  "📃 TXT detected! Go to /menu → *Text & Markup* → TXT → PDF.",
-            ".html": "🌐 HTML detected! Go to /menu → *Text & Markup* → HTML → PDF.",
-            ".rtf":  "📄 RTF detected! Go to /menu → *Text & Markup* to convert it.",
-            ".odt":  "📄 ODT detected! Go to /menu → *Word / Doc* to convert it.",
-            ".epub": "📚 EPUB detected! Go to /menu → *More →* → EPUB → PDF.",
-            ".gif":  f"🎞 GIF detected! Go to /menu → GIF → Frames (up to {GIF_MAX_FRAMES} frames).",
-        }
-        for ext, hint in _EXT_HINTS.items():
-            if file_name.endswith(ext):
-                await update.message.reply_text(hint, parse_mode="Markdown", reply_markup=build_main_menu_keyboard())
-                return
-        await update.message.reply_text(
-            "Please choose a tool first with /menu, then send the file.",
-            reply_markup=build_main_menu_keyboard(),
-        )
-        return
-
-    if awaiting in _SINGLE_IMAGE_TOOLS:
-        if not (mime.startswith("image/") or any(
-            file_name.endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".gif")
-        )):
-            await update.message.reply_text("⚠️ That doesn't look like an image file. Please send an image.")
-            return
-        await _run_image_tool(update, context, doc.file_id, awaiting)
-        context.user_data.pop("awaiting", None)
-        return
-
-    if awaiting == "gif2frames":
-        if not (file_name.endswith(".gif") or mime == "image/gif"):
-            await update.message.reply_text("⚠️ Please send a .gif file.")
-            return
-        await _run_gif_tool(update, context, doc.file_id)
-        context.user_data.pop("awaiting", None)
-        return
-
-    if awaiting == "pdf2img":
-        if not await _check_heavy_rate_limit(update, "pdf2img"):
-            return
-        if not (file_name.endswith(".pdf") or mime == "application/pdf"):
-            await update.message.reply_text("⚠️ Please send a .pdf file.")
-            return
-        status = await update.message.reply_text("⏳ Rendering PDF pages…")
-        try:
-            pdf_bytes = await _download_file(context, doc.file_id)
-            async with storage.HEAVY_JOB_SEMAPHORE:
-                pages = await pdf_to_images(pdf_bytes)
-            if not pages:
-                await safe_edit(status, "❌ Couldn't render any pages from that PDF.")
-                return
-            await safe_delete(status)
-            for batch_start in range(0, len(pages), 10):
-                batch = pages[batch_start:batch_start + 10]
-                await update.message.reply_media_group([InputMediaPhoto(BytesIO(p)) for p in batch])
-            if len(pages) >= PDF2IMG_MAX_PAGES:
-                await update.message.reply_text(f"ℹ️ Only the first {PDF2IMG_MAX_PAGES} pages were rendered.")
-            await _record(context, update, "pdf2img")
-        except Exception as exc:
-            logger.warning("pdf2img failed: %s", exc)
-            await safe_edit(status, _user_hint(exc))
-            await notify_admin(context, "pdf2img", f"pdf2img failed: {exc}")
-        finally:
-            context.user_data.pop("awaiting", None)
-        return
-
-    if awaiting == "md2txt":
-        if not file_name.endswith(".md"):
-            await update.message.reply_text("⚠️ Please send a .md (Markdown) file.")
-            return
-        status = await update.message.reply_text("⏳ Converting…")
-        try:
-            md_bytes = await _download_file(context, doc.file_id)
-            plain    = markdown_to_plain_text(md_bytes.decode("utf-8", errors="replace"))
-            out_name = re.sub(r"\.md$", ".txt", doc.file_name or "output.md", flags=re.IGNORECASE)
-            out_doc  = BytesIO(plain.encode("utf-8"))
-            out_doc.name = out_name
-            await update.message.reply_document(document=out_doc, filename=out_name)
-            await safe_delete(status)
-            await _record(context, update, "md2txt")
-        except Exception as exc:
-            logger.warning("md2txt failed: %s", exc)
-            await safe_edit(status, _user_hint(exc))
-        finally:
-            context.user_data.pop("awaiting", None)
-        return
-
-    if awaiting == "fiver_sanitize":
-        if file_name.endswith(".txt") or mime == "text/plain":
-            status = await update.message.reply_text("⏳ Sanitizing…")
-            try:
-                raw = await _download_file(context, doc.file_id)
-                text = raw.decode("utf-8", errors="replace")
-                if len(text) > FIVER_SANITIZE_MAX_CHARS:
-                    await safe_edit(status, f"⚠️ Too long ({len(text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}.")
-                    return
-                custom_words = await storage.get_words(update.effective_chat.id)
-                sanitized = sanitize_fiver_text(text, custom_words)
-                out_doc = BytesIO(sanitized.encode("utf-8"))
-                out_doc.name = "sanitized.txt"
-                await update.message.reply_document(document=out_doc, filename="sanitized.txt")
-                await safe_delete(status)
-                await _record(context, update, "fiver_sanitize")
-            except Exception as exc:
-                logger.warning("fiver_sanitize (file) failed: %s", exc)
-                await safe_edit(status, _user_hint(exc))
-            finally:
-                context.user_data.pop("awaiting", None)
-        else:
-            await update.message.reply_text("⚠️ Please send a .txt file, or just type the message directly.")
-        return
-
-    if awaiting == "compress_image":
-        if not (mime.startswith("image/") or any(file_name.endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp"))):
-            await update.message.reply_text("⚠️ Please send an image file.")
-            return
-        if not await _check_heavy_rate_limit(update, "compress"):
-            return
-        target_bytes = context.user_data.get("compress_target_bytes", DEFAULT_COMPRESS_TARGET_BYTES)
-        status = await update.message.reply_text("⏳ Compressing…")
-        try:
-            raw = await _download_file(context, doc.file_id)
-            async with storage.HEAVY_JOB_SEMAPHORE:
-                out_bytes = await image_extra.compress_to_target(raw, target_bytes)
-            out_doc = BytesIO(out_bytes)
-            out_doc.name = "compressed.jpg"
-            await update.message.reply_document(
-                document=out_doc, filename="compressed.jpg",
-                caption=f"✅ {len(out_bytes) / 1024:.0f} KB (target ~{target_bytes // 1024} KB)",
-            )
-            await safe_delete(status)
-            await _record(context, update, "compress")
-        except Exception as exc:
-            logger.warning("compress failed: %s", exc)
-            await safe_edit(status, _user_hint(exc))
-        finally:
-            context.user_data.pop("awaiting", None)
-            context.user_data.pop("compress_target_bytes", None)
-        return
-
-    if awaiting == "qrscan":
-        if not (mime.startswith("image/") or any(file_name.endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp"))):
-            await update.message.reply_text("⚠️ Please send an image file containing a QR code.")
-            return
-        status = await update.message.reply_text("⏳ Scanning for QR codes…")
-        try:
-            raw = await _download_file(context, doc.file_id)
-            results = await qr_tools.scan_qr(raw)
-            if not results:
-                await safe_edit(status, "❌ No QR code found in that image.")
-            else:
-                text = "\n\n".join(f"🔗 `{r}`" for r in results)
-                await safe_edit(status, f"✅ *Found {len(results)} code(s):*\n\n{text}", parse_mode="Markdown")
-            await _record(context, update, "qr_scan")
-        except Exception as exc:
-            logger.warning("qr_scan (file) failed: %s", exc)
-            await safe_edit(status, _user_hint(exc))
-        finally:
-            context.user_data.pop("awaiting", None)
-        return
-
-    if awaiting in _DOC_TOOLS or awaiting == "pptx2images":
-        if not _doc_accepts(awaiting, mime, file_name):
-            exts = " / ".join(_DOC_ACCEPTS.get(awaiting, ([], [".file"]))[1])
-            await update.message.reply_text(f"⚠️ That file type doesn't match this tool. Expected: `{exts}`", parse_mode="Markdown")
-            return
-        await _run_doc_tool(update, context, doc.file_id, awaiting)
-        context.user_data.pop("awaiting", None)
-        return
-
-    await update.message.reply_text("Please choose a tool first with /menu.", reply_markup=build_main_menu_keyboard())
-
-
-# ── Animation / GIF handler ───────────────────────────────────────────────────
-
-async def handle_animation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.animation:
-        return
-    awaiting = context.user_data.get("awaiting")
-
-    if awaiting and awaiting != "gif2frames":
-        await _warn_wrong_media(update, context, awaiting, "GIF")
-        return
-
-    if awaiting == "gif2frames":
-        await _run_gif_tool(update, context, update.message.animation.file_id)
-        context.user_data.pop("awaiting", None)
-    else:
-        await update.message.reply_text(f"🎞 GIF detected! Extracting up to {GIF_MAX_FRAMES} frames…")
-        await _run_gif_tool(update, context, update.message.animation.file_id)
-
-
-# ── Callback handlers ─────────────────────────────────────────────────────────
 
 async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    try:
-        _, effect_key, token = query.data.split("|", 2)
-    except ValueError:
-        await query.edit_message_text("❌ Invalid selection.")
-        return
-
+    query = update.callback_query; await query.answer()
+    try: _, effect_key, token = query.data.split("|", 2)
+    except ValueError: await query.edit_message_text("❌ Invalid."); return
     file_id = _get_file_id(context.bot_data, token)
     if not file_id:
-        await query.edit_message_text("❌ Request expired — please resend the photo.")
-        return
-
-    effect_label = EFFECT_NAMES.get(effect_key, effect_key)
-    status_msg = await query.edit_message_text(f"⏳ Applying *{effect_label}*… please wait.", parse_mode="Markdown")
+        await query.edit_message_text("❌ Request expired — please resend the photo."); return
+    label = EFFECT_NAMES.get(effect_key, effect_key)
+    status_msg = await query.edit_message_text(f"⏳ Applying *{label}*…", parse_mode="Markdown")
     try:
         await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_PHOTO)
         image_bytes = await _download_file(context, file_id)
-        w, h = _get_image_dimensions(image_bytes)
+        w, h        = _get_image_dimensions(image_bytes)
         async with storage.HEAVY_JOB_SEMAPHORE:
             png_bytes = await apply_effect_to_image(image_bytes, effect_key, w, h)
-        doc = BytesIO(png_bytes)
-        doc.name = f"{effect_key}.png"
+        doc = BytesIO(png_bytes); doc.name = f"{effect_key}.png"
         await query.message.reply_document(
             document=doc, filename=f"{effect_key}.png",
-            caption=truncate_caption(f"✅ {effect_label} applied ({w}×{h}px)"),
+            caption=truncate_caption(f"✅ {label} applied ({w}×{h}px)"),
         )
-        await safe_edit(status_msg, f"✅ *{effect_label}* done!", parse_mode="Markdown")
+        await safe_edit(status_msg, f"✅ *{label}* done!", parse_mode="Markdown")
         _drop_token(context.bot_data, token)
-        await _record(context, update, "effects")
+        await _record(context, update, f"effect:{effect_key}")  # per-effect tracking
     except asyncio.TimeoutError:
         await safe_edit(status_msg, "⏱ Timed out — try a smaller image.")
     except Exception as exc:
@@ -2881,137 +2547,49 @@ async def handle_effect_callback(update: Update, context: ContextTypes.DEFAULT_T
         await notify_admin(context, "effects", f"Effect `{effect_key}` failed: {exc}")
 
 
-async def handle_effect_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    try:
-        _, category, token = query.data.split("|", 2)
-    except ValueError:
-        await query.edit_message_text("❌ Invalid selection.")
-        return
-    if not _get_file_id(context.bot_data, token):
-        await query.edit_message_text("❌ Request expired — please resend the photo.")
-        return
-    cat_label = EFFECT_CATEGORIES.get(category, category)
-    await query.edit_message_text(
-        f"🎨 *{cat_label}* — choose an effect:", parse_mode="Markdown", reply_markup=build_effect_keyboard(category, token),
-    )
-
-
-async def handle_effect_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    try:
-        _, token = query.data.split("|", 1)
-    except ValueError:
-        await query.edit_message_text("❌ Invalid selection.")
-        return
-    if not _get_file_id(context.bot_data, token):
-        await query.edit_message_text("❌ Request expired — please resend the photo.")
-        return
-    await query.edit_message_text(
-        "🎨 *Choose a category:*", parse_mode="Markdown", reply_markup=build_effect_categories_keyboard(token),
-    )
-
-
-async def handle_watermark_position_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    try:
-        _, position = query.data.split("|", 1)
-    except ValueError:
-        await query.edit_message_text("❌ Invalid selection.")
-        return
-    context.user_data["watermark_position"] = position
-    context.user_data["awaiting"] = "watermark_apply"
-    await query.edit_message_text(f"✅ Position set to *{position}*. Now send the photo to stamp.", parse_mode="Markdown")
-
-
 async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    try:
-        _, action = query.data.split("|", 1)
-    except ValueError:
-        await query.edit_message_text("❌ Invalid selection.")
-        return
+    query = update.callback_query; await query.answer()
+    try: _, action = query.data.split("|", 1)
+    except ValueError: await query.edit_message_text("❌ Invalid."); return
 
     _TOOL_PROMPTS: dict[str, tuple[str, str]] = {
-        "effects":     ("effects",    "🎨 Send me a *photo* and pick an effect."),
-        "bgremove":    ("bgremove",   "🧹 Send me a *photo* — I'll remove its background."),
-        "sticker2png": ("sticker2png","😄 Send me a *static sticker* and I'll convert it to PNG."),
-        "gif2frames":  ("gif2frames", f"🎞 Send me a *GIF* and I'll extract up to {GIF_MAX_FRAMES} frames."),
-        "img2pdf":     ("img2pdf",    "🖼 Send me an *image* (photo or file) and I'll wrap it into a PDF."),
-        "pdf2img":     ("pdf2img",    f"📄 Send me a *PDF file* — I'll render up to {PDF2IMG_MAX_PAGES} pages as images."),
-        "jpg2png":     ("jpg2png",    "🔁 Send me a *JPEG image* as a *file* for best quality."),
-        "png2jpg":     ("png2jpg",    "🔁 Send me a *PNG image* as a *file*."),
-        "fiversanitize": ("fiver_sanitize", "🛡️ Send me the message you want to sanitize."),
-        "compress":    ("compress_image", "📉 Send me the photo to compress (default target: 1 MB). Use /compress 500kb for a custom target."),
-        "qrscan":      ("qrscan",      "🔍 Send me a photo containing a QR code."),
-        "pdf2docx":    ("pdf2docx",   "📄 Send me a *PDF file* → I'll convert it to DOCX."),
-        "pdf2txt":     ("pdf2txt",    "📄 Send me a *PDF file* → I'll extract plain text."),
-        "docx2pdf":    ("docx2pdf",   "📝 Send me a *.docx file* → I'll convert it to PDF."),
-        "docx2txt":    ("docx2txt",   "📝 Send me a *.docx file* → I'll extract plain text."),
-        "docx2html":   ("docx2html",  "📝 Send me a *.docx file* → I'll convert it to HTML."),
-        "doc2docx":    ("doc2docx",   "📄 Send me a *.doc file* → I'll convert it to DOCX."),
-        "odt2pdf":     ("odt2pdf",    "📄 Send me an *.odt file* → I'll convert it to PDF."),
-        "odt2docx":    ("odt2docx",   "📄 Send me an *.odt file* → I'll convert it to DOCX."),
-        "xlsx2pdf":    ("xlsx2pdf",   "📊 Send me an *.xlsx file* → I'll convert it to PDF."),
-        "xlsx2csv":    ("xlsx2csv",   "📊 Send me an *.xlsx file* → I'll export the first sheet as CSV."),
-        "csv2xlsx":    ("csv2xlsx",   "📃 Send me a *.csv file* → I'll build an XLSX spreadsheet."),
-        "xls2xlsx":    ("xls2xlsx",   "📊 Send me an *.xls file* → I'll convert it to XLSX."),
-        "pptx2pdf":    ("pptx2pdf",   "📽 Send me a *.pptx file* → I'll convert it to PDF."),
-        "pptx2images": ("pptx2images","📽 Send me a *.pptx file* → I'll render each slide as an image."),
-        "ppt2pptx":    ("ppt2pptx",   "📽 Send me a *.ppt file* → I'll convert it to PPTX."),
-        "txt2pdf":     ("txt2pdf",    "📃 Send me a *.txt file* → I'll convert it to PDF."),
-        "html2pdf":    ("html2pdf",   "🌐 Send me an *.html file* → I'll render it as PDF."),
-        "md2pdf":      ("md2pdf",     "📝 Send me a *.md file* → I'll convert it to PDF."),
-        "md2txt":      ("md2txt",     "📝 Send me a *.md file* → I'll convert it to plain TXT."),
-        "md2docx":     ("md2docx",    "📝 Send me a *.md file* → I'll convert it to DOCX."),
-        "rtf2txt":     ("rtf2txt",    "📄 Send me a *.rtf file* → I'll strip it to plain text."),
-        "rtf2pdf":     ("rtf2pdf",    "📄 Send me a *.rtf file* → I'll convert it to PDF."),
-        "epub2pdf":    ("epub2pdf",   "📚 Send me an *.epub file* → I'll convert it to PDF."),
+        "effects":     ("effects",        "🎨 Send me a *photo* and pick an effect."),
+        "bgremove":    ("bgremove",        "🧹 Send me a *photo* — I'll remove the background."),
+        "sticker2png": ("sticker2png",     "😄 Send me a *static sticker* to convert to PNG."),
+        "gif2frames":  ("gif2frames",      f"🎞 Send me a *GIF* — I'll extract up to {GIF_MAX_FRAMES} frames."),
+        "img2pdf":     ("img2pdf",         "🖼 Send me an *image* — I'll wrap it into a PDF."),
+        "pdf2img":     ("pdf2img",         f"📄 Send me a *PDF* — I'll render up to {PDF2IMG_MAX_PAGES} pages."),
+        "jpg2png":     ("jpg2png",         "🔁 Send me a *JPEG* as a file for best quality."),
+        "png2jpg":     ("png2jpg",         "🔁 Send me a *PNG* as a file."),
+        "fiversanitize":("fiver_sanitize", "🛡 Send me the message to sanitise."),
+        "compress":    ("compress_image",  f"📉 Send me the photo to compress (default ~{DEFAULT_COMPRESS_TARGET//1024} KB)."),
+        "qrscan":      ("qrscan",          "🔍 Send me a photo containing a QR code."),
+        **{t: (t, f"Send me the file for `{t}`.") for t in _DOC_ACCEPTS},
     }
 
     if action == "translate":
-        await query.edit_message_text(
-            "🌐 *Choose the target language:*", parse_mode="Markdown", reply_markup=build_translate_lang_keyboard(),
-        )
-        return
-
+        await query.edit_message_text("🌐 *Choose target language:*", parse_mode="Markdown", reply_markup=build_translate_lang_keyboard()); return
     if action == "watermark":
         context.user_data["awaiting"] = "watermark_setup"
-        await query.edit_message_text("💧 First, send me your *logo/signature image*.", parse_mode="Markdown")
-        return
-
+        await query.edit_message_text("💧 Send your *logo/signature image* first.", parse_mode="Markdown"); return
     if action == "genpass":
-        await query.edit_message_text("🔑 Choose a length:", reply_markup=build_genpass_keyboard())
-        return
-
+        await query.edit_message_text("🔑 Choose a length:", reply_markup=build_genpass_keyboard()); return
     if action == "qrgen":
-        await query.edit_message_text("🔳 Send `/qr <text or link>` to generate a QR code.", parse_mode="Markdown")
-        return
-
+        await query.edit_message_text("🔳 Send `/qr <text or link>` to generate a QR code.", parse_mode="Markdown"); return
     if action == "mywords":
         words = await storage.get_words(query.message.chat_id)
         if not words:
-            await query.edit_message_text(
-                "You have no custom words yet. Add one with `/addword <word> <replacement>`.",
-                parse_mode="Markdown",
-            )
+            await query.edit_message_text("No custom words yet. Use `/addword <word> <replacement>`.", parse_mode="Markdown")
         else:
             preview = "\n".join(f"• `{w}` → `{r}`" for w, r in list(sorted(words.items()))[:20])
             await query.edit_message_text(
-                f"📚 *Your custom words* ({len(words)} total):\n\n{preview}\n\n"
-                "Use /mywords for the full paginated list.",
+                f"📚 *Custom words* ({len(words)} total):\n\n{preview}\n\nUse /mywords for the full list.",
                 parse_mode="Markdown",
             )
         return
-
     if action == "effects":
         context.user_data["awaiting"] = "effects"
-        await query.edit_message_text("🎨 Send me a *photo* and pick an effect.", parse_mode="Markdown")
-        return
+        await query.edit_message_text("🎨 Send me a *photo* and I'll show the effect categories.", parse_mode="Markdown"); return
 
     if action in _TOOL_PROMPTS:
         tool_key, msg = _TOOL_PROMPTS[action]
@@ -3022,101 +2600,598 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    try:
-        _, cat = query.data.split("|", 1)
-    except ValueError:
-        await query.edit_message_text("❌ Invalid selection.")
-        return
-
+    query = update.callback_query; await query.answer()
+    try: _, cat = query.data.split("|", 1)
+    except ValueError: await query.edit_message_text("❌ Invalid."); return
     if cat == "back":
-        await query.edit_message_text(MENU_INTRO, parse_mode="Markdown", reply_markup=build_main_menu_keyboard())
-        return
-
-    cat_labels = {
-        "image": "🖼 Image Tools",
-        "pdf":   "📄 PDF Tools",
-        "word":  "📝 Word / Doc",
-        "sheet": "📊 Spreadsheet",
-        "ppt":   "📽 Presentation",
-        "text":  "✍️ Text & Markup",
-        "more":  "📚 More Tools",
+        await query.edit_message_text(MENU_INTRO, parse_mode="Markdown", reply_markup=build_main_menu_keyboard()); return
+    labels = {
+        "image":"🖼 Image Tools","pdf":"📄 PDF Tools","word":"📝 Documents",
+        "sheet":"📊 Spreadsheet","ppt":"📽 Presentation","text":"✍️ Text & Markup",
+        "color":"🎨 Colour Tools","dev":"🔧 Dev Tools","more":"📚 More",
     }
-    label = cat_labels.get(cat, cat.title())
-    await query.edit_message_text(f"*{label}* — choose a conversion:", parse_mode="Markdown", reply_markup=build_category_keyboard(cat))
+    await query.edit_message_text(
+        f"*{labels.get(cat, cat.title())}* — choose a tool:",
+        parse_mode="Markdown", reply_markup=build_category_keyboard(cat),
+    )
+
+
+async def handle_color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles color|<tool> callbacks — prompts user for input."""
+    query = update.callback_query; await query.answer()
+    try: _, tool = query.data.split("|", 1)
+    except ValueError: await query.edit_message_text("❌ Invalid."); return
+
+    prompts = {
+        "convert":   "🔄 Send a colour in any format:\n`#FF5733`  or  `255 87 51`  or  `rgb(255,87,51)`",
+        "contrast":  "✅ Send two colours separated by a newline:\n`#FFFFFF`\n`#333333`",
+        "gradient":  "🌈 Send a hex colour to generate gradient CSS:\n`#FF5733`",
+        "shadow":    "💧 Send a hex colour to generate shadow CSS:\n`#FF5733`",
+        "tintshade": "🖌 Send a hex colour to generate tints & shades:\n`#FF5733`",
+    }
+    context.user_data["awaiting"]    = "color_input"
+    context.user_data["color_tool"]  = tool
+    await query.edit_message_text(prompts.get(tool, "Send colour input:"), parse_mode="Markdown", reply_markup=build_color_input_keyboard(tool))
+
+
+async def handle_dev_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles dev|<tool> callbacks."""
+    query = update.callback_query; await query.answer()
+    try: _, tool = query.data.split("|", 1)
+    except ValueError: await query.edit_message_text("❌ Invalid."); return
+
+    # Stateless / instant tools
+    if tool == "uuid":
+        await query.edit_message_text(f"🆔 {generate_uuid()}", parse_mode="Markdown", reply_markup=build_dev_input_keyboard(tool)); return
+    if tool == "lorem":
+        await query.edit_message_text(f"📝 {lorem_ipsum(50)}", reply_markup=build_dev_input_keyboard(tool)); return
+
+    # Tools that need case buttons
+    if tool == "case":
+        context.user_data["awaiting"]  = "dev_input"
+        context.user_data["dev_tool"]  = "case_text"
+        await query.edit_message_text("🔤 Send the text to convert:", parse_mode="Markdown", reply_markup=build_dev_input_keyboard(tool)); return
+
+    prompts = {
+        "json":      "📋 Send the JSON to format/validate:",
+        "hash":      "🔑 Send the text to hash:",
+        "timestamp": "⏰ Send a Unix timestamp (`1700000000`) or ISO date (`2024-01-15T12:00:00`):",
+        "pxrem":     "📐 Send a pixel value (e.g. `16` or `24px`):",
+        "urlencode": "🔗 Send the text to URL-encode:",
+        "urldecode": "🔗 Send the encoded URL to decode:",
+        "b64enc":    "💻 Send the text to Base64-encode:",
+        "b64dec":    "💻 Send the Base64 string to decode:",
+        "wordcount": "📊 Send the text to count:",
+        "diff":      "🔀 Send *Text A*, then on a new message *Text B*.\n\nFirst — send Text A:",
+        "regex":     "🔍 Send `<pattern>\\n<text>` (pattern on first line, text below):",
+    }
+    context.user_data["awaiting"]  = "dev_input"
+    context.user_data["dev_tool"]  = tool
+    await query.edit_message_text(prompts.get(tool, "Send input:"), parse_mode="Markdown", reply_markup=build_dev_input_keyboard(tool))
+
+
+async def handle_case_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query; await query.answer()
+    try: _, mode = query.data.split("|", 1)
+    except ValueError: await query.edit_message_text("❌ Invalid."); return
+    text = context.user_data.pop("case_input", "")
+    if not text:
+        await query.edit_message_text("⚠️ No text stored. Please restart the tool."); return
+    result = convert_case(text, mode)
+    await query.edit_message_text(f"🔤 *{mode}:*\n\n`{result}`", parse_mode="Markdown", reply_markup=build_dev_input_keyboard("case"))
+
+
+async def handle_fiver_reportcard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query; await query.answer()
+    context.user_data["awaiting"]      = "fiver_profile"
+    context.user_data["fiver_profile"] = ""
+    context.user_data["fiver_client"]  = ""
+    context.user_data["fiver_order"]   = ""
+    await query.edit_message_text(
+        "📋 Let's fill the report card.\n\n*Step 1/3* — Send your *Profile* name:",
+        parse_mode="Markdown",
+    )
 
 
 async def handle_translate_lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    try:
-        _, lang_code = query.data.split("|", 1)
-    except ValueError:
-        await query.edit_message_text("❌ Invalid selection.")
-        return
-    lang_label = next((label for code, label in TRANSLATE_LANGUAGES if code == lang_code), lang_code)
+    query = update.callback_query; await query.answer()
+    try: _, lang_code = query.data.split("|", 1)
+    except ValueError: await query.edit_message_text("❌ Invalid."); return
+    lang_label = next((l for c, l in TRANSLATE_LANGUAGES if c == lang_code), lang_code)
     context.user_data["awaiting"]    = "translate_text"
     context.user_data["target_lang"] = lang_code
-    await query.edit_message_text(f"✏️ Send me the text to translate to *{lang_label}*.", parse_mode="Markdown")
+    await query.edit_message_text(f"✏️ Send the text to translate to *{lang_label}*.", parse_mode="Markdown")
+
+
+async def handle_watermark_position_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query; await query.answer()
+    try: _, position = query.data.split("|", 1)
+    except ValueError: await query.edit_message_text("❌ Invalid."); return
+    context.user_data["watermark_position"] = position
+    context.user_data["awaiting"]           = "watermark_apply"
+    await query.edit_message_text(f"✅ Position set to *{position}*. Now send the photo to stamp.", parse_mode="Markdown")
+
+
+async def handle_genpass_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query; await query.answer()
+    try:
+        _, length_str = query.data.split("|", 1)
+        pw = password_tools.generate_password(length=int(length_str), use_symbols=True)
+        await query.edit_message_text(f"🔑 `{pw}`", parse_mode="Markdown")
+        await _record(context, update, "genpass")
+    except Exception:
+        await query.edit_message_text("❌ Failed to generate password.")
+
+
+async def handle_genpin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query; await query.answer()
+    try:
+        _, length_str = query.data.split("|", 1)
+        await query.edit_message_text(f"🔢 `{password_tools.generate_pin(int(length_str))}`", parse_mode="Markdown")
+        await _record(context, update, "genpin")
+    except Exception:
+        await query.edit_message_text("❌ Failed to generate PIN.")
+
+
+async def handle_limit_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query; await query.answer()
+    if not is_admin(update):
+        await query.answer("Admins only.", show_alert=True); return
+    parts     = query.data.split("|")
+    action    = parts[1]
+    target_id = int(parts[2])
+    if action == "approve":
+        requested = int(parts[3])
+        await storage.set_custom_limit(target_id, requested)
+        await storage.remove_limit_request(target_id)
+        await safe_edit(query.message, f"✅ Approved: `{target_id}` → {requested} calls/60s.", parse_mode="Markdown")
+        try: await context.bot.send_message(target_id, f"✅ Your limit request was approved — now {requested} calls/60s.")
+        except Exception: pass
+    else:
+        await storage.remove_limit_request(target_id)
+        await safe_edit(query.message, f"❌ Denied request from `{target_id}`.", parse_mode="Markdown")
+        try: await context.bot.send_message(target_id, "❌ Your limit increase request was denied.")
+        except Exception: pass
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  MEDIA HANDLERS
+# ════════════════════════════════════════════════════════════════════════════
+
+async def _warn_wrong_media(update: Update, context: ContextTypes.DEFAULT_TYPE, awaiting: str, got: str) -> None:
+    label = _AWAITING_LABELS.get(awaiting, awaiting)
+    await update.message.reply_text(
+        f"⚠️ I'm waiting for *{label}* input, but got a {got}.\n"
+        f"Send the correct input or /cancel.",
+        parse_mode="Markdown",
+    )
+
+
+async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.sticker: return
+    awaiting = context.user_data.get("awaiting")
+    if awaiting and awaiting != "sticker2png":
+        await _warn_wrong_media(update, context, awaiting, "sticker"); return
+    sticker = update.message.sticker
+    if sticker.is_animated or sticker.is_video:
+        await update.message.reply_text("⚠️ Animated/video stickers can't be converted to static PNG."); return
+    await _run_image_tool(update, context, sticker.file_id, "sticker2png")
+    context.user_data.pop("awaiting", None)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.photo: return
+    awaiting = context.user_data.get("awaiting")
+    file_id  = update.message.photo[-1].file_id
+
+    if awaiting in _SINGLE_IMAGE_TOOLS:
+        await _run_image_tool(update, context, file_id, awaiting)
+        context.user_data.pop("awaiting", None); return
+
+    if awaiting == "watermark_setup":
+        await storage.set_watermark(update.effective_chat.id, file_id)
+        _watermark_cache[file_id] = await _download_file(context, file_id)  # pre-cache
+        context.user_data["awaiting"] = "watermark_apply"
+        await update.message.reply_text(
+            "✅ Logo saved. Now send the *photo* to stamp, or pick a position:",
+            parse_mode="Markdown", reply_markup=build_watermark_position_keyboard(),
+        ); return
+
+    if awaiting == "watermark_apply":
+        if not await _check_heavy_rate_limit(update, "watermark"): return
+        wm_file_id = await storage.get_watermark(update.effective_chat.id)
+        if not wm_file_id:
+            await update.message.reply_text("⚠️ No logo saved yet. Use /watermark first.")
+            context.user_data.pop("awaiting", None); return
+        status = await update.message.reply_text("⏳ Applying watermark…")
+        try:
+            base_bytes = await _download_file(context, file_id)
+            wm_bytes   = await _get_watermark_bytes(context, wm_file_id)
+            position   = context.user_data.get("watermark_position", "bottom-right")
+            async with storage.HEAVY_JOB_SEMAPHORE:
+                out = await image_extra.apply_watermark(base_bytes, wm_bytes, position=position)
+            doc = BytesIO(out); doc.name = "watermarked.jpg"
+            await update.message.reply_document(document=doc, filename="watermarked.jpg")
+            await safe_delete(status)
+            await _record(context, update, "watermark")
+        except Exception as exc:
+            await safe_edit(status, _user_hint(exc))
+            await notify_admin(context, "watermark", f"watermark failed: {exc}")
+        return
+
+    if awaiting == "compress_image":
+        if not await _check_heavy_rate_limit(update, "compress"): return
+        target = context.user_data.get("compress_target_bytes", DEFAULT_COMPRESS_TARGET)
+        status = await update.message.reply_text("⏳ Compressing…")
+        try:
+            raw = await _download_file(context, file_id)
+            async with storage.HEAVY_JOB_SEMAPHORE:
+                out = await image_extra.compress_to_target(raw, target)
+            doc = BytesIO(out); doc.name = "compressed.jpg"
+            await update.message.reply_document(document=doc, filename="compressed.jpg",
+                caption=f"✅ {len(out)/1024:.0f} KB (target ~{target//1024} KB)")
+            await safe_delete(status)
+            await _record(context, update, "compress")
+        except Exception as exc:
+            await safe_edit(status, _user_hint(exc))
+        finally:
+            context.user_data.pop("awaiting", None)
+            context.user_data.pop("compress_target_bytes", None)
+        return
+
+    if awaiting == "qrscan":
+        status = await update.message.reply_text("⏳ Scanning for QR codes…")
+        try:
+            raw     = await _download_file(context, file_id)
+            results = await qr_tools.scan_qr(raw)
+            if not results:
+                await safe_edit(status, "❌ No QR code found.")
+            else:
+                await safe_edit(status, "✅ *Found {}:*\n\n{}".format(
+                    len(results), "\n\n".join(f"🔗 `{r}`" for r in results)
+                ), parse_mode="Markdown")
+            await _record(context, update, "qr_scan")
+        except Exception as exc:
+            await safe_edit(status, _user_hint(exc))
+        finally:
+            context.user_data.pop("awaiting", None)
+        return
+
+    if awaiting and awaiting not in ("effects",):
+        await _warn_wrong_media(update, context, awaiting, "photo"); return
+
+    context.user_data.pop("awaiting", None)
+    token = _store_token(context.bot_data, file_id)
+    await update.message.reply_text(
+        "🎨 *Choose a category:*", parse_mode="Markdown",
+        reply_markup=build_effect_categories_keyboard(token),
+    )
+
+
+async def handle_animation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.animation: return
+    awaiting = context.user_data.get("awaiting")
+    if awaiting and awaiting != "gif2frames":
+        await _warn_wrong_media(update, context, awaiting, "GIF"); return
+    if awaiting == "gif2frames":
+        await _run_gif_tool(update, context, update.message.animation.file_id)
+        context.user_data.pop("awaiting", None)
+    else:
+        await update.message.reply_text(f"🎞 GIF detected! Extracting up to {GIF_MAX_FRAMES} frames…")
+        await _run_gif_tool(update, context, update.message.animation.file_id)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.document: return
+    doc       = update.message.document
+    awaiting  = context.user_data.get("awaiting")
+    file_name = (doc.file_name or "").lower()
+    mime      = doc.mime_type or ""
+
+    if not awaiting:
+        hints = {
+            ".pdf": "📄 PDF detected — go to /menu → *PDF Tools*.",
+            ".docx":"📝 DOCX detected — go to /menu → *Documents*.",
+            ".xlsx":"📊 XLSX detected — go to /menu → *Spreadsheet*.",
+            ".pptx":"📽 PPTX detected — go to /menu → *Presentation*.",
+            ".md":  "📝 Markdown detected — go to /menu → *Text & Markup*.",
+            ".gif": f"🎞 GIF detected — go to /menu → GIF → Frames.",
+        }
+        for ext, hint in hints.items():
+            if file_name.endswith(ext):
+                await update.message.reply_text(hint, parse_mode="Markdown", reply_markup=build_main_menu_keyboard()); return
+        await update.message.reply_text("Choose a tool first via /menu.", reply_markup=build_main_menu_keyboard()); return
+
+    if awaiting in _SINGLE_IMAGE_TOOLS:
+        if not (mime.startswith("image/") or any(file_name.endswith(e) for e in (".png",".jpg",".jpeg",".webp",".bmp",".tiff",".gif"))):
+            await update.message.reply_text("⚠️ Please send an image file."); return
+        await _run_image_tool(update, context, doc.file_id, awaiting)
+        context.user_data.pop("awaiting", None); return
+
+    if awaiting == "gif2frames":
+        if not (file_name.endswith(".gif") or mime == "image/gif"):
+            await update.message.reply_text("⚠️ Please send a .gif file."); return
+        await _run_gif_tool(update, context, doc.file_id)
+        context.user_data.pop("awaiting", None); return
+
+    if awaiting == "pdf2img":
+        if not await _check_heavy_rate_limit(update, "pdf2img"): return
+        if not (file_name.endswith(".pdf") or mime == "application/pdf"):
+            await update.message.reply_text("⚠️ Please send a .pdf file."); return
+        status = await update.message.reply_text("⏳ Rendering PDF pages…")
+        try:
+            pdf_bytes = await _download_file(context, doc.file_id)
+            async with storage.HEAVY_JOB_SEMAPHORE:
+                pages = await pdf_to_images(pdf_bytes)
+            if not pages:
+                await safe_edit(status, "❌ No pages could be rendered."); return
+            await safe_delete(status)
+            for i in range(0, len(pages), 10):
+                await update.message.reply_media_group([InputMediaPhoto(BytesIO(p)) for p in pages[i:i+10]])
+            if len(pages) >= PDF2IMG_MAX_PAGES:
+                await update.message.reply_text(f"ℹ️ Only the first {PDF2IMG_MAX_PAGES} pages were rendered.")
+            await _record(context, update, "pdf2img")
+        except Exception as exc:
+            await safe_edit(status, _user_hint(exc))
+            await notify_admin(context, "pdf2img", f"pdf2img failed: {exc}")
+        finally:
+            context.user_data.pop("awaiting", None)
+        return
+
+    if awaiting == "fiver_sanitize":
+        if file_name.endswith(".txt") or mime == "text/plain":
+            status = await update.message.reply_text("⏳ Sanitising…")
+            try:
+                raw  = await _download_file(context, doc.file_id)
+                text = raw.decode("utf-8", errors="replace")
+                if len(text) > FIVER_SANITIZE_MAX_CHARS:
+                    await safe_edit(status, f"⚠️ Too long ({len(text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}."); return
+                custom   = await storage.get_words(update.effective_chat.id)
+                san, changes, score = sanitize_fiver_text(text, custom)
+                report   = format_sanitizer_report(text, san, changes, score)
+                out_doc  = BytesIO(san.encode("utf-8")); out_doc.name = "sanitized.txt"
+                await update.message.reply_document(document=out_doc, filename="sanitized.txt", caption=report[:900])
+                await safe_delete(status)
+                await _record(context, update, "fiver_sanitize")
+            except Exception as exc:
+                await safe_edit(status, _user_hint(exc))
+            finally:
+                context.user_data.pop("awaiting", None)
+        else:
+            await update.message.reply_text("⚠️ Please send a .txt file or type the message directly.")
+        return
+
+    if awaiting == "compress_image":
+        if not (mime.startswith("image/") or any(file_name.endswith(e) for e in (".png",".jpg",".jpeg",".webp"))):
+            await update.message.reply_text("⚠️ Please send an image file."); return
+        if not await _check_heavy_rate_limit(update, "compress"): return
+        target = context.user_data.get("compress_target_bytes", DEFAULT_COMPRESS_TARGET)
+        status = await update.message.reply_text("⏳ Compressing…")
+        try:
+            raw = await _download_file(context, doc.file_id)
+            async with storage.HEAVY_JOB_SEMAPHORE:
+                out = await image_extra.compress_to_target(raw, target)
+            out_doc = BytesIO(out); out_doc.name = "compressed.jpg"
+            await update.message.reply_document(document=out_doc, filename="compressed.jpg",
+                caption=f"✅ {len(out)/1024:.0f} KB (target ~{target//1024} KB)")
+            await safe_delete(status)
+            await _record(context, update, "compress")
+        except Exception as exc:
+            await safe_edit(status, _user_hint(exc))
+        finally:
+            context.user_data.pop("awaiting", None)
+            context.user_data.pop("compress_target_bytes", None)
+        return
+
+    if awaiting == "qrscan":
+        if not (mime.startswith("image/") or any(file_name.endswith(e) for e in (".png",".jpg",".jpeg",".webp"))):
+            await update.message.reply_text("⚠️ Please send an image containing a QR code."); return
+        status = await update.message.reply_text("⏳ Scanning…")
+        try:
+            raw     = await _download_file(context, doc.file_id)
+            results = await qr_tools.scan_qr(raw)
+            if not results:
+                await safe_edit(status, "❌ No QR code found.")
+            else:
+                await safe_edit(status, "✅ *Found {}:*\n\n{}".format(
+                    len(results), "\n\n".join(f"🔗 `{r}`" for r in results)
+                ), parse_mode="Markdown")
+            await _record(context, update, "qr_scan")
+        except Exception as exc:
+            await safe_edit(status, _user_hint(exc))
+        finally:
+            context.user_data.pop("awaiting", None)
+        return
+
+    if awaiting in _DOC_TOOLS or awaiting == "pptx2images":
+        if not _doc_accepts(awaiting, mime, file_name):
+            exts = " / ".join(_DOC_ACCEPTS.get(awaiting, ([], [".file"]))[1])
+            await update.message.reply_text(f"⚠️ Expected: `{exts}`", parse_mode="Markdown"); return
+        await _run_doc_tool(update, context, doc.file_id, awaiting)
+        context.user_data.pop("awaiting", None); return
+
+    await update.message.reply_text("Choose a tool first via /menu.", reply_markup=build_main_menu_keyboard())
 
 
 # ── Text message handler ──────────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
-        return
+    if not update.message or not update.message.text: return
     raw_text = update.message.text
+    awaiting = context.user_data.get("awaiting")
 
     if GREETING_RE.match(raw_text.strip()):
         context.user_data.pop("awaiting", None)
-        await update.message.reply_text(WELCOME_MESSAGE, parse_mode="Markdown", reply_markup=build_main_menu_keyboard())
-        return
+        await update.message.reply_text(WELCOME_MESSAGE, parse_mode="Markdown", reply_markup=build_main_menu_keyboard()); return
 
-    if context.user_data.get("awaiting") == "fiver_sanitize":
-        text_to_sanitize = raw_text.strip()
-        if not text_to_sanitize:
-            await update.message.reply_text("Please send some text to sanitize.")
-            return
-        if len(text_to_sanitize) > FIVER_SANITIZE_MAX_CHARS:
-            await update.message.reply_text(f"⚠️ Too long ({len(text_to_sanitize)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}.")
-            return
-        custom_words = await storage.get_words(update.effective_chat.id)
-        sanitized = sanitize_fiver_text(text_to_sanitize, custom_words)
-        await update.message.reply_text(f"✅ *Sanitized:*\n\n{sanitized}", parse_mode="Markdown")
+    # ── Fiver sanitize ──
+    if awaiting == "fiver_sanitize":
+        text = raw_text.strip()
+        if not text: await update.message.reply_text("Please send some text."); return
+        if len(text) > FIVER_SANITIZE_MAX_CHARS:
+            await update.message.reply_text(f"⚠️ Too long ({len(text)} chars). Limit: {FIVER_SANITIZE_MAX_CHARS}."); return
+        custom  = await storage.get_words(update.effective_chat.id)
+        san, changes, score = sanitize_fiver_text(text, custom)
+        report  = format_sanitizer_report(text, san, changes, score)
+        await update.message.reply_text(report, parse_mode="Markdown", reply_markup=build_fiver_report_keyboard())
         await _record(context, update, "fiver_sanitize")
-        context.user_data.pop("awaiting", None)
-        return
+        context.user_data.pop("awaiting", None); return
 
-    if context.user_data.get("awaiting") == "translate_text":
-        target_lang   = context.user_data.get("target_lang", "en")
-        text_to_xlate = raw_text.strip()
-        if not text_to_xlate:
-            await update.message.reply_text("Please send some text to translate.")
-            return
-        if len(text_to_xlate) > TRANSLATE_MAX_CHARS:
-            await update.message.reply_text(f"⚠️ Too long ({len(text_to_xlate)} chars). Limit: {TRANSLATE_MAX_CHARS}.")
-            return
+    # ── Fiver report card steps ──
+    if awaiting == "fiver_profile":
+        context.user_data["fiver_profile"] = raw_text.strip()
+        context.user_data["awaiting"]      = "fiver_client"
+        await update.message.reply_text("*Step 2/3* — Send the *Client Name*:", parse_mode="Markdown"); return
+
+    if awaiting == "fiver_client":
+        context.user_data["fiver_client"] = raw_text.strip()
+        context.user_data["awaiting"]     = "fiver_order"
+        await update.message.reply_text("*Step 3/3* — Send the *Order ID*:", parse_mode="Markdown"); return
+
+    if awaiting == "fiver_order":
+        context.user_data["fiver_order"] = raw_text.strip()
+        context.user_data.pop("awaiting", None)
+        # Re-run sanitizer with report card
+        last_text = context.user_data.pop("last_fiver_text", "")
+        custom    = await storage.get_words(update.effective_chat.id)
+        san, changes, score = sanitize_fiver_text(last_text, custom) if last_text else ("", [], 100)
+        report    = format_sanitizer_report(
+            last_text, san, changes, score,
+            profile     = context.user_data.pop("fiver_profile", ""),
+            client_name = context.user_data.pop("fiver_client", ""),
+            order_id    = context.user_data.pop("fiver_order", ""),
+        )
+        await update.message.reply_text(report, parse_mode="Markdown"); return
+
+    # ── Translate ──
+    if awaiting == "translate_text":
+        text = raw_text.strip()
+        if not text: await update.message.reply_text("Please send some text."); return
+        if len(text) > TRANSLATE_MAX_CHARS:
+            await update.message.reply_text(f"⚠️ Too long ({len(text)} chars). Limit: {TRANSLATE_MAX_CHARS}."); return
         status = await update.message.reply_text("🌐 Translating…")
         try:
-            translated = await translate_text(text_to_xlate, target_lang)
+            translated = await translate_text(text, context.user_data.get("target_lang", "en"))
             await safe_edit(status, f"✅ *Translation:*\n\n{translated}", parse_mode="Markdown")
             await _record(context, update, "translate")
         except Exception as exc:
-            logger.warning("Translation failed: %s", exc)
-            if "rate_limited" in str(exc).lower():
-                await safe_edit(status, "🚦 The service is temporarily rate-limited. Please try again in a minute.")
-            else:
-                await safe_edit(status, "❌ Translation failed. Please try again.")
+            await safe_edit(status,
+                "🚦 Service temporarily rate-limited. Please try again in a minute."
+                if "rate_limited" in str(exc) else "❌ Translation failed.")
         context.user_data.pop("awaiting", None)
-        context.user_data.pop("target_lang", None)
-        return
+        context.user_data.pop("target_lang", None); return
 
-    awaiting = context.user_data.get("awaiting")
-    if awaiting and awaiting not in ("translate_text", "fiver_sanitize"):
-        await _warn_wrong_media(update, context, awaiting, "text message")
-        return
+    # ── Colour Tools ──
+    if awaiting == "color_input":
+        tool = context.user_data.get("color_tool", "")
+        text = raw_text.strip()
+        result = ""
 
+        if tool == "convert":
+            rgb = None
+            if text.startswith("#"):
+                rgb = hex_to_rgb(text)
+            elif "," in text or text.replace(" ","").isdigit() or re.match(r"rgb\(", text, re.I):
+                nums = re.findall(r"\d+", text)
+                if len(nums) >= 3:
+                    rgb = (int(nums[0]), int(nums[1]), int(nums[2]))
+            if rgb:
+                r, g, b = rgb
+                h, s, l = rgb_to_hsl(r, g, b)
+                c, m, y, k = rgb_to_cmyk(r, g, b)
+                result = (
+                    f"🎨 *Colour Conversions*\n\n"
+                    f"HEX:  `{rgb_to_hex(r,g,b)}`\n"
+                    f"RGB:  `rgb({r}, {g}, {b})`\n"
+                    f"HSL:  `hsl({h}, {s}%, {l}%)`\n"
+                    f"CMYK: `cmyk({c}%, {m}%, {y}%, {k}%)`"
+                )
+            else:
+                result = "❌ Couldn't parse that colour. Try `#FF5733` or `255 87 51`."
+
+        elif tool == "contrast":
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            if len(lines) >= 2:
+                rgb1 = hex_to_rgb(lines[0])
+                rgb2 = hex_to_rgb(lines[1])
+                if rgb1 and rgb2:
+                    ratio = wcag_contrast(*rgb1, *rgb2)
+                    aa  = "✅ Pass" if ratio >= 4.5 else "❌ Fail"
+                    aaa = "✅ Pass" if ratio >= 7.0 else "❌ Fail"
+                    result = (
+                        f"✅ *Contrast Ratio:* `{ratio}:1`\n\n"
+                        f"WCAG AA  (4.5:1) — {aa}\n"
+                        f"WCAG AAA (7.0:1) — {aaa}"
+                    )
+                else:
+                    result = "❌ Could not parse colours. Use hex format: `#FFFFFF`"
+            else:
+                result = "❌ Send two hex colours, one per line."
+
+        elif tool == "gradient":
+            rgb = hex_to_rgb(text)
+            result = f"```css\n{css_gradient(*rgb)}\n```" if rgb else "❌ Invalid hex colour."
+
+        elif tool == "shadow":
+            rgb = hex_to_rgb(text)
+            result = f"```css\n{css_shadow(*rgb)}\n```" if rgb else "❌ Invalid hex colour."
+
+        elif tool == "tintshade":
+            rgb = hex_to_rgb(text)
+            result = f"🖌 *Tints & Shades for `{text}`*\n\n```\n{tint_shade(*rgb)}\n```" if rgb else "❌ Invalid hex colour."
+
+        await update.message.reply_text(result, parse_mode="Markdown", reply_markup=build_color_input_keyboard(tool))
+        context.user_data.pop("awaiting", None)
+        await _record(context, update, f"color:{tool}"); return
+
+    # ── Dev Tools ──
+    if awaiting == "dev_input":
+        tool = context.user_data.get("dev_tool", "")
+        text = raw_text.strip()
+        result = ""
+
+        if tool == "json":
+            result = f"```json\n{format_json(text)}\n```"
+        elif tool == "hash":
+            result = f"🔑 *Hashes for your text:*\n\n{hash_text(text)}"
+        elif tool == "timestamp":
+            result = f"⏰ {convert_timestamp(text)}"
+        elif tool == "pxrem":
+            nums = re.findall(r"[\d.]+", text)
+            result = px_to_rem(float(nums[0])) if nums else "❌ Send a number like `16` or `24px`."
+        elif tool == "urlencode":
+            result = f"🔗 `{url_encode(text)}`"
+        elif tool == "urldecode":
+            result = f"🔗 `{url_decode(text)}`"
+        elif tool == "b64enc":
+            result = f"💻 `{base64_encode(text)}`"
+        elif tool == "b64dec":
+            result = f"💻 `{base64_decode(text)}`"
+        elif tool == "wordcount":
+            result = f"📊 *Word Count*\n\n{word_count(text)}"
+        elif tool == "diff":
+            if "diff_text_a" not in context.user_data:
+                context.user_data["diff_text_a"] = text
+                await update.message.reply_text("✅ Text A saved. Now send *Text B*:", parse_mode="Markdown")
+                return
+            else:
+                result = f"```\n{diff_texts(context.user_data.pop('diff_text_a'), text)}\n```"
+        elif tool == "regex":
+            parts = text.split("\n", 1)
+            result = regex_test(parts[0], parts[1]) if len(parts) == 2 else "❌ Send `<pattern>\\n<text>`."
+        elif tool == "case_text":
+            context.user_data["case_input"] = text
+            context.user_data.pop("awaiting", None)
+            await update.message.reply_text("🔤 Choose a case style:", reply_markup=build_case_keyboard()); return
+
+        await update.message.reply_text(result or "❌ Empty result.", parse_mode="Markdown", reply_markup=build_dev_input_keyboard(tool))
+        context.user_data.pop("awaiting", None)
+        await _record(context, update, f"dev:{tool}"); return
+
+    if awaiting and awaiting not in ("translate_text", "fiver_sanitize", "color_input", "dev_input"):
+        await _warn_wrong_media(update, context, awaiting, "text message"); return
+
+    # ── URL detection ──
     lummi_match = LUMMI_URL_RE.search(raw_text)
     url = trim_url(lummi_match.group(0)) if lummi_match else None
     platform = "lummi" if url else None
@@ -3131,78 +3206,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not url or not platform:
         await update.message.reply_text(
-            "Please send a supported Lummi.ai or Hugeicons link, "
-            "or send a photo / sticker / GIF to use an effect, "
-            "or use /FiverMessage to sanitize text. "
-            "Use /help for examples."
-        )
-        return
+            "Send a Lummi.ai or Hugeicons link, a photo, sticker, or GIF — "
+            "or use /FiverMessage to sanitise text. Type /help for examples."
+        ); return
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
     status = await update.message.reply_text("⏳ Processing your link…")
 
     if platform == "lummi":
-        await _process_lummi(update, context, status, url)
+        try:
+            await safe_edit(status, "⏳ Downloading Lummi asset…")
+            result = await fetch_lummi_asset(url)
+            doc    = BytesIO(result["bytes"]); doc.name = result["filename"]
+            await update.message.reply_document(
+                document=doc, filename=result["filename"],
+                caption=truncate_caption(f"✅ {result['size_mb']:.2f} MB — {result['direct_url']}"),
+            )
+            await safe_delete(status)
+            await _record(context, update, "lummi")
+        except Exception as exc:
+            await safe_edit(status, _user_hint(exc))
     else:
-        await _process_hugeicons(update, context, status, url)
-
-
-async def _process_lummi(update: Update, context: ContextTypes.DEFAULT_TYPE, status: Any, url: str) -> None:
-    try:
-        await safe_edit(status, "⏳ Downloading the Lummi asset…")
-        result = await fetch_lummi_asset(url)
-        await safe_edit(status, "📤 Sending full-size Lummi asset…")
-        doc = BytesIO(result["bytes"])
-        doc.name = result["filename"]
-        await update.message.reply_document(
-            document=doc, filename=result["filename"],
-            caption=truncate_caption(
-                f"✅ Full-size image ({result['size_mb']:.2f} MB)\n"
-                f"Direct link: {result['direct_url']}"
-            ),
-        )
-        await safe_delete(status)
-        await _record(context, update, "lummi")
-    except Exception as exc:
-        logger.warning("Lummi failed: %s", exc)
-        await safe_edit(status, _user_hint(exc))
-
-
-async def _process_hugeicons(update: Update, context: ContextTypes.DEFAULT_TYPE, status: Any, url: str) -> None:
-    try:
-        await safe_edit(status, "⏳ Fetching the Hugeicons SVG…")
-        result    = await fetch_hugeicons_svg(url)
-        clean_svg = format_svg(result["svg"])
-        icon_name = result["icon_name"]
-        style     = result["style"]
-        filename  = f"{icon_name}-{style}.svg"
-        await safe_delete(status)
-        label = f"✅ *{markdown_v2_escape(icon_name)}* \\({markdown_v2_escape(style)}\\)"
-        await update.message.reply_text(label, parse_mode="MarkdownV2")
-        await update.message.reply_text(f"```xml\n{markdown_code_escape(clean_svg)}\n```", parse_mode="MarkdownV2")
-        doc = BytesIO(clean_svg.encode("utf-8"))
-        doc.name = filename
-        await update.message.reply_document(document=doc, filename=filename, caption=truncate_caption(f"{filename} — ready to use."))
-        await _record(context, update, "hugeicons")
-    except Exception as exc:
-        logger.warning("Hugeicons failed: %s", exc)
-        await safe_edit(status, _user_hint(exc))
+        try:
+            await safe_edit(status, "⏳ Fetching Hugeicons SVG…")
+            result    = await fetch_hugeicons_svg(url)
+            clean_svg = format_svg(result["svg"])
+            filename  = f"{result['icon_name']}-{result['style']}.svg"
+            await safe_delete(status)
+            label_md  = f"✅ *{markdown_v2_escape(result['icon_name'])}* \\({markdown_v2_escape(result['style'])}\\)"
+            await update.message.reply_text(label_md, parse_mode="MarkdownV2")
+            await update.message.reply_text(f"```xml\n{markdown_code_escape(clean_svg)}\n```", parse_mode="MarkdownV2")
+            doc = BytesIO(clean_svg.encode()); doc.name = filename
+            await update.message.reply_document(document=doc, filename=filename, caption=truncate_caption(f"{filename} — ready to use."))
+            await _record(context, update, "hugeicons")
+        except Exception as exc:
+            await safe_edit(status, _user_hint(exc))
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception:", exc_info=context.error)
     try:
-        await notify_admin(context, "unhandled", f"Unhandled exception: {context.error}")
+        await notify_admin(context, "unhandled", f"Unhandled: {context.error}")
     except Exception:
         pass
 
 
-# ── Lifecycle hooks ────────────────────────────────────────────────────────────
+# ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 async def _on_shutdown(app: Application) -> None:
     await close_http_client()
     app.bot_data.pop("pending_files", None)
-    logger.info("Shutdown cleanup complete: HTTP client closed, pending_files cleared.")
+    logger.info("Shutdown complete.")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -3224,48 +3278,55 @@ def main() -> None:
     )
 
     # Commands
-    app.add_handler(CommandHandler("start",  start))
-    app.add_handler(CommandHandler("help",   help_command))
-    app.add_handler(CommandHandler("menu",   menu_command))
-    app.add_handler(CommandHandler("cancel", cancel_command))
-    app.add_handler(CommandHandler("FiverMessage", fivermessage_command))
-    app.add_handler(CommandHandler("addword", addword_command))
-    app.add_handler(CommandHandler("mywords", mywords_command))
-    app.add_handler(CommandHandler("delword", delword_command))
-    app.add_handler(CommandHandler("resetwords", resetwords_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("useractivity", useractivity_command))
-    app.add_handler(CommandHandler("admins", admins_command))
-    app.add_handler(CommandHandler("setlimit", setlimit_command))
-    app.add_handler(CommandHandler("resetlimit", resetlimit_command))
-    app.add_handler(CommandHandler("mylimit", mylimit_command))
-    app.add_handler(CommandHandler("requestlimit", requestlimit_command))
-    app.add_handler(CommandHandler("pendingrequests", pendingrequests_command))
-    app.add_handler(CommandHandler("blockuser", blockuser_command))
-    app.add_handler(CommandHandler("unblockuser", unblockuser_command))
-    app.add_handler(CommandHandler("qr", qr_command))
-    app.add_handler(CommandHandler("genpass", genpass_command))
-    app.add_handler(CommandHandler("genpin", genpin_command))
-    app.add_handler(CommandHandler("compress", compress_command))
-    app.add_handler(CommandHandler("watermark", watermark_command))
+    for cmd, fn in [
+        ("start",           start),
+        ("help",            help_command),
+        ("menu",            menu_command),
+        ("cancel",          cancel_command),
+        ("FiverMessage",    fivermessage_command),
+        ("addword",         addword_command),
+        ("mywords",         mywords_command),
+        ("delword",         delword_command),
+        ("resetwords",      resetwords_command),
+        ("stats",           stats_command),
+        ("useractivity",    useractivity_command),
+        ("admins",          admins_command),
+        ("setlimit",        setlimit_command),
+        ("resetlimit",      resetlimit_command),
+        ("mylimit",         mylimit_command),
+        ("requestlimit",    requestlimit_command),
+        ("pendingrequests", pendingrequests_command),
+        ("blockuser",       blockuser_command),
+        ("unblockuser",     unblockuser_command),
+        ("qr",              qr_command),
+        ("genpass",         genpass_command),
+        ("genpin",          genpin_command),
+        ("compress",        compress_command),
+        ("watermark",       watermark_command),
+    ]:
+        app.add_handler(CommandHandler(cmd, fn))
 
-    # Media
-    app.add_handler(MessageHandler(filters.PHOTO,     handle_photo))
-    app.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker))
-    app.add_handler(MessageHandler(filters.ANIMATION, handle_animation))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    # Media handlers
+    app.add_handler(MessageHandler(filters.PHOTO,           handle_photo))
+    app.add_handler(MessageHandler(filters.Sticker.ALL,     handle_sticker))
+    app.add_handler(MessageHandler(filters.ANIMATION,       handle_animation))
+    app.add_handler(MessageHandler(filters.Document.ALL,    handle_document))
 
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(handle_effect_category_callback, pattern=r"^fxcat\|"))
-    app.add_handler(CallbackQueryHandler(handle_effect_back_callback,     pattern=r"^fxback\|"))
-    app.add_handler(CallbackQueryHandler(handle_effect_callback,          pattern=r"^fx\|"))
-    app.add_handler(CallbackQueryHandler(handle_menu_callback,            pattern=r"^menu\|"))
-    app.add_handler(CallbackQueryHandler(handle_category_callback,        pattern=r"^cat\|"))
-    app.add_handler(CallbackQueryHandler(handle_translate_lang_callback,  pattern=r"^trlang\|"))
-    app.add_handler(CallbackQueryHandler(handle_watermark_position_callback, pattern=r"^wmpos\|"))
-    app.add_handler(CallbackQueryHandler(handle_genpass_callback,         pattern=r"^genpass\|"))
-    app.add_handler(CallbackQueryHandler(handle_genpin_callback,          pattern=r"^genpin\|"))
-    app.add_handler(CallbackQueryHandler(handle_limit_request_callback,   pattern=r"^limitreq\|"))
+    # Callback handlers
+    app.add_handler(CallbackQueryHandler(handle_effect_category_callback,  pattern=r"^fxcat\|"))
+    app.add_handler(CallbackQueryHandler(handle_effect_back_callback,      pattern=r"^fxback\|"))
+    app.add_handler(CallbackQueryHandler(handle_effect_callback,           pattern=r"^fx\|"))
+    app.add_handler(CallbackQueryHandler(handle_menu_callback,             pattern=r"^menu\|"))
+    app.add_handler(CallbackQueryHandler(handle_category_callback,         pattern=r"^cat\|"))
+    app.add_handler(CallbackQueryHandler(handle_translate_lang_callback,   pattern=r"^trlang\|"))
+    app.add_handler(CallbackQueryHandler(handle_watermark_position_callback,pattern=r"^wmpos\|"))
+    app.add_handler(CallbackQueryHandler(handle_genpass_callback,          pattern=r"^genpass\|"))
+    app.add_handler(CallbackQueryHandler(handle_genpin_callback,           pattern=r"^genpin\|"))
+    app.add_handler(CallbackQueryHandler(handle_limit_request_callback,    pattern=r"^limitreq\|"))
+    app.add_handler(CallbackQueryHandler(handle_color_callback,            pattern=r"^color\|"))
+    app.add_handler(CallbackQueryHandler(handle_dev_callback,              pattern=r"^dev\|"))
+    app.add_handler(CallbackQueryHandler(handle_case_callback,             pattern=r"^case\|"))
+    app.add_handler(CallbackQueryHandler(handle_fiver_reportcard_callback, pattern=r"^fiver\|"))
 
     # Text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -3274,13 +3335,13 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     logger.info(
-        "Unified bot starting (Lummi + Hugeicons + 32 Effects + Sticker/GIF + "
-        "Fiver Sanitizer + Custom Words + QR + Passwords + Watermark/Compress + "
-        "Per-user Stats + Limit Requests)"
+        "BangaliIcon Bot v3 starting — "
+        "40 effects | Fiver v2 | Colour Tools | Dev Tools | "
+        "Lummi + Hugeicons | QR | Passwords | Watermark | Compress"
     )
 
     if webhook_url:
-        logger.info("Webhook mode on port %s", port)
+        logger.info("Webhook mode — port %s", port)
         app.run_webhook(
             listen="0.0.0.0", port=port, url_path="/webhook",
             webhook_url=f"{webhook_url}/webhook", allowed_updates=Update.ALL_TYPES,

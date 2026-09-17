@@ -3845,12 +3845,23 @@ def build_application() -> Application:
 def main() -> None:
     app = build_application()
     logger.info("BangaliIcon Bot starting…")
+
+    port = int(os.environ.get("PORT", 8080))
+    bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+
+    if not render_url:
+        raise RuntimeError(
+            "RENDER_EXTERNAL_URL is not set. This should be auto-injected by Render "
+            "for web services — check your service type/config."
+        )
+
     app.run_webhook(
-    listen="0.0.0.0",
-    port=PORT,
-    url_path=BOT_TOKEN,
-    webhook_url=f"{RENDER_EXTERNAL_URL}/{BOT_TOKEN}",
-)
+        listen="0.0.0.0",
+        port=port,
+        url_path=bot_token,
+        webhook_url=f"{render_url}/{bot_token}",
+    )
 
 
 if __name__ == "__main__":

@@ -2,31 +2,6 @@
 BangaliIcon Image Effects Engine
 =================================
 Standalone subprocess worker — communicates via stdin/stdout JSON.
-
-Protocol
---------
-stdin  → JSON payload:
-    {
-        "effect": "<effect-key>",
-        "width": <int>,
-        "height": <int>,
-        "pixels_rgba_b64": "<base64 of raw RGBA bytes>",
-        "params": {
-            "dotPitch":       <int,   default 8>,
-            "contrast":       <float, default 1.0>,
-            "brightness":     <float, default 1.0>,
-            "grainIntensity": <float, default 0>,
-            "vignette":       <float, default 0>
-        }
-    }
-
-stdout → JSON result:
-    success: {"status": "success", "bmp_data_url": "data:image/bmp;base64,..."}
-    failure: {"status": "error",   "message": "<reason>"}
-
-Standalone test
----------------
-    echo '<payload json>' | python python_engine.py
 """
 
 from __future__ import annotations
@@ -41,10 +16,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 
-# ── I/O ───────────────────────────────────────────────────────────────────────
-
 def _decode_input(payload: dict) -> tuple[Image.Image, dict]:
-    """Decode the JSON payload into a PIL Image and a params dict."""
     width  = int(payload["width"])
     height = int(payload["height"])
     raw    = base64.b64decode(payload["pixels_rgba_b64"])
@@ -53,15 +25,12 @@ def _decode_input(payload: dict) -> tuple[Image.Image, dict]:
 
 
 def _encode_output(img: Image.Image) -> str:
-    """Encode a PIL Image as a BMP data-URL string."""
     if img.mode == "RGBA":
         img = img.convert("RGB")
     buf = BytesIO()
     img.save(buf, format="BMP")
     return "data:image/bmp;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
-
-# ── Post-processing helpers ───────────────────────────────────────────────────
 
 def _apply_base_adjustments(img: Image.Image, params: dict) -> Image.Image:
     contrast   = float(params.get("contrast",   1.0))
@@ -94,7 +63,64 @@ def _add_vignette(img: Image.Image, strength: float) -> Image.Image:
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
 
 
-# ── Shared building blocks ────────────────────────────────────────────────────
+ASPECT_RATIOS: dict[str, tuple[int, int] | None] = {
+    "original": None,
+    "1:1":  (1, 1),
+    "4:5":  (4, 5),
+    "5:4":  (5, 4),
+    "16:9": (16, 9),
+    "9:16": (9, 16),
+    "4:3":  (4, 3),
+    "3:4":  (3, 4),
+    "3:2":  (3, 2),
+    "2:3":  (2, 3),
+    "21:9": (21, 9),
+}
+
+
+def _apply_aspect_ratio(img: Image.Image, ratio_key: str | None, mode: str = "crop") -> Image.Image:
+    if not ratio_key or ratio_key not in ASPECT_RATIOS:
+        return img
+    ratio = ASPECT_RATIOS[ratio_key]
+    if ratio is None:
+        return img
+    w, h = img.size
+    target_ratio = ratio[0] / ratio[1]
+    cur_ratio    = w / h
+
+    if abs(cur_ratio - target_ratio) < 1e-3:
+        return img
+
+    if mode == "pad":
+        if cur_ratio > target_ratio:
+            new_h  = max(1, int(round(w / target_ratio)))
+            canvas = Image.new("RGB", (w, new_h), (0, 0, 0))
+            canvas.paste(img.convert("RGB"), (0, (new_h - h) // 2))
+            return canvas
+        else:
+            new_w  = max(1, int(round(h * target_ratio)))
+            canvas = Image.new("RGB", (new_w, h), (0, 0, 0))
+            canvas.paste(img.convert("RGB"), ((new_w - w) // 2, 0))
+            return canvas
+
+    if cur_ratio > target_ratio:
+        new_w = max(1, int(round(h * target_ratio)))
+        left  = (w - new_w) // 2
+        return img.crop((left, 0, left + new_w, h))
+    else:
+        new_h = max(1, int(round(w / target_ratio)))
+        top   = (h - new_h) // 2
+        return img.crop((0, top, w, top + new_h))
+
+
+def _apply_resize(img: Image.Image, out_w: int | None, out_h: int | None) -> Image.Image:
+    if not out_w or not out_h:
+        return img
+    out_w, out_h = max(1, int(out_w)), max(1, int(out_h))
+    if (out_w, out_h) == img.size:
+        return img
+    return img.resize((out_w, out_h), Image.LANCZOS)
+
 
 def _duotone(
     img: Image.Image,
@@ -172,11 +198,9 @@ def _bayer_matrix() -> np.ndarray:
 _BAYER = _bayer_matrix()
 
 
-# ── Effect implementations ────────────────────────────────────────────────────
-# Convention: every fx_* function receives an RGB Image and a params dict,
-# and returns an RGB Image.
+def fx_original(img: Image.Image, params: dict) -> Image.Image:
+    return img.convert("RGB")
 
-# --- Retro & Print ---
 
 def fx_halftone_dots(img: Image.Image, params: dict) -> Image.Image:
     pitch    = max(2, int(params.get("dotPitch", 8)))
@@ -245,8 +269,6 @@ def fx_lomography(img: Image.Image, params: dict) -> Image.Image:
     return _add_vignette(rgb, 0.55)
 
 
-# --- Color & Tone ---
-
 def fx_duotone(img: Image.Image,        params: dict) -> Image.Image: return _duotone(img, (25, 15, 60),   (255, 200, 120))
 def fx_autumn_tone(img: Image.Image,    params: dict) -> Image.Image: return _duotone(img, (45, 20, 10),   (255, 170, 60))
 def fx_forest_green(img: Image.Image,   params: dict) -> Image.Image: return _duotone(img, (5,  20, 10),   (120, 200, 90))
@@ -255,8 +277,6 @@ def fx_cherry_blossom(img: Image.Image, params: dict) -> Image.Image: return _du
 def fx_moonlight(img: Image.Image,      params: dict) -> Image.Image: return _duotone(img, (5,  10, 30),   (180, 200, 255))
 def fx_frozen_ice(img: Image.Image,     params: dict) -> Image.Image: return _duotone(img, (0,  20, 45),   (180, 230, 255))
 
-
-# --- Artistic ---
 
 def fx_watercolor(img: Image.Image, params: dict) -> Image.Image:
     rgb     = img.convert("RGB")
@@ -289,7 +309,6 @@ def fx_emboss(img: Image.Image, params: dict) -> Image.Image:
 
 
 def fx_pencil_sketch(img: Image.Image, params: dict) -> Image.Image:
-    """Realistic pencil sketch using dodge-blend of blurred inverse."""
     gray     = ImageOps.grayscale(img)
     inverted = ImageOps.invert(gray)
     blurred  = inverted.filter(ImageFilter.GaussianBlur(radius=21))
@@ -301,12 +320,10 @@ def fx_pencil_sketch(img: Image.Image, params: dict) -> Image.Image:
 
 
 def fx_color_splash(img: Image.Image, params: dict) -> Image.Image:
-    """Keep reds/warm tones; desaturate everything else."""
     rgb  = img.convert("RGB")
     arr  = np.array(rgb).astype(np.float32)
     gray = np.array(ImageOps.grayscale(rgb)).astype(np.float32)
     r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-    # Hue-based keep mask: pixels where red dominates
     keep = (r > 120) & (r > g * 1.3) & (r > b * 1.2)
     out  = np.stack([gray, gray, gray], axis=-1)
     out[keep] = arr[keep]
@@ -314,7 +331,6 @@ def fx_color_splash(img: Image.Image, params: dict) -> Image.Image:
 
 
 def fx_stained_glass(img: Image.Image, params: dict) -> Image.Image:
-    """Voronoi-cell stained glass with dark lead lines."""
     rgb   = img.convert("RGB")
     w, h  = rgb.size
     arr   = np.array(rgb)
@@ -323,7 +339,6 @@ def fx_stained_glass(img: Image.Image, params: dict) -> Image.Image:
     px    = rng.integers(0, w, n)
     py    = rng.integers(0, h, n)
     yg, xg = np.mgrid[0:h, 0:w]
-    # Nearest seed per pixel
     dx   = xg[:, :, None] - px[None, None, :]
     dy   = yg[:, :, None] - py[None, None, :]
     nearest = np.argmin(dx ** 2 + dy ** 2, axis=2)
@@ -338,8 +353,6 @@ def fx_stained_glass(img: Image.Image, params: dict) -> Image.Image:
     dark   = Image.new("RGB", (w, h), (15, 15, 15))
     return Image.composite(dark, result, lead)
 
-
-# --- Digital & Glitch ---
 
 def fx_cyber_glitch(img: Image.Image, params: dict) -> Image.Image:
     return _scanlines(_channel_shift(img, 6, 0, -6), 4, 0.25)
@@ -359,7 +372,6 @@ def fx_glitch_art(img: Image.Image, params: dict) -> Image.Image:
 
 
 def fx_ascii_matrix(img: Image.Image, params: dict) -> Image.Image:
-    """Matrix-style green ASCII art rendered with actual characters."""
     w, h  = img.size
     cell  = max(6, int(params.get("dotPitch", 8)))
     ramp  = " .:-=+*#%@"
@@ -410,22 +422,21 @@ def fx_neon_poster(img: Image.Image, params: dict) -> Image.Image:
 
 
 def fx_neon_glow(img: Image.Image, params: dict) -> Image.Image:
-    """Dark background with vivid neon edge glow (cyan + magenta)."""
     rgb   = img.convert("RGB")
     edges = ImageEnhance.Contrast(rgb.convert("L").filter(ImageFilter.FIND_EDGES)).enhance(3.0)
     arr   = np.array(edges).astype(np.float32) / 255.0
     out   = np.zeros((*arr.shape, 3), dtype=np.float32)
-    out[..., 0] = arr * 255   # R
-    out[..., 1] = arr * 50    # G
-    out[..., 2] = arr * 255   # B
+    out[..., 0] = arr * 255
+    out[..., 1] = arr * 50
+    out[..., 2] = arr * 255
     neon  = Image.fromarray(out.clip(0, 255).astype(np.uint8), "RGB")
     glow  = neon.filter(ImageFilter.GaussianBlur(3))
     return Image.blend(neon, glow, 0.6)
 
 
-# --- Distort & Special ---
-
 def fx_swirl_distort(img: Image.Image,  params: dict) -> Image.Image: return _swirl(img, 3.0)
+
+
 def fx_mirror_reflect(img: Image.Image, params: dict) -> Image.Image:
     rgb  = img.convert("RGB")
     w, h = rgb.size
@@ -454,12 +465,13 @@ def fx_thermal_flir(img: Image.Image, params: dict) -> Image.Image:
 
 
 def fx_inferno(img: Image.Image,    params: dict) -> Image.Image: return _duotone(img, (10,  0,  0),  (255, 120, 0))
+
+
 def fx_horror_red(img: Image.Image, params: dict) -> Image.Image:
     return _add_vignette(_duotone(img, (10, 0, 0), (190, 15, 15)), 0.6)
 
 
 def fx_tilt_shift(img: Image.Image, params: dict) -> Image.Image:
-    """Miniature/tilt-shift: sharp centre, blurred top & bottom."""
     rgb     = img.convert("RGB")
     w, h    = rgb.size
     blurred = rgb.filter(ImageFilter.GaussianBlur(8))
@@ -474,7 +486,6 @@ def fx_tilt_shift(img: Image.Image, params: dict) -> Image.Image:
 
 
 def fx_kaleidoscope(img: Image.Image, params: dict) -> Image.Image:
-    """4-mirror kaleidoscope from the top-left quadrant."""
     rgb  = img.convert("RGB")
     w, h = rgb.size
     hw, hh = w // 2, h // 2
@@ -487,10 +498,8 @@ def fx_kaleidoscope(img: Image.Image, params: dict) -> Image.Image:
     return out
 
 
-# ── Registry ──────────────────────────────────────────────────────────────────
-
 EFFECT_FUNCS: dict[str, Callable[[Image.Image, dict], Image.Image]] = {
-    # Retro & Print
+    "original":              fx_original,
     "halftone-dots":        fx_halftone_dots,
     "comic-cmyk":           fx_comic_cmyk,
     "retro-8bit":           fx_retro_8bit,
@@ -499,7 +508,6 @@ EFFECT_FUNCS: dict[str, Callable[[Image.Image, dict], Image.Image]] = {
     "bayer-dither":         fx_bayer_dither,
     "vhs-tape":             fx_vhs_tape,
     "lomography":           fx_lomography,
-    # Color & Tone
     "duotone":              fx_duotone,
     "autumn-tone":          fx_autumn_tone,
     "forest-green":         fx_forest_green,
@@ -507,7 +515,6 @@ EFFECT_FUNCS: dict[str, Callable[[Image.Image, dict], Image.Image]] = {
     "cherry-blossom":       fx_cherry_blossom,
     "moonlight":            fx_moonlight,
     "frozen-ice":           fx_frozen_ice,
-    # Artistic
     "watercolor":           fx_watercolor,
     "oil-paint":            fx_oil_paint,
     "cinematic-noir":       fx_cinematic_noir,
@@ -515,7 +522,6 @@ EFFECT_FUNCS: dict[str, Callable[[Image.Image, dict], Image.Image]] = {
     "pencil-sketch":        fx_pencil_sketch,
     "color-splash":         fx_color_splash,
     "stained-glass":        fx_stained_glass,
-    # Digital & Glitch
     "cyber-glitch":         fx_cyber_glitch,
     "glitch-art":           fx_glitch_art,
     "ascii-matrix":         fx_ascii_matrix,
@@ -523,7 +529,6 @@ EFFECT_FUNCS: dict[str, Callable[[Image.Image, dict], Image.Image]] = {
     "vaporwave":            fx_vaporwave,
     "neon-poster":          fx_neon_poster,
     "neon-glow":            fx_neon_glow,
-    # Distort & Special
     "swirl-distort":        fx_swirl_distort,
     "mirror-reflect":       fx_mirror_reflect,
     "pixelate":             fx_pixelate,
@@ -535,19 +540,14 @@ EFFECT_FUNCS: dict[str, Callable[[Image.Image, dict], Image.Image]] = {
     "kaleidoscope":         fx_kaleidoscope,
 }
 
-# Effects whose graphic nature means added film grain just muddies the result.
 _SKIP_GRAIN: frozenset[str] = frozenset({
-    "halftone-dots", "ascii-matrix", "bayer-dither", "pixelate",
+    "original", "halftone-dots", "ascii-matrix", "bayer-dither", "pixelate",
     "blueprint-cyan", "crosshatch-engraving", "retro-8bit",
     "glitch-art", "pencil-sketch", "kaleidoscope",
 })
 
-# Effects that bake in their own vignette — applying the global one on top
-# would double-darken corners.
 _SKIP_VIGNETTE: frozenset[str] = _SKIP_GRAIN | frozenset({"horror-red", "lomography", "tilt-shift"})
 
-
-# ── Pipeline ──────────────────────────────────────────────────────────────────
 
 def apply_effect(img: Image.Image, effect: str, params: dict) -> Image.Image:
     func = EFFECT_FUNCS.get(effect)
@@ -563,10 +563,11 @@ def apply_effect(img: Image.Image, effect: str, params: dict) -> Image.Image:
     if effect not in _SKIP_VIGNETTE:
         result = _add_vignette(result, float(params.get("vignette", 0)) * 0.5)
 
+    result = _apply_aspect_ratio(result, params.get("aspectRatio", "original"), params.get("cropMode", "crop"))
+    result = _apply_resize(result, params.get("outputWidth"), params.get("outputHeight"))
+
     return result
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
     try:

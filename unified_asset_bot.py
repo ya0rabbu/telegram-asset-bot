@@ -3845,7 +3845,12 @@ def build_application() -> Application:
 def main() -> None:
     app = build_application()
     logger.info("BangaliIcon Bot starting…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+    app.run_webhook(
+    listen="0.0.0.0",
+    port=PORT,
+    url_path=BOT_TOKEN,
+    webhook_url=f"{RENDER_EXTERNAL_URL}/{BOT_TOKEN}",
+)
 
 
 if __name__ == "__main__":

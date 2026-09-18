@@ -343,32 +343,8 @@ function showToast(msg, icon){
   if (!t) return;
   t.innerHTML = (icon ? ICONS[icon] || "" : "") + "<span>" + msg + "</span>";
   t.classList.add("show");
-  setTimeout(function(){ t.classList.remove("show"); }, 2500);
+  clearTimeout(showToast._t); showToast._t = setTimeout(function(){ t.classList.remove("show"); }, 2800);
 }
-
-// ---- Request more credits button ----
-var requestCreditBtn = document.getElementById("requestCreditBtn");
-if (requestCreditBtn) {
-  requestCreditBtn.addEventListener("click", function(){
-    haptic("medium");
-
-    var botUsername = "BangaliIconbot"; // আপনার bot-এর username
-    var payload = "requestlimit_5";     // bot-এর /start handler এ পার্স হবে
-    var deepLink = "https://t.me/" + botUsername + "?start=" + payload;
-
-    if (tg && tg.openTelegramLink) {
-      tg.openTelegramLink(deepLink);
-    } else if (tg && tg.openLink) {
-      tg.openLink(deepLink);
-    } else {
-      window.open(deepLink, "_blank");
-    }
-
-    showToast("বট চ্যাটে পাঠানো হচ্ছে...", "clock");
-  });
-}
-
-})();
 
 /* ============ RATE LIMIT ============ */
 var RATE_LIMIT_MAX = 5, RATE_LIMIT_WINDOW = 60000;
@@ -387,12 +363,7 @@ function paintLimit(){
 setInterval(paintLimit, 4000);
 paintLimit();
 
-function toast(msg, icon){
-  var t = document.getElementById("toast");
-  t.innerHTML = (icon ? ICONS[icon] : "") + "<span>" + msg + "</span>";
-  t.classList.add("show");
-  clearTimeout(toast._t); toast._t = setTimeout(function(){ t.classList.remove("show"); }, 2800);
-}
+function toast(msg, icon){ showToast(msg, icon); }
 
 /* ============ STATE ============ */
 var srcImage = null;
@@ -1145,7 +1116,6 @@ function dataUrlToBlob(dataUrl){
 }
 
 function saveViaDataUrl(dataUrl, filename, mime){
-  /* 1) Native OS "choose a folder" dialog, where supported */
   if (window.showSaveFilePicker){
     setBusy(true, "Waiting for save location…", "Choose a folder to save into");
     var ext = filename.split(".").pop();
@@ -1167,7 +1137,6 @@ function saveViaDataUrl(dataUrl, filename, mime){
 }
 
 function tryTelegramThenAnchor(dataUrl, filename){
-  /* 2) Telegram's native bridge, with a hard timeout so we never hang */
   if (tg && typeof tg.downloadFile === "function"){
     setBusy(true, "Handing off to Telegram…", "Waiting for the save prompt");
     var settled = false;
@@ -1187,7 +1156,6 @@ function tryTelegramThenAnchor(dataUrl, filename){
 }
 
 function anchorDownload(dataUrl, filename){
-  /* 3) data: URL anchor click — survives Telegram's in-app WebView, unlike blob: */
   setBusy(true, "Starting download…", "Check your device's Downloads folder");
   var a = document.createElement("a");
   a.href = dataUrl; a.download = filename; a.rel = "noopener"; a.style.display = "none";

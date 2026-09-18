@@ -249,4 +249,12 @@ def build_aspect_ratio_keyboard(token: str) -> InlineKeyboardMarkup:
 
 
 def build_resize_presets_keyboard(token: str) -> InlineKeyboardMarkup:
+    rows = []
+    rows.append([InlineKeyboardButton("Small (480px)",  callback_data=f"fxresize|480|{token}")])
+    rows.append([InlineKeyboardButton("Medium (720px)", callback_data=f"fxresize|720|{token}")])
+    rows.append([InlineKeyboardButton("Large (1080px)", callback_data=f"fxresize|1080|{token}")])
+    rows.append([InlineKeyboardButton("XL (1600px)",    callback_data=f"fxresize|1600|{token}")])
+    rows.append([InlineKeyboardButton("✏️ Custom WxH (type it)", callback_data=f"fxresizecustom|{token}")])
+    rows.append([InlineKeyboardButton("◀ Back", callback_data=f"fxtoolback|{token}")])
+    return InlineKeyboardMarkup(rows)   
     presets = [

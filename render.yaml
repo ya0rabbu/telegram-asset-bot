@@ -4,6 +4,7 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python unified_asset_bot.py
+    healthCheckPath: /health
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
@@ -11,4 +12,5 @@ services:
         sync: false
       - key: LOG_LEVEL
         value: INFO
-    healthCheckPath: /health
+      - key: PORT
+        value: 8080

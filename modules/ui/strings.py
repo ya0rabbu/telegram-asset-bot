@@ -157,3 +157,18 @@ ADMINS: dict[str, dict[str, str]] = {
         "telegram": "https://t.me/smashik_softvence",
     },
 }
+# Constants used across modules
+DEFAULT_COMPRESS_TARGET   = 1 * 1024 * 1024   # 1 MB
+MAX_UPLOAD_BYTES          = 49 * 1024 * 1024
+BOT_DOWNLOAD_LIMIT_BYTES  = 20 * 1024 * 1024
+PDF2IMG_MAX_PAGES         = 20
+GIF_MAX_FRAMES            = 10
+IMAGE_MAX_DIM             = 1_200
+TOKEN_TTL_SECONDS         = 1_800
+MAX_PENDING_FILES         = 500
+MAX_LIMIT_REQUEST_VALUE   = 100
+REMBG_MAX_DIMENSION       = 2_000
+REMBG_TIMEOUT_SECONDS     = 90
+TRANSLATE_MAX_CHARS       = 4_500
+MYMEMORY_MAX_CHARS        = 500
+FIVER_SANITIZE_MAX_CHARS  = 4_500

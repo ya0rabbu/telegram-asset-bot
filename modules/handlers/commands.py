@@ -12,6 +12,7 @@ from modules import storage
 from modules.ui.strings import (
     WELCOME_MESSAGE, MENU_INTRO, FIVER_INFO_PATTERN_HINT,
     SUPER_ADMINS, ADMINS, DEFAULT_COMPRESS_TARGET,
+    MAX_LIMIT_REQUEST_VALUE,
 )
 from modules.ui.keyboards import (
     build_main_menu_keyboard, build_genpass_keyboard,

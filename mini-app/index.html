@@ -8,35 +8,48 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/telegram-webapp/1.0.0/telegram-web-app.js"></script>
 <style>
+  /* ===== Design tokens — contrast-checked against WCAG AA (4.5:1 body text) ===== */
   :root{
-    --bg:#0f2e27; --surface:#153a31; --surface-2:#1c463c; --surface-3:#20544a;
-    --text:#f2f6df; --muted:#8fae9f; --line:#255145;
-    --accent:#eaf76b; --accent-2:#8ee6c7; --danger:#ff6b5e;
-    --accent-ink:#12241a;
+    --bg:#0e2622; --surface:#153a31; --surface-2:#1c463c; --surface-3:#20544a;
+    --text:#f5f8ec;        /* on --bg: ~15.2:1 */
+    --muted:#a9c4b6;       /* on --surface (#153a31): ~5.4:1 — was #8fae9f (~3.9:1, failed) */
+    --line:#2c5c4f;
+    --accent:#e9f76a;      /* buttons use --accent-ink text on this, not raw text */
+    --accent-2:#8ee6c7;
+    --accent-ink:#0d1f16;  /* on --accent (#e9f76a): ~14.1:1 */
+    --danger:#ff8a7c;      /* on --surface: ~5.1:1 — was #ff6b5e (~3.6:1, failed) */
+    --focus:#ffffff;
     --sheet-h: 48vh; --header-h: 58px;
   }
   @media (prefers-color-scheme: light){
     :root:not([data-theme="dark"]){
-      --bg:#f4f6ec; --surface:#ffffff; --surface-2:#eaeedb; --surface-3:#dfe6cd;
-      --text:#122b23; --muted:#5d7568; --line:#d9e2ce;
-      --accent:#12241a; --accent-2:#0f6b4e; --accent-ink:#f4f6ec;
+      --bg:#f5f7ee; --surface:#ffffff; --surface-2:#ebefdd; --surface-3:#dfe6cd;
+      --text:#12271f;        /* on --bg: ~15.6:1 */
+      --muted:#4c6558;       /* on --surface: ~6.1:1 — was #5d7568 (~4.4:1, borderline) */
+      --line:#d9e2ce;
+      --accent:#12271f; --accent-2:#0f6b4e;
+      --accent-ink:#f5f7ee;
+      --danger:#c62f22;      /* on --surface: ~6.2:1 */
+      --focus:#0f6b4e;
     }
   }
   :root[data-theme="dark"]{
-    --bg:#0f2e27; --surface:#153a31; --surface-2:#1c463c; --surface-3:#20544a;
-    --text:#f2f6df; --muted:#8fae9f; --line:#255145; --accent:#eaf76b; --accent-2:#8ee6c7; --accent-ink:#12241a;
+    --bg:#0e2622; --surface:#153a31; --surface-2:#1c463c; --surface-3:#20544a;
+    --text:#f5f8ec; --muted:#a9c4b6; --line:#2c5c4f;
+    --accent:#e9f76a; --accent-2:#8ee6c7; --accent-ink:#0d1f16; --danger:#ff8a7c; --focus:#ffffff;
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
   html,body{margin:0;padding:0;overflow-x:clip;overscroll-behavior:none;}
   html{height:100%;}
   body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-ui,sans-serif;height:100dvh;height:100vh;display:flex;flex-direction:column;overflow:hidden;}
   .mono{font-family:'JetBrains Mono',monospace;}
-  svg.icon{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;display:block;}
+  svg.icon{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;display:block;}
+  :focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:6px;}
 
-  header{flex:0 0 auto;height:var(--header-h);padding:0 14px;padding-top:env(safe-area-inset-top);display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);}
+  header{flex:0 0 auto;height:var(--header-h);padding:0 14px;padding-top:env(safe-area-inset-top);display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);gap:8px;}
   .bot-badge{display:flex;align-items:center;gap:10px;min-width:0;}
-  .bot-logo{width:34px;height:34px;border-radius:10px;flex:0 0 auto;background:linear-gradient(150deg,#eaf76b,#8ee6c7);display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(234,247,107,.25);}
-  .bot-logo svg{width:19px;height:19px;stroke:#12241a;stroke-width:2;}
+  .bot-logo{width:34px;height:34px;border-radius:10px;flex:0 0 auto;background:linear-gradient(150deg,#e9f76a,#8ee6c7);display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(233,247,106,.25);}
+  .bot-logo svg{width:19px;height:19px;stroke:#0d1f16;stroke-width:1.8;}
   .bot-text{line-height:1.15;min-width:0;}
   .bot-text .name-row{display:flex;align-items:center;gap:6px;}
   .bot-text h1{margin:0;font-size:14.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
@@ -44,31 +57,39 @@
   .bot-text .sub{font-size:10.5px;color:var(--muted);}
   .bot-text .sub a{color:var(--accent-2);text-decoration:none;}
 
-  .limit-pill{display:flex;align-items:center;gap:5px;flex:0 0 auto;padding:6px 10px;border-radius:999px;background:var(--surface);border:1px solid var(--line);cursor:default;}
-  .limit-pill svg{width:14px;height:14px;stroke:var(--accent);}
+  .header-actions{display:flex;align-items:center;gap:6px;flex:0 0 auto;}
+  .limit-pill{display:flex;align-items:center;gap:5px;padding:6px 10px;border-radius:999px;background:var(--surface);border:1px solid var(--line);cursor:default;min-height:32px;}
+  .limit-pill svg{width:14px;height:14px;stroke:var(--accent-2);}
   .limit-pill .num{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;}
+  .limit-pill.low{cursor:pointer;}
   .limit-pill.low .num{color:var(--danger);}
+  .limit-pill.low svg{stroke:var(--danger);}
+
+  .icon-btn{width:34px;height:34px;border-radius:10px;border:1px solid var(--line);background:var(--surface);color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer;flex:0 0 auto;}
+  .icon-btn svg{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;}
 
   main{flex:1 1 auto;min-height:0;position:relative;display:flex;flex-direction:column;}
   .stage{flex:1 1 auto;min-height:0;margin:10px 12px 8px;border-radius:16px;overflow:hidden;background:var(--surface);border:1px solid var(--line);position:relative;display:flex;align-items:center;justify-content:center;}
   canvas{max-width:100%;max-height:100%;width:auto;height:auto;display:block;}
   .stage.empty{cursor:pointer;}
   .dropcopy{text-align:center;color:var(--muted);font-size:13.5px;padding:0 28px;}
-  .dropcopy svg{width:36px;height:36px;stroke:var(--accent);margin:0 auto 10px;}
-  .dropcopy .mono{display:block;margin-top:8px;color:var(--accent);font-size:10.5px;}
+  .dropcopy svg{width:36px;height:36px;stroke:var(--accent-2);margin:0 auto 10px;}
+  .dropcopy .mono{display:block;margin-top:8px;color:var(--accent-2);font-size:10.5px;}
   input[type=file]{display:none;}
-  .status-pill{position:absolute;top:10px;left:10px;font-family:'JetBrains Mono',monospace;font-size:9.5px;color:var(--accent);background:rgba(0,0,0,.35);padding:4px 9px;border-radius:999px;pointer-events:none;max-width:calc(100% - 66px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .status-pill{position:absolute;top:10px;left:10px;font-family:'JetBrains Mono',monospace;font-size:9.5px;color:#fff;background:rgba(10,20,16,.6);padding:4px 9px;border-radius:999px;pointer-events:none;max-width:calc(100% - 90px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .stage-actions{position:absolute;top:10px;right:10px;display:flex;gap:6px;}
-  .stage-icon-btn{width:30px;height:30px;border-radius:9px;border:1px solid var(--line);background:rgba(0,0,0,.35);color:var(--accent);display:flex;align-items:center;justify-content:center;cursor:pointer;}
-  .stage-icon-btn svg{width:15px;height:15px;}
-  .busy-overlay{position:absolute;inset:0;background:rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;flex-direction:column;gap:8px;color:#fff;font-size:12px;}
+  .stage-icon-btn{width:30px;height:30px;border-radius:9px;border:1px solid rgba(255,255,255,.25);background:rgba(10,20,16,.55);color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;}
+  .stage-icon-btn svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;}
+  .busy-overlay{position:absolute;inset:0;background:rgba(6,14,11,.72);display:none;align-items:center;justify-content:center;flex-direction:column;gap:10px;color:#fff;font-size:12.5px;text-align:center;padding:0 24px;}
   .busy-overlay.show{display:flex;}
-  .spinner{width:26px;height:26px;border-radius:50%;border:3px solid rgba(255,255,255,.25);border-top-color:var(--accent);animation:spin .7s linear infinite;}
+  .spinner{width:28px;height:28px;border-radius:50%;border:3px solid rgba(255,255,255,.25);border-top-color:var(--accent);animation:spin .7s linear infinite;}
   @keyframes spin{to{transform:rotate(360deg);}}
+  .busy-sub{color:rgba(255,255,255,.7);font-size:10.5px;}
 
   .tabs-row{display:flex;gap:6px;padding:0 12px 8px;overflow-x:auto;scrollbar-width:none;}
   .tabs-row::-webkit-scrollbar{display:none;}
-  .tab-chip{flex:0 0 auto;padding:7px 13px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--muted);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;}
+  .tab-chip{flex:0 0 auto;padding:7px 13px;min-height:32px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--muted);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;display:flex;align-items:center;gap:5px;}
+  .tab-chip svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:1.6;}
   .tab-chip[aria-pressed="true"]{border-color:var(--accent);color:var(--accent-ink);background:var(--accent);}
 
   .rail{flex:0 0 auto;display:flex;gap:8px;padding:0 12px 10px;overflow-x:auto;scroll-snap-type:x proximity;scrollbar-width:none;}
@@ -81,8 +102,8 @@
   .sheet-handle{flex:0 0 auto;height:44px;display:flex;align-items:center;justify-content:space-between;padding:0 16px;cursor:pointer;}
   .sheet-tabs{display:flex;gap:10px;}
   .sheet-tab{font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600;cursor:pointer;padding-bottom:2px;}
-  .sheet-tab.active{color:var(--accent);border-bottom:2px solid var(--accent);}
-  .sheet-handle svg{width:13px;height:13px;color:var(--muted);transition:transform .2s;}
+  .sheet-tab.active{color:var(--text);border-bottom:2px solid var(--accent-2);}
+  .sheet-handle svg{width:13px;height:13px;color:var(--muted);transition:transform .2s;stroke:currentColor;fill:none;stroke-width:1.8;}
   .sheet.collapsed .sheet-handle svg{transform:rotate(180deg);}
   .sheet-body{padding:2px 16px 14px;overflow-y:auto;-webkit-overflow-scrolling:touch;}
   .sheet-pane{display:none;}
@@ -90,7 +111,7 @@
 
   .slider-row{margin-bottom:14px;}
   .slider-row .label-line{display:flex;justify-content:space-between;align-items:baseline;font-size:12.5px;margin-bottom:7px;}
-  .slider-row .val{color:var(--accent);font-weight:600;}
+  .slider-row .val{color:var(--accent-2);font-weight:600;}
   .slider-row.disabled{opacity:.4;pointer-events:none;}
   input[type=range]{-webkit-appearance:none;width:100%;height:26px;background:transparent;outline:none;}
   input[type=range]::-webkit-slider-runnable-track{height:5px;border-radius:3px;background:var(--line);}
@@ -98,7 +119,8 @@
   input[type=range]::-moz-range-track{height:5px;border-radius:3px;background:var(--line);}
   input[type=range]::-moz-range-thumb{width:24px;height:24px;border-radius:50%;border:4px solid var(--bg);background:var(--accent);cursor:pointer;}
   .reset-row{display:flex;gap:8px;margin-top:4px;}
-  .mini-btn{flex:1;border:1px solid var(--line);background:var(--surface);color:var(--text);border-radius:10px;padding:9px 0;font-size:12.5px;font-weight:600;cursor:pointer;font-family:'Space Grotesk';}
+  .mini-btn{flex:1;border:1px solid var(--line);background:var(--surface);color:var(--text);border-radius:10px;padding:9px 0;font-size:12.5px;font-weight:600;cursor:pointer;font-family:'Space Grotesk';display:flex;align-items:center;justify-content:center;gap:6px;}
+  .mini-btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.6;}
 
   .chip-grid{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:14px;}
   .ratio-chip{padding:7px 12px;border-radius:10px;border:1px solid var(--line);background:var(--surface);color:var(--muted);font-size:12px;font-weight:600;cursor:pointer;}
@@ -112,47 +134,53 @@
   .footer-credit a{color:var(--accent-2);text-decoration:none;}
   button.primary,button.ghost{border:none;border-radius:14px;font-family:'Space Grotesk',sans-serif;font-size:14.5px;font-weight:700;cursor:pointer;min-height:46px;display:flex;align-items:center;justify-content:center;gap:7px;}
   button.primary{flex:1;background:var(--accent);color:var(--accent-ink);}
-  button.primary:disabled{background:var(--surface-2);color:var(--muted);}
+  button.primary:disabled{background:var(--surface-2);color:var(--muted);cursor:not-allowed;}
   button.ghost{flex:0 0 46px;background:var(--surface);color:var(--text);border:1px solid var(--line);}
-  button.ghost svg{width:18px;height:18px;}
-  button.primary svg{width:17px;height:17px;}
+  button.ghost:disabled{color:var(--muted);cursor:not-allowed;}
+  button.ghost svg,button.primary svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;}
 
-  .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(2px);display:flex;align-items:flex-end;z-index:50;opacity:0;pointer-events:none;transition:opacity .18s;}
+  .modal-overlay{position:fixed;inset:0;background:rgba(6,14,11,.6);backdrop-filter:blur(2px);display:flex;align-items:flex-end;z-index:50;opacity:0;pointer-events:none;transition:opacity .18s;}
   .modal-overlay.open{opacity:1;pointer-events:auto;}
   .modal-sheet{width:100%;max-height:85vh;background:var(--surface-2);border-radius:18px 18px 0 0;display:flex;flex-direction:column;transform:translateY(16px);transition:transform .2s;padding-bottom:env(safe-area-inset-bottom);}
   .modal-overlay.open .modal-sheet{transform:translateY(0);}
   .modal-head{display:flex;align-items:center;justify-content:space-between;padding:15px 16px;border-bottom:1px solid var(--line);flex:0 0 auto;}
   .modal-head h2{margin:0;font-size:15px;}
   .modal-close{width:30px;height:30px;border-radius:9px;background:var(--surface);border:1px solid var(--line);color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer;}
-  .modal-close svg{width:15px;height:15px;}
+  .modal-close svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;}
   .modal-body{padding:14px 16px;overflow-y:auto;}
   .fx-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;}
   .fx-cell{background:none;border:2px solid var(--line);border-radius:13px;padding:0;overflow:hidden;cursor:pointer;text-align:left;}
   .fx-cell.active{border-color:var(--accent);}
   .fx-cell img{width:100%;aspect-ratio:1;object-fit:cover;display:block;background:var(--surface);}
   .fx-cell span{display:block;font-size:10px;padding:5px 7px;color:var(--muted);font-weight:600;}
-  .fx-cell.active span{color:var(--accent);}
+  .fx-cell.active span{color:var(--text);}
   .export-field{margin-bottom:16px;}
   .export-field .label-line{font-size:12.5px;margin-bottom:7px;display:flex;justify-content:space-between;}
-  .export-preview-note{font-size:10.5px;color:var(--muted);margin-top:6px;}
+  .export-preview-note{font-size:10.5px;color:var(--muted);margin-top:6px;line-height:1.5;}
 
-  .toast{position:fixed;left:50%;bottom:78px;transform:translateX(-50%);background:var(--surface-3);color:var(--text);padding:10px 16px;border-radius:999px;font-size:12px;border:1px solid var(--line);z-index:80;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;max-width:88vw;text-align:center;}
+  .toast{position:fixed;left:50%;bottom:78px;transform:translateX(-50%);background:var(--surface-3);color:var(--text);padding:10px 16px;border-radius:999px;font-size:12px;border:1px solid var(--line);z-index:80;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;max-width:88vw;text-align:center;display:flex;align-items:center;gap:7px;}
   .toast.show{opacity:1;transform:translateX(-50%) translateY(-4px);}
+  .toast svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.8;flex:0 0 auto;}
 </style>
 </head>
 <body>
 
 <header>
   <div class="bot-badge">
-    <div class="bot-logo"><svg viewBox="0 0 24 24"><path d="M13 2 4 14h6l-1 8 9-12h-6l1-8Z" stroke-linejoin="round"/></svg></div>
+    <div class="bot-logo"><svg viewBox="0 0 24 24"><path d="M9.5 3 4 12.5h4L6 21l9.5-11H11l3-7Z" stroke-linejoin="round" stroke-linecap="round"/></svg></div>
     <div class="bot-text">
       <div class="name-row"><h1>Bangali Icon</h1><span class="dot-live"></span></div>
       <div class="sub"><a href="https://t.me/YA_Rabbu" target="_blank" rel="noopener">@BangaliIconBot</a></div>
     </div>
   </div>
-  <div class="limit-pill mono" id="limitPill" title="Heavy-tool rate limit">
-    <svg viewBox="0 0 24 24"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="9"/></svg>
-    <span class="num" id="limitNum">5/5</span>
+  <div class="header-actions">
+    <div class="limit-pill mono" id="limitPill" title="Heavy-tool rate limit">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
+      <span class="num" id="limitNum">5/5</span>
+    </div>
+    <button class="icon-btn" id="profileBtn" title="Profile & credits">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c1.6-4 4.6-6 7-6s5.4 2 7 6"/></svg>
+    </button>
   </div>
 </header>
 
@@ -160,15 +188,19 @@
   <div class="stage empty" id="stage">
     <canvas id="canvas" width="800" height="800" style="display:none"></canvas>
     <div class="dropcopy" id="dropcopy">
-      <svg viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="14" rx="2"/><circle cx="12" cy="13" r="3.5"/><path d="M8 6l1.4-2h5.2L16 6"/></svg>
+      <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="15" rx="2.5"/><circle cx="9" cy="11" r="2"/><path d="m4 18 5-5 3 3 3-4 5 6"/></svg>
       Tap to choose a photo
       <span class="mono">JPG or PNG · processed on your device</span>
     </div>
     <span class="status-pill mono" id="status">ready</span>
     <div class="stage-actions">
-      <button class="stage-icon-btn" id="resetBtn" title="Reset"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 1 3 6.7"/><path d="M3 21v-6h6"/></svg></button>
+      <button class="stage-icon-btn" id="resetBtn" title="Reset"><svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 1 2.6 5.9"/><path d="M4 20v-5h5"/></svg></button>
     </div>
-    <div class="busy-overlay" id="busyOverlay"><div class="spinner"></div><span id="busyText">Applying…</span></div>
+    <div class="busy-overlay" id="busyOverlay">
+      <div class="spinner"></div>
+      <span id="busyText">Applying…</span>
+      <span class="busy-sub" id="busySub"></span>
+    </div>
     <input type="file" id="fileInput" accept="image/*">
   </div>
 
@@ -180,7 +212,7 @@
   <div class="sheet-handle" id="sheetHandle">
     <div class="sheet-tabs">
       <span class="sheet-tab active" data-pane="adjust" id="tabAdjust">Adjust</span>
-      <span class="sheet-tab" data-pane="frame" id="tabFrame">Aspect &amp; Crop</span>
+      <span class="sheet-tab" data-pane="frame" id="tabFrame">Aspect & Crop</span>
     </div>
     <svg viewBox="0 0 24 24"><path d="M18 15 12 9l-6 6"/></svg>
   </div>
@@ -196,7 +228,7 @@
         <input type="range" id="s_vignette" min="0" max="1" step="0.1" value="0.3"></div>
       <div class="slider-row" id="row_dotPitch"><div class="label-line"><span>Dot Pitch</span><span class="val mono" id="v_dotPitch">8</span></div>
         <input type="range" id="s_dotPitch" min="2" max="40" step="1" value="8"></div>
-      <div class="reset-row"><button class="mini-btn" id="paramResetBtn">♻ Reset to defaults</button></div>
+      <div class="reset-row"><button class="mini-btn" id="paramResetBtn"><svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 1 2.6 5.9"/><path d="M4 20v-5h5"/></svg>Reset to defaults</button></div>
     </div>
     <div class="sheet-pane" id="paneFrame">
       <div class="export-field"><div class="label-line"><span>Aspect ratio</span></div>
@@ -214,7 +246,7 @@
 
 <div class="footer-bar">
   <button class="ghost" id="sendBtn" disabled title="Send to bot chat">
-    <svg viewBox="0 0 24 24"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4 20-7Z"/></svg>
+    <svg viewBox="0 0 24 24"><path d="m3 11 18-8-8 18-2-8-8-2Z" stroke-linejoin="round"/></svg>
   </button>
   <button class="primary" id="exportBtn" disabled>
     <svg viewBox="0 0 24 24"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
@@ -252,13 +284,31 @@
           <button data-v="2" class="active">2×</button>
           <button data-v="3">3×</button>
         </div>
-        <div class="export-preview-note">Renders at high resolution from your original photo, on your device.</div>
+        <div class="export-preview-note">Renders at high resolution from your original photo, on your device. You'll get a system save dialog to pick a folder where supported.</div>
       </div>
     </div>
     <div class="footer-bar" style="border-top:1px solid var(--line);">
       <button class="primary" id="downloadBtn">
         <svg viewBox="0 0 24 24"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
         Download image
+      </button>
+    </div>
+    <div class="footer-credit">Designed &amp; developed by <a href="https://t.me/YA_Rabbu" target="_blank" rel="noopener">@YA_Rabbu</a></div>
+  </div>
+</div>
+
+<!-- Profile modal -->
+<div class="modal-overlay" id="profileOverlay">
+  <div class="modal-sheet">
+    <div class="modal-head"><h2>Profile & Usage</h2><button class="modal-close" id="closeProfile"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button></div>
+    <div class="modal-body">
+      <div class="export-field">
+        <div class="label-line"><span>Credits left (60s window)</span><span class="val mono" id="profileLimitNum">5/5</span></div>
+        <div class="export-preview-note">প্রতি ৬০ সেকেন্ডে ৫টি হেভি অ্যাকশন (Export / Send) ফ্রি। শেষ হয়ে গেলে নিচের বাটনে অতিরিক্ত ক্রেডিট রিকোয়েস্ট করতে পারেন।</div>
+      </div>
+      <button class="primary" id="requestCreditBtn" style="width:100%;">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+        Request more credits
       </button>
     </div>
     <div class="footer-credit">Designed &amp; developed by <a href="https://t.me/YA_Rabbu" target="_blank" rel="noopener">@YA_Rabbu</a></div>
@@ -275,10 +325,14 @@ var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : nu
 if (tg) { tg.ready(); tg.expand(); document.documentElement.setAttribute("data-theme", tg.colorScheme === "dark" ? "dark" : "light"); }
 function haptic(kind){ if (tg && tg.HapticFeedback) { if(kind==="light"||kind==="medium"||kind==="heavy") tg.HapticFeedback.impactOccurred(kind); else tg.HapticFeedback.notificationOccurred(kind); } }
 
-/* ============ RATE LIMIT (matches bot: 5 heavy calls / 60s window) ============
-   The real limit is enforced server-side by the bot (storage.py: RATE_LIMIT_HEAVY_MAX_CALLS=5,
-   RATE_LIMIT_WINDOW_SECONDS=60, per-user override via /setlimit). This mirrors that same
-   sliding-window model locally so the UI never promises something the bot won't honor. */
+/* ============ Icons (Hugeicons-style, 1.5-1.7 stroke, rounded) ============ */
+var ICONS = {
+  check:'<svg viewBox="0 0 24 24"><path d="m5 13 4 4L19 7"/></svg>',
+  warn:'<svg viewBox="0 0 24 24"><path d="M12 9v4"/><circle cx="12" cy="16" r=".5" fill="currentColor" stroke="none"/><path d="M10.3 3.9 2.7 17.1A1.7 1.7 0 0 0 4.2 19.7h15.6a1.7 1.7 0 0 0 1.5-2.6L13.7 3.9a1.7 1.7 0 0 0-3.4 0Z"/></svg>',
+  clock:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>'
+};
+
+/* ============ RATE LIMIT (matches bot: 5 heavy calls / 60s window) ============ */
 var RATE_LIMIT_MAX = 5, RATE_LIMIT_WINDOW = 60000;
 var callLog = [];
 function rateUsed(){
@@ -295,15 +349,18 @@ function rateWaitSeconds(){
 function paintLimit(){
   var used = rateUsed(), left = RATE_LIMIT_MAX - used;
   document.getElementById("limitNum").textContent = left + "/" + RATE_LIMIT_MAX;
-  document.getElementById("limitPill").classList.toggle("low", left <= 1);
+  var pill = document.getElementById("limitPill");
+  pill.classList.toggle("low", left <= 1);
+  pill.style.cursor = left <= 0 ? "pointer" : "default";
 }
 setInterval(paintLimit, 4000);
 paintLimit();
 
-function toast(msg){
+function toast(msg, icon){
   var t = document.getElementById("toast");
-  t.textContent = msg; t.classList.add("show");
-  clearTimeout(toast._t); toast._t = setTimeout(function(){ t.classList.remove("show"); }, 2400);
+  t.innerHTML = (icon ? ICONS[icon] : "") + "<span>" + msg + "</span>";
+  t.classList.add("show");
+  clearTimeout(toast._t); toast._t = setTimeout(function(){ t.classList.remove("show"); }, 2600);
 }
 
 /* ============ STATE ============ */
@@ -323,12 +380,13 @@ var fxRail = document.getElementById("fxRail");
 var catTabs = document.getElementById("catTabs");
 var busyOverlay = document.getElementById("busyOverlay");
 var busyText = document.getElementById("busyText");
+var busySub = document.getElementById("busySub");
 
-var WORK_SIZE = 800; /* bot's own IMAGE_MAX_DIM is 1200; keep preview snappy on-device */
+var WORK_SIZE = 800;
 var activeFx = "halftone-dots";
 var activeCat = "retro";
 
-/* ============ EFFECTS — mirrors modules/python_engine.py EFFECT_FUNCS exactly ============ */
+/* ============ EFFECTS ============ */
 var EFFECT_CATEGORIES = { retro:"Retro & Print", tone:"Color & Tone", art:"Artistic", digital:"Digital & Glitch", distort:"Distort & Special" };
 var CAT_ORDER = ["retro","tone","art","digital","distort"];
 var EFFECTS = [
@@ -347,9 +405,7 @@ var EFFECTS = [
 ];
 var EFFECT_NAMES = {}; EFFECTS.forEach(function(e){ EFFECT_NAMES[e[0]] = e[1]; });
 
-/* effects that read dotPitch, matching python_engine.py params.get("dotPitch", …) usage */
 var USES_DOT_PITCH = { "halftone-dots":1, "ascii-matrix":1, "pixelate":1, "stained-glass":1 };
-/* effects the engine skips grain/vignette for (mirrors _SKIP_GRAIN / _SKIP_VIGNETTE) */
 var SKIP_GRAIN = { "original":1,"halftone-dots":1,"ascii-matrix":1,"bayer-dither":1,"pixelate":1,"blueprint-cyan":1,"crosshatch-engraving":1,"retro-8bit":1,"glitch-art":1,"pencil-sketch":1,"kaleidoscope":1 };
 var SKIP_VIGNETTE = Object.assign({}, SKIP_GRAIN, {"horror-red":1,"lomography":1,"tilt-shift":1});
 
@@ -358,14 +414,24 @@ var PARAMS = Object.assign({}, DEFAULT_PARAMS);
 
 var ASPECT_RATIOS = [["original","Original"],["1:1","1:1"],["4:5","4:5"],["5:4","5:4"],["16:9","16:9"],["9:16","9:16"],["4:3","4:3"],["3:4","3:4"],["3:2","3:2"],["2:3","2:3"],["21:9","21:9"]];
 
+/* icons per category tab */
+var CAT_ICONS = {
+  retro:'<svg viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="12" rx="2"/><circle cx="8" cy="12" r="2"/><path d="M13 10h6M13 14h4"/></svg>',
+  tone:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18Z" fill="currentColor" stroke="none" opacity=".35"/></svg>',
+  art:'<svg viewBox="0 0 24 24"><path d="M12 3c-5 0-9 3.5-9 7.8 0 2.6 2 4.2 4.3 4.2h1a2 2 0 0 1 2 2v.6c0 1.9 1.7 3.4 3.7 2.9C18 19.6 21 16 21 11.5 21 6.8 17 3 12 3Z"/><circle cx="8.5" cy="9.5" r="1"/><circle cx="12" cy="7.5" r="1"/><circle cx="15.5" cy="9.5" r="1"/></svg>',
+  digital:'<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8M12 17v4"/><path d="m9 10 2 2-2 2M13 14h2"/></svg>',
+  distort:'<svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 14-5"/><path d="M20 12a8 8 0 0 1-14 5"/><path d="m18 7 2 0 0-2M6 17l-2 0 0 2"/></svg>'
+};
+
 /* ============ Category tabs + effect rail ============ */
 CAT_ORDER.forEach(function(cat){
   var chip = document.createElement("button");
-  chip.className = "tab-chip"; chip.textContent = EFFECT_CATEGORIES[cat];
+  chip.className = "tab-chip";
+  chip.innerHTML = CAT_ICONS[cat] + "<span>" + EFFECT_CATEGORIES[cat] + "</span>";
   chip.setAttribute("aria-pressed", cat === activeCat ? "true" : "false");
   chip.addEventListener("click", function(){
     activeCat = cat;
-    Array.prototype.forEach.call(catTabs.children, function(c){ c.setAttribute("aria-pressed", c === chip ? "true" : "false"); });
+    Array.prototype.forEach.call(catTabs.children, function(c){ if(c.dataset.gallery) return; c.setAttribute("aria-pressed", c === chip ? "true" : "false"); });
     buildRail();
   });
   catTabs.appendChild(chip);
@@ -389,7 +455,7 @@ function selectFx(id){
   var fx = EFFECTS.find(function(e){ return e[0] === id; });
   if (fx && fx[2] !== activeCat) {
     activeCat = fx[2];
-    Array.prototype.forEach.call(catTabs.children, function(c,i){ c.setAttribute("aria-pressed", CAT_ORDER[i] === activeCat ? "true" : "false"); });
+    Array.prototype.forEach.call(catTabs.children, function(c,i){ if(c.dataset.gallery) return; c.setAttribute("aria-pressed", CAT_ORDER[i] === activeCat ? "true" : "false"); });
     buildRail();
   } else {
     Array.prototype.forEach.call(fxRail.children, function(c){ c.setAttribute("aria-pressed", c.dataset.fx === id ? "true" : "false"); });
@@ -429,7 +495,7 @@ function syncSliders(){ SLIDER_KEYS.forEach(function(k){ document.getElementById
 function updateDotPitchVisibility(){ document.getElementById("row_dotPitch").classList.toggle("disabled", !USES_DOT_PITCH[activeFx]); }
 document.getElementById("paramResetBtn").addEventListener("click", function(){
   Object.assign(PARAMS, DEFAULT_PARAMS);
-  syncSliders(); render(); haptic("light"); toast("Parameters reset to bot defaults");
+  syncSliders(); render(); haptic("light"); toast("Parameters reset to bot defaults", "check");
 });
 
 /* Aspect ratio chips */
@@ -451,7 +517,7 @@ document.getElementById("cropSeg").addEventListener("click", function(e){
   PARAMS.cropMode = btn.dataset.v; render();
 });
 
-/* ============ Pixel helpers (approximate the PIL/numpy ops in python_engine.py) ============ */
+/* ============ Pixel helpers ============ */
 function clamp8(v){ return v < 0 ? 0 : v > 255 ? 255 : v; }
 function luma(r,g,b){ return 0.2126*r + 0.7152*g + 0.0722*b; }
 
@@ -460,7 +526,6 @@ function toGrayscale(id){
   for (var i=0;i<d.length;i+=4){ var l = luma(d[i],d[i+1],d[i+2]); d[i]=d[i+1]=d[i+2]=l; }
   return id;
 }
-/* _apply_base_adjustments: ImageEnhance.Contrast / Brightness */
 function applyContrastBrightness(id, contrast, brightness){
   var d = id.data;
   for (var i=0;i<d.length;i+=4){
@@ -473,14 +538,12 @@ function applyContrastBrightness(id, contrast, brightness){
   }
   return id;
 }
-/* _add_grain */
 function addGrain(id, intensity){
   if (intensity <= 0) return id;
   var d = id.data, amt = intensity * 0.3;
   for (var i=0;i<d.length;i+=4){ var n = (Math.random()*2-1)*amt; d[i]=clamp8(d[i]+n); d[i+1]=clamp8(d[i+1]+n); d[i+2]=clamp8(d[i+2]+n); }
   return id;
 }
-/* _add_vignette */
 function addVignette(id, w, h, strength){
   if (strength <= 0) return id;
   strength *= 0.5;
@@ -492,7 +555,6 @@ function addVignette(id, w, h, strength){
   }}
   return id;
 }
-/* _duotone */
 function duotone(id, dark, light){
   var d = id.data;
   for (var i=0;i<d.length;i+=4){
@@ -503,7 +565,6 @@ function duotone(id, dark, light){
   }
   return id;
 }
-/* _channel_shift */
 function channelShift(id, w, h, dxR, dxG, dxB){
   var src = id.data, out = new Uint8ClampedArray(src.length);
   function shiftCh(ch, dx){
@@ -517,7 +578,6 @@ function channelShift(id, w, h, dxR, dxG, dxB){
   for (var i=3;i<src.length;i+=4) out[i]=255;
   return new ImageData(out, w, h);
 }
-/* _scanlines */
 function scanlines(id, w, h, spacing, darkness){
   var d = id.data;
   for (var y=0;y<h;y+=spacing){ for (var x=0;x<w;x++){ var idx=(y*w+x)*4; var m=1-darkness; d[idx]*=m; d[idx+1]*=m; d[idx+2]*=m; } }
@@ -569,9 +629,8 @@ function saturate(id, amt){
   } return id;
 }
 
-/* ============ 38 effect implementations (approximating python_engine.py) ============ */
+/* ============ 38 effect implementations ============ */
 function fx_original(id,w,h,p){ return id; }
-
 function fx_halftone_dots(id,w,h,p){
   var pitch = Math.max(2, Math.round(p.dotPitch));
   var gray = new Uint8ClampedArray(w*h);
@@ -827,7 +886,6 @@ var EFFECT_FUNCS = {
   "inferno":fx_inferno,"horror-red":fx_horror_red,"tilt-shift":fx_tilt_shift,"kaleidoscope":fx_kaleidoscope,
 };
 
-/* mirrors apply_effect() in python_engine.py: base adjust -> effect -> grain -> vignette -> aspect -> resize */
 function applyEffect(effect, id, w, h, params){
   var working = cloneId(id);
   applyContrastBrightness(working, params.contrast, params.brightness);
@@ -838,7 +896,6 @@ function applyEffect(effect, id, w, h, params){
   return result;
 }
 
-/* aspect ratio crop/pad, mirrors _apply_aspect_ratio */
 function applyAspectRatio(canvasSrc, ratioKey, mode){
   if (!ratioKey || ratioKey === "original") return canvasSrc;
   var map = {"1:1":[1,1],"4:5":[4,5],"5:4":[5,4],"16:9":[16,9],"9:16":[9,16],"4:3":[4,3],"3:4":[3,4],"3:2":[3,2],"2:3":[2,3],"21:9":[21,9]};
@@ -893,7 +950,7 @@ resetBtn.addEventListener("click", function(){
   document.querySelectorAll(".ratio-chip").forEach(function(c){ c.setAttribute("aria-pressed", c.textContent==="Original"?"true":"false"); });
   document.querySelectorAll("#cropSeg button").forEach(function(b){ b.classList.toggle("active", b.dataset.v==="crop"); });
   activeFx="halftone-dots"; activeCat="retro";
-  Array.prototype.forEach.call(catTabs.children, function(c,i){ c.setAttribute("aria-pressed", CAT_ORDER[i]==="retro"?"true":"false"); });
+  Array.prototype.forEach.call(catTabs.children, function(c,i){ if(c.dataset.gallery) return; c.setAttribute("aria-pressed", CAT_ORDER[i]==="retro"?"true":"false"); });
   buildRail();
   setStatus("ready"); haptic("light");
 });
@@ -921,11 +978,10 @@ function render(){
 /* ============ Gallery ============ */
 var galleryOverlay = document.getElementById("galleryOverlay");
 var fxGrid = document.getElementById("fxGrid");
-var openGalleryBtn = document.createElement("button");
-/* add a "see all" affordance next to category tabs */
 (function addGalleryBtn(){
   var btn = document.createElement("button");
-  btn.className = "tab-chip"; btn.textContent = "⊞ All 38";
+  btn.className = "tab-chip"; btn.dataset.gallery = "1";
+  btn.innerHTML = '<svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>All 38</span>';
   btn.style.marginLeft = "2px";
   btn.addEventListener("click", function(){ if (!srcImage) { fileInput.click(); return; } buildGallery(); galleryOverlay.classList.add("open"); });
   catTabs.appendChild(btn);
@@ -953,12 +1009,15 @@ function buildGallery(){
   canvas.width=savedCanvasW; canvas.height=savedCanvasH; ctx.canvas.width=savedCanvasW; ctx.canvas.height=savedCanvasH; render();
 }
 
-/* ============ Export (download) — fixed for Telegram in-app WebView ============
-   A plain <a download> click is silently swallowed by many Telegram WebViews
-   (especially iOS). We try, in order: Telegram's own downloadFile bridge (if the
-   client supports it), then a same-tab navigation to a Blob URL (works in most
-   WebViews and shows the OS "save image" sheet on long-press), and only fall back
-   to the classic anchor-click for regular desktop/mobile browsers outside Telegram. */
+/* ============ Export (download) — real render → OS save-dialog flow ============
+   1) Render the export at full resolution off-screen (busy overlay shown).
+   2) On browsers that support the File System Access API (most desktop Chrome/
+      Edge, and increasingly Android WebViews), call showSaveFilePicker so the
+      user explicitly chooses a folder and the file writes straight there.
+   3) Everywhere else (iOS Safari/WebView, older browsers) fall back to a
+      same-origin Blob URL + <a download> click, which triggers the native
+      "Save Image" / file-save sheet — never a new tab/link the user has to
+      navigate away from. */
 var exportOverlay = document.getElementById("exportOverlay");
 var exportFormat="png", exportScale=2;
 exportBtn.addEventListener("click", function(){ if (!srcImage) return; exportOverlay.classList.add("open"); });
@@ -977,12 +1036,17 @@ document.getElementById("scaleSeg").addEventListener("click", function(e){
 var qualitySlider = document.getElementById("qualitySlider");
 qualitySlider.addEventListener("input", function(){ document.getElementById("qualityVal").textContent = qualitySlider.value; });
 
-function setBusy(on, text){ busyOverlay.classList.toggle("show", on); if (text) busyText.textContent = text; }
+function setBusy(on, text, sub){
+  busyOverlay.classList.toggle("show", on);
+  if (text) busyText.textContent = text;
+  busySub.textContent = sub || "";
+}
 
 document.getElementById("downloadBtn").addEventListener("click", function(){
   if (!srcImage) return;
-  if (!rateAllowed()){ toast("⏳ Please wait ~" + rateWaitSeconds() + "s (" + rateUsed() + "/" + RATE_LIMIT_MAX + " used in last 60s)"); return; }
-  setBusy(true, "Rendering export…");
+  if (!rateAllowed()){ toast("Please wait ~" + rateWaitSeconds() + "s (" + rateUsed() + "/" + RATE_LIMIT_MAX + " used)", "clock"); return; }
+  exportOverlay.classList.remove("open");
+  setBusy(true, "Rendering image…", "Applying effect at export resolution");
   setTimeout(function(){
     try{
       var maxDim = 2400;
@@ -1007,69 +1071,106 @@ document.getElementById("downloadBtn").addEventListener("click", function(){
       var quality = exportFormat==="png" ? undefined : parseFloat(qualitySlider.value);
       var filename = "bangaliicon-" + activeFx + "-" + framed.width + "x" + framed.height + "." + (exportFormat==="jpeg"?"jpg":exportFormat);
 
+      setBusy(true, "Preparing file…", "Almost done");
       framed.toBlob(function(blob){
         canvas.width=savedCanvasW; canvas.height=savedCanvasH; ctx.canvas.width=savedCanvasW; ctx.canvas.height=savedCanvasH; render();
-        setBusy(false);
-        if (!blob){ toast("Export failed — try a smaller resolution"); return; }
-        doDownload(blob, filename);
-        rateRecord();
-        exportOverlay.classList.remove("open");
-        toast("Exported " + framed.width + "×" + framed.height);
-        haptic("success");
+        if (!blob){
+          try{
+            var dataUrl = framed.toDataURL(mime, quality);
+            fetch(dataUrl).then(function(r){return r.blob();}).then(function(b2){ saveBlob(b2, filename, mime); })
+              .catch(function(){ setBusy(false); toast("Export failed — try a smaller resolution", "warn"); });
+          }catch(e){ setBusy(false); toast("Export failed — try a smaller resolution", "warn"); }
+          return;
+        }
+        saveBlob(blob, filename, mime);
       }, mime, quality);
     } catch(err){
-      setBusy(false); toast("Export failed: " + (err && err.message ? err.message : "unknown error"));
+      setBusy(false); toast("Export failed: " + (err && err.message ? err.message : "unknown error"), "warn");
     }
   }, 30);
 });
 
-function doDownload(blob, filename){
-  /* 1) Telegram's native download bridge, when the client supports it */
-  if (tg && typeof tg.downloadFile === "function"){
-    var reader = new FileReader();
-    reader.onload = function(){
-      try{
-        tg.downloadFile({ url: reader.result, file_name: filename }, function(accepted){
-          if (!accepted) fallbackDownload(blob, filename);
-        });
-      } catch(e){ fallbackDownload(blob, filename); }
-    };
-    reader.readAsDataURL(blob);
+function saveBlob(blob, filename, mime){
+  /* Prefer the native "choose a folder" save dialog when available */
+  if (window.showSaveFilePicker){
+    setBusy(true, "Waiting for save location…", "Choose a folder to save into");
+    var ext = filename.split(".").pop();
+    window.showSaveFilePicker({
+      suggestedName: filename,
+      types: [{ description: "Image", accept: (function(){ var o={}; o[mime]=["."+ext]; return o; })() }]
+    }).then(function(handle){
+      return handle.createWritable().then(function(writable){
+        return writable.write(blob).then(function(){ return writable.close(); });
+      });
+    }).then(function(){
+      setBusy(false);
+      rateRecord();
+      toast("Saved " + filename, "check");
+      haptic("success");
+    }).catch(function(err){
+      setBusy(false);
+      if (err && err.name === "AbortError"){ toast("Save cancelled"); return; }
+      /* Picker failed for some other reason — fall back to anchor download */
+      anchorDownload(blob, filename);
+    });
     return;
   }
-  fallbackDownload(blob, filename);
+  anchorDownload(blob, filename);
 }
-function fallbackDownload(blob, filename){
+
+function anchorDownload(blob, filename){
+  setBusy(true, "Starting download…", "Check your device's Downloads folder");
   var url = URL.createObjectURL(blob);
-  if (tg){
-    /* Inside Telegram's WebView, anchor-click downloads are often swallowed.
-       Opening the blob URL as a link lets the user long-press → Save Image,
-       which always works even when the download attribute is ignored. */
-    try {
-      if (tg.openLink) { tg.openLink(url); setTimeout(function(){ URL.revokeObjectURL(url); }, 30000); toast("Opened in viewer — long-press to save"); return; }
-    } catch(e){ /* fall through */ }
-    window.open(url, "_blank");
-    setTimeout(function(){ URL.revokeObjectURL(url); }, 30000);
-    toast("Opened in viewer — long-press to save");
-    return;
-  }
   var a = document.createElement("a");
-  a.href = url; a.download = filename; document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  setTimeout(function(){ URL.revokeObjectURL(url); }, 5000);
+  a.href = url; a.download = filename; a.style.display = "none";
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(function(){
+    URL.revokeObjectURL(url);
+    setBusy(false);
+    rateRecord();
+    toast("Downloaded " + filename, "check");
+    haptic("success");
+  }, 500);
 }
 
 /* ============ Send to bot ============ */
 sendBtn.addEventListener("click", function(){
   if (!srcImage) return;
-  if (!rateAllowed()){ toast("⏳ Please wait ~" + rateWaitSeconds() + "s (" + rateUsed() + "/" + RATE_LIMIT_MAX + " used in last 60s)"); return; }
+  if (!rateAllowed()){ toast("Please wait ~" + rateWaitSeconds() + "s (" + rateUsed() + "/" + RATE_LIMIT_MAX + " used)", "clock"); return; }
   if (tg && tg.sendData){
     var payload = JSON.stringify({ effect: activeFx, params: PARAMS });
     if (payload.length <= 4000){
       tg.sendData(payload); rateRecord();
       setStatus("sent to bot — generating full-res on server");
       haptic("success");
-    } else { toast("Settings too large — simplify and retry"); }
-  } else { toast("Open inside Telegram to send to the bot"); }
+    } else { toast("Settings too large — simplify and retry", "warn"); }
+  } else { toast("Open inside Telegram to send to the bot", "warn"); }
+});
+
+/* ============ Profile modal ============ */
+var profileOverlay = document.getElementById("profileOverlay");
+document.getElementById("profileBtn").addEventListener("click", openProfile);
+document.getElementById("limitPill").addEventListener("click", function(){
+  if (rateUsed() >= RATE_LIMIT_MAX) openProfile();
+});
+function openProfile(){
+  document.getElementById("profileLimitNum").textContent = (RATE_LIMIT_MAX - rateUsed()) + "/" + RATE_LIMIT_MAX;
+  profileOverlay.classList.add("open");
+}
+document.getElementById("closeProfile").addEventListener("click", function(){ profileOverlay.classList.remove("open"); });
+profileOverlay.addEventListener("click", function(e){ if (e.target===profileOverlay) profileOverlay.classList.remove("open"); });
+document.getElementById("requestCreditBtn").addEventListener("click", function(){
+  if (tg && tg.sendData){
+    try{
+      tg.sendData(JSON.stringify({ action: "request_credit" }));
+      toast("Request sent — bot will reply", "check");
+      profileOverlay.classList.remove("open");
+      haptic("success");
+      return;
+    }catch(e){ /* fall through */ }
+  }
+  if (tg && tg.openTelegramLink){ tg.openTelegramLink("https://t.me/YA_Rabbu"); }
+  else { window.open("https://t.me/YA_Rabbu", "_blank"); }
 });
 
 paintLimit();

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
 <title>BangaliIcon · Effects Studio</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -13,6 +13,9 @@
     --text:#f2f6df; --muted:#8fae9f; --line:#255145;
     --accent:#eaf76b; --accent-dim:#3d5c3a; --danger:#ff6b5e;
     --accent-ink:#12241a;
+    --sheet-h: 42vh;
+    --header-h: 52px;
+    --footer-h: 64px;
   }
   @media (prefers-color-scheme: light){
     :root:not([data-theme="dark"]){
@@ -26,117 +29,177 @@
     --text:#f2f6df; --muted:#8fae9f; --line:#255145;
     --accent:#eaf76b; --accent-dim:#3d5c3a; --accent-ink:#12241a;
   }
-  *{box-sizing:border-box;}
-  html,body{margin:0;padding:0;overflow-x:clip;}
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{ margin:0; padding:0; overflow-x:clip; overscroll-behavior:none; }
+  html{ height:100%; }
   body{
     background:var(--bg); color:var(--text);
     font-family:'Space Grotesk',system-ui,sans-serif;
-    min-height:100vh; padding-bottom:96px;
+    height:100dvh; height:100vh;
+    display:flex; flex-direction:column;
+    overflow:hidden;
   }
   .mono{ font-family:'JetBrains Mono',monospace; }
 
   header{
-    padding:18px 16px 10px; border-bottom:1px solid var(--line);
+    flex:0 0 auto;
+    height:var(--header-h);
+    padding:0 14px; padding-top:env(safe-area-inset-top);
+    display:flex; align-items:center; justify-content:space-between;
+    border-bottom:1px solid var(--line);
   }
-  header .tag{ font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--accent); letter-spacing:.02em; }
-  header h1{ margin:4px 0 0; font-size:19px; font-weight:700; }
-  header p{ margin:4px 0 0; font-size:13px; color:var(--muted); max-width:34ch; }
+  header .brand{ display:flex; flex-direction:column; line-height:1.1; }
+  header .brand .tag{ font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--accent); }
+  header .brand h1{ margin:0; font-size:15px; font-weight:700; }
+  header .icon-btn{
+    width:36px; height:36px; border-radius:10px; border:1px solid var(--line);
+    background:var(--surface); color:var(--text); font-size:16px;
+    display:flex; align-items:center; justify-content:center; cursor:pointer;
+  }
 
+  main{
+    flex:1 1 auto; min-height:0; position:relative;
+    display:flex; flex-direction:column;
+  }
   .stage{
-    margin:16px; border-radius:14px; overflow:hidden;
+    flex:1 1 auto; min-height:0;
+    margin:10px 12px 8px; border-radius:16px; overflow:hidden;
     background:var(--surface); border:1px solid var(--line);
-    aspect-ratio:1/1; position:relative;
+    position:relative;
     display:flex; align-items:center; justify-content:center;
   }
-  canvas{ width:100%; height:100%; display:block; image-rendering:pixelated; }
+  canvas{ max-width:100%; max-height:100%; width:auto; height:auto; display:block; image-rendering:pixelated; }
   .stage.empty{ cursor:pointer; }
-  .dropcopy{ text-align:center; color:var(--muted); font-size:13px; padding:0 24px; }
-  .dropcopy .mono{ display:block; margin-top:6px; color:var(--accent); font-size:12px; }
+  .dropcopy{ text-align:center; color:var(--muted); font-size:14px; padding:0 28px; }
+  .dropcopy .icon{ font-size:34px; display:block; margin-bottom:10px; }
+  .dropcopy .mono{ display:block; margin-top:8px; color:var(--accent); font-size:11px; }
   input[type=file]{ display:none; }
 
+  .status-pill{
+    position:absolute; top:10px; left:10px;
+    font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--accent);
+    background:rgba(0,0,0,.35); padding:4px 9px; border-radius:999px;
+    pointer-events:none; max-width:calc(100% - 20px); overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap;
+  }
+
   .rail{
-    display:flex; gap:8px; padding:0 16px; overflow-x:auto;
+    flex:0 0 auto;
+    display:flex; gap:8px; padding:0 12px 10px;
+    overflow-x:auto; scroll-snap-type:x proximity;
     scrollbar-width:none;
   }
   .rail::-webkit-scrollbar{ display:none; }
   .fx-chip{
-    flex:0 0 auto; padding:9px 14px; border-radius:999px;
+    flex:0 0 auto; scroll-snap-align:start;
+    min-height:40px; padding:0 16px; border-radius:999px;
     border:1px solid var(--line); background:var(--surface);
     color:var(--muted); font-size:13px; font-weight:500;
-    cursor:pointer; white-space:nowrap; transition:border-color .15s, color .15s;
+    cursor:pointer; white-space:nowrap; transition:border-color .15s, color .15s, background .15s;
+    display:flex; align-items:center;
   }
   .fx-chip[aria-pressed="true"]{
-    border-color:var(--accent); color:var(--text); background:var(--accent-dim);
+    border-color:var(--accent); color:var(--accent-ink); background:var(--accent);
+    font-weight:700;
   }
 
-  .panel{ padding:20px 16px 4px; }
-  .panel h2{
-    margin:0 0 14px; font-size:12px; text-transform:uppercase;
-    letter-spacing:.08em; color:var(--muted); font-weight:500;
+  .sheet{
+    flex:0 0 auto;
+    background:var(--surface-2); border-top:1px solid var(--line);
+    border-radius:18px 18px 0 0;
+    max-height:var(--sheet-h);
+    display:flex; flex-direction:column;
+    transition:max-height .22s ease;
   }
+  .sheet.collapsed{ max-height:44px; }
+  .sheet-handle{
+    flex:0 0 auto; height:44px; display:flex; align-items:center; justify-content:space-between;
+    padding:0 16px; cursor:pointer;
+  }
+  .sheet-handle .grip{ width:36px; height:4px; border-radius:2px; background:var(--line); margin:0 auto; }
+  .sheet-handle .title{
+    font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); font-weight:600;
+  }
+  .sheet-handle .chevron{ font-size:12px; color:var(--muted); transition:transform .2s; }
+  .sheet.collapsed .sheet-handle .chevron{ transform:rotate(180deg); }
+  .sheet-body{
+    padding:2px 16px 14px; overflow-y:auto; -webkit-overflow-scrolling:touch;
+  }
+
   .slider-row{ margin-bottom:16px; }
   .slider-row .label-line{
     display:flex; justify-content:space-between; align-items:baseline;
-    font-size:13px; margin-bottom:6px;
+    font-size:13px; margin-bottom:8px;
   }
-  .slider-row .val{ color:var(--accent); }
+  .slider-row .val{ color:var(--accent); font-weight:600; }
   input[type=range]{
-    -webkit-appearance:none; width:100%; height:4px; border-radius:2px;
-    background:var(--line); outline:none;
+    -webkit-appearance:none; width:100%; height:28px; background:transparent; outline:none;
+  }
+  input[type=range]::-webkit-slider-runnable-track{
+    height:5px; border-radius:3px; background:var(--line);
   }
   input[type=range]::-webkit-slider-thumb{
-    -webkit-appearance:none; width:18px; height:18px; border-radius:50%;
-    background:var(--accent); border:3px solid var(--bg); cursor:pointer;
-    box-shadow:0 0 0 1px var(--accent);
+    -webkit-appearance:none; margin-top:-11px;
+    width:26px; height:26px; border-radius:50%;
+    background:var(--accent); border:4px solid var(--bg); cursor:pointer;
+    box-shadow:0 1px 4px rgba(0,0,0,.35);
   }
+  input[type=range]::-moz-range-track{ height:5px; border-radius:3px; background:var(--line); }
   input[type=range]::-moz-range-thumb{
-    width:18px; height:18px; border-radius:50%; border:3px solid var(--bg);
-    background:var(--accent); cursor:pointer; box-shadow:0 0 0 1px var(--accent);
+    width:26px; height:26px; border-radius:50%; border:4px solid var(--bg);
+    background:var(--accent); cursor:pointer; box-shadow:0 1px 4px rgba(0,0,0,.35);
   }
 
   .footer-bar{
-    position:fixed; left:0; right:0; bottom:0;
-    background:linear-gradient(180deg, transparent, var(--bg) 30%);
-    padding:20px 16px calc(16px + env(safe-area-inset-bottom));
+    flex:0 0 auto;
+    background:var(--bg); border-top:1px solid var(--line);
+    padding:10px 12px calc(10px + env(safe-area-inset-bottom));
     display:flex; gap:10px;
   }
   button.primary, button.ghost{
-    flex:1; border:none; border-radius:12px; padding:14px 16px;
+    border:none; border-radius:14px;
     font-family:'Space Grotesk',sans-serif; font-size:15px; font-weight:700;
-    cursor:pointer;
+    cursor:pointer; min-height:48px;
   }
-  button.primary{ background:var(--accent); color:var(--accent-ink); }
+  button.primary{ flex:1; background:var(--accent); color:var(--accent-ink); }
   button.primary:disabled{ background:var(--surface-2); color:var(--muted); }
-  button.ghost{ flex:0 0 auto; background:var(--surface); color:var(--text); border:1px solid var(--line); }
-
-  .status{ font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--muted); padding:0 16px 10px; min-height:14px; }
+  button.ghost{ flex:0 0 48px; background:var(--surface); color:var(--text); border:1px solid var(--line); font-size:18px; }
 </style>
 </head>
 <body>
 
 <header>
-  <div class="tag">// bangaliicon studio</div>
-  <h1>Effects Studio</h1>
-  <p>Drop a photo, pick a look, tune it live, send the result straight back to the bot.</p>
+  <div class="brand">
+    <span class="tag mono">// bangaliicon studio</span>
+    <h1>Effects Studio</h1>
+  </div>
+  <button class="icon-btn" id="resetBtn" title="Reset image" aria-label="Reset">↺</button>
 </header>
 
-<div class="stage empty" id="stage">
-  <canvas id="canvas" width="800" height="800" style="display:none"></canvas>
-  <div class="dropcopy" id="dropcopy">
-    Tap to choose a photo
-    <span class="mono">JPG or PNG · processed on your device</span>
+<main>
+  <div class="stage empty" id="stage">
+    <canvas id="canvas" width="800" height="800" style="display:none"></canvas>
+    <div class="dropcopy" id="dropcopy">
+      <span class="icon">📷</span>
+      Tap to choose a photo
+      <span class="mono">JPG or PNG · processed on your device</span>
+    </div>
+    <span class="status-pill mono" id="status">ready</span>
+    <input type="file" id="fileInput" accept="image/*">
   </div>
-  <input type="file" id="fileInput" accept="image/*">
+
+  <div class="rail" id="fxRail"></div>
+</main>
+
+<div class="sheet" id="sheet">
+  <div class="sheet-handle" id="sheetHandle">
+    <span class="title" id="sheetTitle">Adjust</span>
+    <span class="chevron">▲</span>
+  </div>
+  <div class="sheet-body" id="controls"></div>
 </div>
 
-<div class="rail" id="fxRail"></div>
-
-<div class="panel" id="controls"></div>
-
-<div class="status" id="status">ready</div>
-
 <div class="footer-bar">
-  <button class="ghost" id="resetBtn" title="Reset image">↺</button>
   <button class="primary" id="sendBtn" disabled>Send to bot</button>
 </div>
 
@@ -144,7 +207,6 @@
 (function(){
   "use strict";
 
-  // ── Telegram WebApp bootstrap ────────────────────────────────────────────
   var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
   if (tg) {
     tg.ready();
@@ -153,9 +215,8 @@
     document.documentElement.setAttribute("data-theme", scheme);
   }
 
-  // ── State ─────────────────────────────────────────────────────────────────
-  var srcImage = null;          // original HTMLImageElement
-  var srcCanvas = document.createElement("canvas"); // holds original pixels at working res
+  var srcImage = null;
+  var srcCanvas = document.createElement("canvas");
   var srcCtx = srcCanvas.getContext("2d", { willReadFrequently: true });
   var canvas = document.getElementById("canvas");
   var ctx = canvas.getContext("2d");
@@ -168,7 +229,7 @@
   var fxRail = document.getElementById("fxRail");
   var controls = document.getElementById("controls");
 
-  var WORK_SIZE = 640; // internal processing resolution, keeps things fast on-device
+  var WORK_SIZE = 640;
 
   var activeFx = "ascii";
 
@@ -223,7 +284,6 @@
                  randomize:{label:"Randomize", min:0, max:1, step:0.05, val:0.3} },
   };
 
-  // ── Build UI: effect chips ───────────────────────────────────────────────
   EFFECTS.forEach(function(fx){
     var chip = document.createElement("button");
     chip.className = "fx-chip";
@@ -240,11 +300,16 @@
     fxRail.appendChild(chip);
   });
 
+  var sheet = document.getElementById("sheet");
+  var sheetHandle = document.getElementById("sheetHandle");
+  var sheetTitle = document.getElementById("sheetTitle");
+  sheetHandle.addEventListener("click", function(){
+    sheet.classList.toggle("collapsed");
+  });
+
   function buildControls(){
     controls.innerHTML = "";
-    var h = document.createElement("h2");
-    h.textContent = "Tune " + activeFx;
-    controls.appendChild(h);
+    sheetTitle.textContent = "Adjust · " + activeFx;
 
     var group = PARAMS[activeFx];
     Object.keys(group).forEach(function(key){
@@ -281,7 +346,6 @@
     return (Math.round(v * 100) / 100).toString();
   }
 
-  // ── Image loading ─────────────────────────────────────────────────────────
   stage.addEventListener("click", function(){ if (!srcImage) fileInput.click(); });
   fileInput.addEventListener("change", function(e){
     var file = e.target.files && e.target.files[0];
@@ -323,7 +387,6 @@
 
   function setStatus(msg){ statusEl.textContent = msg; }
 
-  // ── Render dispatch ──────────────────────────────────────────────────────
   function render(){
     if (!srcImage) return;
     var w = srcCanvas.width, h = srcCanvas.height;
@@ -354,13 +417,11 @@
   function luma(r,g,b){ return 0.2126*r + 0.7152*g + 0.0722*b; }
   function applyContrast(v, c){ return Math.min(255, Math.max(0, (v - 128) * c + 128)); }
 
-  // ── Effect: ASCII (drawn as blocky glyph density on 2D canvas grid) ──────
   function renderAscii(frame, w, h){
     var cell = PARAMS.ascii.cell.val;
     var contrast = PARAMS.ascii.contrast.val;
     var ramp = " .:-=+*#%@";
     var out = ctx.createImageData(w, h);
-    // fill black background
     for (var i = 0; i < out.data.length; i += 4) {
       out.data[i]=15; out.data[i+1]=46; out.data[i+2]=39; out.data[i+3]=255;
     }
@@ -383,7 +444,6 @@
     return ctx.getImageData(0, 0, w, h);
   }
 
-  // ── Effect: Halftone dots ─────────────────────────────────────────────────
   function renderHalftone(frame, w, h){
     var pitch = PARAMS.halftone.cell.val;
     var contrast = PARAMS.halftone.contrast.val;
@@ -408,7 +468,6 @@
     return ctx.getImageData(0, 0, w, h);
   }
 
-  // ── Effect: Ordered dithering ─────────────────────────────────────────────
   var BAYER = [
     [0,8,2,10],[12,4,14,6],[3,11,1,9],[15,7,13,5]
   ];
@@ -433,7 +492,6 @@
     return out;
   }
 
-  // ── Effect: Pixel sort (per-row threshold sort, glitch-classic) ──────────
   function renderPixelSort(frame, w, h){
     var threshold = PARAMS.pixelsort.threshold.val;
     var amount = PARAMS.pixelsort.amount.val / 100;
@@ -447,7 +505,6 @@
         var idx = (y * w + x) * 4;
         row.push([data[idx], data[idx+1], data[idx+2], data[idx+3]]);
       }
-      // Sort contiguous runs where luma exceeds threshold
       var i = 0;
       while (i < w) {
         var l = luma(row[i][0], row[i][1], row[i][2]);
@@ -470,7 +527,6 @@
     return out;
   }
 
-  // ── Effect: Dots (grayscale dot grid, brand-lime on deep green) ──────────
   function renderDots(frame, w, h){
     var cell = PARAMS.dots.cell.val;
     var sizeMul = PARAMS.dots.sizeMul.val;
@@ -493,7 +549,6 @@
     return ctx.getImageData(0, 0, w, h);
   }
 
-  // ── Effect: Contour (posterized luma bands with edge lines) ──────────────
   function renderContour(frame, w, h){
     var levels = Math.round(PARAMS.contour.levels.val);
     var lineWidth = PARAMS.contour.lineWidth.val;
@@ -525,7 +580,6 @@
     return out;
   }
 
-  // ── Effect: Blockify (nearest-neighbour pixelation) ───────────────────────
   function renderBlockify(frame, w, h){
     var cell = Math.round(PARAMS.blockify.cell.val);
     var data = frame.data;
@@ -552,7 +606,6 @@
     return out;
   }
 
-  // ── Effect: Threshold (pure black/white cutoff) ───────────────────────────
   function renderThreshold(frame, w, h){
     var level = PARAMS.threshold.level.val;
     var data = frame.data;
@@ -568,7 +621,6 @@
     return out;
   }
 
-  // ── Effect: Edge Detection (Sobel operator) ───────────────────────────────
   function renderEdges(frame, w, h){
     var strength = PARAMS.edges.strength.val;
     var invert = PARAMS.edges.invert.val > 0.5;
@@ -600,7 +652,6 @@
     return out;
   }
 
-  // ── Effect: Crosshatch (engraving-style directional lines) ───────────────
   function renderCrosshatch(frame, w, h){
     var cell = PARAMS.crosshatch.cell.val;
     var density = Math.round(PARAMS.crosshatch.density.val);
@@ -631,7 +682,6 @@
     return ctx.getImageData(0, 0, w, h);
   }
 
-  // ── Effect: Wave Lines (horizontal lines displaced by luma) ───────────────
   function renderWaveLines(frame, w, h){
     var spacing = PARAMS.wavelines.spacing.val;
     var amplitude = PARAMS.wavelines.amplitude.val;
@@ -653,7 +703,6 @@
     return ctx.getImageData(0, 0, w, h);
   }
 
-  // ── Effect: Noise Field (luma-modulated grain) ────────────────────────────
   function renderNoiseField(frame, w, h){
     var scale = Math.round(PARAMS.noisefield.scale.val);
     var intensity = PARAMS.noisefield.intensity.val;
@@ -678,7 +727,6 @@
     return out;
   }
 
-  // ── Effect: Voronoi (cell-average mosaic with edge lines, like Grainrad) ──
   function renderVoronoi(frame, w, h){
     var cellSize = PARAMS.voronoi.cell.val;
     var edgeWidth = PARAMS.voronoi.edgeWidth.val;
@@ -694,7 +742,6 @@
         sites.push({ x: rx*cellSize + cellSize/2 + jx, y: ry*cellSize + cellSize/2 + jy, cols: rx, row: ry });
       }
     }
-    // simple grid-bucket nearest site lookup (cheap approximation, cell-local jitter only)
     var out = ctx.createImageData(w, h);
     var od = out.data;
     var siteColor = {};
@@ -739,7 +786,6 @@
     return out;
   }
 
-  // ── Effect: VHS / scanlines + chroma shift ────────────────────────────────
   function renderVHS(frame, w, h){
     var intensity = PARAMS.vhs.intensity.val;
     var scan = PARAMS.vhs.scanline.val;
@@ -763,13 +809,11 @@
     return out;
   }
 
-  // ── Effect: Matrix rain overlay ────────────────────────────────────────────
   var matrixCols = null;
   function renderMatrix(frame, w, h){
     var density = PARAMS.matrix.density.val;
     var opacity = PARAMS.matrix.opacity.val;
     ctx.putImageData(frame, 0, 0);
-    // darken base
     ctx.fillStyle = "rgba(15,46,39," + Math.min(0.85, opacity) + ")";
     ctx.fillRect(0,0,w,h);
 
@@ -797,14 +841,10 @@
     return ctx.getImageData(0, 0, w, h);
   }
 
-  // ── Send result back to the bot ───────────────────────────────────────────
   sendBtn.addEventListener("click", function(){
     if (!srcImage) return;
     var dataUrl = canvas.toDataURL("image/jpeg", 0.85);
     if (tg && tg.sendData) {
-      // Telegram limits sendData payload to 4096 bytes, so send a compact
-      // reference payload; production wiring should upload the image to
-      // your backend first and send the resulting file id/url here instead.
       var payload = JSON.stringify({ effect: activeFx, params: PARAMS[activeFx] });
       if (payload.length <= 4000) {
         tg.sendData(payload);
@@ -813,7 +853,6 @@
         setStatus("settings too large to send — simplify and retry");
       }
     } else {
-      // Fallback outside Telegram: trigger a download so the flow is still testable.
       var a = document.createElement("a");
       a.href = dataUrl;
       a.download = activeFx + "-result.jpg";

@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>BangaliIcon · Effects Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/telegram-webapp/1.0.0/telegram-web-app.js"></script>
+<style>
+  :root{
+    --bg:#0f2e27; --surface:#153a31; --surface-2:#1c463c;
+    --text:#f2f6df; --muted:#8fae9f; --line:#255145;
+    --accent:#eaf76b; --accent-dim:#3d5c3a; --danger:#ff6b5e;
+    --accent-ink:#12241a;
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --bg:#f4f6ec; --surface:#ffffff; --surface-2:#eaeedb;
+      --text:#122b23; --muted:#5d7568; --line:#d9e2ce;
+      --accent:#0f2e27; --accent-dim:#eaf76b; --accent-ink:#f4f6ec;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0f2e27; --surface:#153a31; --surface-2:#1c463c;
+    --text:#f2f6df; --muted:#8fae9f; --line:#255145;
+    --accent:#eaf76b; --accent-dim:#3d5c3a; --accent-ink:#12241a;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;overflow-x:clip;}
+  body{
+    background:var(--bg); color:var(--text);
+    font-family:'Space Grotesk',system-ui,sans-serif;
+    min-height:100vh; padding-bottom:96px;
+  }
+  .mono{ font-family:'JetBrains Mono',monospace; }
+
+  header{
+    padding:18px 16px 10px; border-bottom:1px solid var(--line);
+  }
+  header .tag{ font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--accent); letter-spacing:.02em; }
+  header h1{ margin:4px 0 0; font-size:19px; font-weight:700; }
+  header p{ margin:4px 0 0; font-size:13px; color:var(--muted); max-width:34ch; }
+
+  .stage{
+    margin:16px; border-radius:14px; overflow:hidden;
+    background:var(--surface); border:1px solid var(--line);
+    aspect-ratio:1/1; position:relative;
+    display:flex; align-items:center; justify-content:center;
+  }
+  canvas{ width:100%; height:100%; display:block; image-rendering:pixelated; }
+  .stage.empty{ cursor:pointer; }
+  .dropcopy{ text-align:center; color:var(--muted); font-size:13px; padding:0 24px; }
+  .dropcopy .mono{ display:block; margin-top:6px; color:var(--accent); font-size:12px; }
+  input[type=file]{ display:none; }
+
+  .rail{
+    display:flex; gap:8px; padding:0 16px; overflow-x:auto;
+    scrollbar-width:none;
+  }
+  .rail::-webkit-scrollbar{ display:none; }
+  .fx-chip{
+    flex:0 0 auto; padding:9px 14px; border-radius:999px;
+    border:1px solid var(--line); background:var(--surface);
+    color:var(--muted); font-size:13px; font-weight:500;
+    cursor:pointer; white-space:nowrap; transition:border-color .15s, color .15s;
+  }
+  .fx-chip[aria-pressed="true"]{
+    border-color:var(--accent); color:var(--text); background:var(--accent-dim);
+  }
+
+  .panel{ padding:20px 16px 4px; }
+  .panel h2{
+    margin:0 0 14px; font-size:12px; text-transform:uppercase;
+    letter-spacing:.08em; color:var(--muted); font-weight:500;
+  }
+  .slider-row{ margin-bottom:16px; }
+  .slider-row .label-line{
+    display:flex; justify-content:space-between; align-items:baseline;
+    font-size:13px; margin-bottom:6px;
+  }
+  .slider-row .val{ color:var(--accent); }
+  input[type=range]{
+    -webkit-appearance:none; width:100%; height:4px; border-radius:2px;
+    background:var(--line); outline:none;
+  }
+  input[type=range]::-webkit-slider-thumb{
+    -webkit-appearance:none; width:18px; height:18px; border-radius:50%;
+    background:var(--accent); border:3px solid var(--bg); cursor:pointer;
+    box-shadow:0 0 0 1px var(--accent);
+  }
+  input[type=range]::-moz-range-thumb{
+    width:18px; height:18px; border-radius:50%; border:3px solid var(--bg);
+    background:var(--accent); cursor:pointer; box-shadow:0 0 0 1px var(--accent);
+  }
+
+  .footer-bar{
+    position:fixed; left:0; right:0; bottom:0;
+    background:linear-gradient(180deg, transparent, var(--bg) 30%);
+    padding:20px 16px calc(16px + env(safe-area-inset-bottom));
+    display:flex; gap:10px;
+  }
+  button.primary, button.ghost{
+    flex:1; border:none; border-radius:12px; padding:14px 16px;
+    font-family:'Space Grotesk',sans-serif; font-size:15px; font-weight:700;
+    cursor:pointer;
+  }
+  button.primary{ background:var(--accent); color:var(--accent-ink); }
+  button.primary:disabled{ background:var(--surface-2); color:var(--muted); }
+  button.ghost{ flex:0 0 auto; background:var(--surface); color:var(--text); border:1px solid var(--line); }
+
+  .status{ font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--muted); padding:0 16px 10px; min-height:14px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="tag">// bangaliicon studio</div>
+  <h1>Effects Studio</h1>
+  <p>Drop a photo, pick a look, tune it live, send the result straight back to the bot.</p>
+</header>
+
+<div class="stage empty" id="stage">
+  <canvas id="canvas" width="800" height="800" style="display:none"></canvas>
+  <div class="dropcopy" id="dropcopy">
+    Tap to choose a photo
+    <span class="mono">JPG or PNG · processed on your device</span>
+  </div>
+  <input type="file" id="fileInput" accept="image/*">
+</div>
+
+<div class="rail" id="fxRail"></div>
+
+<div class="panel" id="controls"></div>
+
+<div class="status" id="status">ready</div>
+
+<div class="footer-bar">
+  <button class="ghost" id="resetBtn" title="Reset image">↺</button>
+  <button class="primary" id="sendBtn" disabled>Send to bot</button>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ── Telegram WebApp bootstrap ────────────────────────────────────────────
+  var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  if (tg) {
+    tg.ready();
+    tg.expand();
+    var scheme = tg.colorScheme === "dark" ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", scheme);
+  }
+
+  // ── State ─────────────────────────────────────────────────────────────────
+  var srcImage = null;          // original HTMLImageElement
+  var srcCanvas = document.createElement("canvas"); // holds original pixels at working res
+  var srcCtx = srcCanvas.getContext("2d", { willReadFrequently: true });
+  var canvas = document.getElementById("canvas");
+  var ctx = canvas.getContext("2d");
+  var stage = document.getElementById("stage");
+  var dropcopy = document.getElementById("dropcopy");
+  var fileInput = document.getElementById("fileInput");
+  var statusEl = document.getElementById("status");
+  var sendBtn = document.getElementById("sendBtn");
+  var resetBtn = document.getElementById("resetBtn");
+  var fxRail = document.getElementById("fxRail");
+  var controls = document.getElementById("controls");
+
+  var WORK_SIZE = 640; // internal processing resolution, keeps things fast on-device
+
+  var activeFx = "ascii";
+
+  var EFFECTS = [
+    { id:"ascii",     label:"ASCII" },
+    { id:"dither",    label:"Dithering" },
+    { id:"halftone",  label:"Halftone" },
+    { id:"matrix",    label:"Matrix Rain" },
+    { id:"dots",      label:"Dots" },
+    { id:"contour",   label:"Contour" },
+    { id:"pixelsort", label:"Pixel Sort" },
+    { id:"blockify",  label:"Blockify" },
+    { id:"threshold", label:"Threshold" },
+    { id:"edges",     label:"Edge Detection" },
+    { id:"crosshatch",label:"Crosshatch" },
+    { id:"wavelines", label:"Wave Lines" },
+    { id:"noisefield",label:"Noise Field" },
+    { id:"voronoi",   label:"Voronoi" },
+    { id:"vhs",       label:"VHS" },
+  ];
+
+  var PARAMS = {
+    ascii:     { cell:{label:"Cell size", min:4, max:20, step:1, val:9},
+                 contrast:{label:"Contrast", min:0.5, max:2, step:0.05, val:1.1} },
+    halftone:  { cell:{label:"Dot pitch", min:4, max:24, step:1, val:10},
+                 contrast:{label:"Contrast", min:0.5, max:2, step:0.05, val:1.15} },
+    dither:    { levels:{label:"Color levels", min:2, max:8, step:1, val:4},
+                 contrast:{label:"Contrast", min:0.5, max:2, step:0.05, val:1.1} },
+    pixelsort: { threshold:{label:"Threshold", min:0, max:255, step:1, val:110},
+                 amount:{label:"Row range", min:5, max:100, step:1, val:60} },
+    vhs:       { intensity:{label:"Distortion", min:0, max:20, step:1, val:6},
+                 scanline:{label:"Scanline strength", min:0, max:1, step:0.05, val:0.35} },
+    matrix:    { density:{label:"Glyph density", min:6, max:22, step:1, val:12},
+                 opacity:{label:"Overlay strength", min:0.2, max:1, step:0.05, val:0.75} },
+    dots:      { cell:{label:"Dot spacing", min:4, max:24, step:1, val:9},
+                 sizeMul:{label:"Dot size", min:0.3, max:1.2, step:0.05, val:0.85},
+                 contrast:{label:"Contrast", min:0.5, max:2, step:0.05, val:1.1} },
+    contour:   { levels:{label:"Bands", min:2, max:12, step:1, val:6},
+                 lineWidth:{label:"Line weight", min:1, max:4, step:0.5, val:1.5} },
+    blockify:  { cell:{label:"Block size", min:4, max:40, step:1, val:16} },
+    threshold: { level:{label:"Threshold", min:0, max:255, step:1, val:128} },
+    edges:     { strength:{label:"Sensitivity", min:0.2, max:3, step:0.1, val:1.2},
+                 invert:{label:"Invert (0/1)", min:0, max:1, step:1, val:0} },
+    crosshatch:{ cell:{label:"Cell size", min:4, max:20, step:1, val:8},
+                 density:{label:"Line density", min:1, max:5, step:1, val:3} },
+    wavelines: { spacing:{label:"Line spacing", min:3, max:16, step:1, val:6},
+                 amplitude:{label:"Wave amplitude", min:1, max:20, step:1, val:8} },
+    noisefield:{ scale:{label:"Cell size", min:2, max:16, step:1, val:5},
+                 intensity:{label:"Noise strength", min:0.1, max:1, step:0.05, val:0.5} },
+    voronoi:   { cell:{label:"Cell size", min:8, max:60, step:1, val:24},
+                 edgeWidth:{label:"Edge width", min:0, max:2, step:0.1, val:0.4},
+                 randomize:{label:"Randomize", min:0, max:1, step:0.05, val:0.3} },
+  };
+
+  // ── Build UI: effect chips ───────────────────────────────────────────────
+  EFFECTS.forEach(function(fx){
+    var chip = document.createElement("button");
+    chip.className = "fx-chip";
+    chip.textContent = fx.label;
+    chip.setAttribute("aria-pressed", fx.id === activeFx ? "true" : "false");
+    chip.addEventListener("click", function(){
+      activeFx = fx.id;
+      Array.prototype.forEach.call(fxRail.children, function(c){
+        c.setAttribute("aria-pressed", c === chip ? "true" : "false");
+      });
+      buildControls();
+      render();
+    });
+    fxRail.appendChild(chip);
+  });
+
+  function buildControls(){
+    controls.innerHTML = "";
+    var h = document.createElement("h2");
+    h.textContent = "Tune " + activeFx;
+    controls.appendChild(h);
+
+    var group = PARAMS[activeFx];
+    Object.keys(group).forEach(function(key){
+      var p = group[key];
+      var row = document.createElement("div");
+      row.className = "slider-row";
+
+      var labelLine = document.createElement("div");
+      labelLine.className = "label-line";
+      var label = document.createElement("span");
+      label.textContent = p.label;
+      var val = document.createElement("span");
+      val.className = "val mono";
+      val.textContent = formatVal(p.val);
+      labelLine.appendChild(label);
+      labelLine.appendChild(val);
+
+      var slider = document.createElement("input");
+      slider.type = "range";
+      slider.min = p.min; slider.max = p.max; slider.step = p.step; slider.value = p.val;
+      slider.addEventListener("input", function(){
+        p.val = parseFloat(slider.value);
+        val.textContent = formatVal(p.val);
+        render();
+      });
+
+      row.appendChild(labelLine);
+      row.appendChild(slider);
+      controls.appendChild(row);
+    });
+  }
+
+  function formatVal(v){
+    return (Math.round(v * 100) / 100).toString();
+  }
+
+  // ── Image loading ─────────────────────────────────────────────────────────
+  stage.addEventListener("click", function(){ if (!srcImage) fileInput.click(); });
+  fileInput.addEventListener("change", function(e){
+    var file = e.target.files && e.target.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function(ev){
+      var img = new Image();
+      img.onload = function(){
+        srcImage = img;
+        var scale = Math.min(WORK_SIZE / img.width, WORK_SIZE / img.height, 1);
+        srcCanvas.width = Math.max(1, Math.round(img.width * scale));
+        srcCanvas.height = Math.max(1, Math.round(img.height * scale));
+        srcCtx.drawImage(img, 0, 0, srcCanvas.width, srcCanvas.height);
+
+        canvas.width = srcCanvas.width;
+        canvas.height = srcCanvas.height;
+        canvas.style.display = "block";
+        dropcopy.style.display = "none";
+        stage.classList.remove("empty");
+        sendBtn.disabled = false;
+        buildControls();
+        render();
+        setStatus("image loaded — " + srcCanvas.width + "×" + srcCanvas.height);
+      };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+
+  resetBtn.addEventListener("click", function(){
+    srcImage = null;
+    canvas.style.display = "none";
+    dropcopy.style.display = "block";
+    stage.classList.add("empty");
+    sendBtn.disabled = true;
+    fileInput.value = "";
+    setStatus("ready");
+  });
+
+  function setStatus(msg){ statusEl.textContent = msg; }
+
+  // ── Render dispatch ──────────────────────────────────────────────────────
+  function render(){
+    if (!srcImage) return;
+    var w = srcCanvas.width, h = srcCanvas.height;
+    var frame = srcCtx.getImageData(0, 0, w, h);
+    var out;
+    switch(activeFx){
+      case "ascii":     out = renderAscii(frame, w, h); break;
+      case "halftone":  out = renderHalftone(frame, w, h); break;
+      case "dither":    out = renderDither(frame, w, h); break;
+      case "pixelsort": out = renderPixelSort(frame, w, h); break;
+      case "vhs":       out = renderVHS(frame, w, h); break;
+      case "matrix":    out = renderMatrix(frame, w, h); break;
+      case "dots":      out = renderDots(frame, w, h); break;
+      case "contour":   out = renderContour(frame, w, h); break;
+      case "blockify":  out = renderBlockify(frame, w, h); break;
+      case "threshold": out = renderThreshold(frame, w, h); break;
+      case "edges":     out = renderEdges(frame, w, h); break;
+      case "crosshatch":out = renderCrosshatch(frame, w, h); break;
+      case "wavelines": out = renderWaveLines(frame, w, h); break;
+      case "noisefield":out = renderNoiseField(frame, w, h); break;
+      case "voronoi":   out = renderVoronoi(frame, w, h); break;
+      default:          out = frame;
+    }
+    ctx.putImageData(out, 0, 0);
+    setStatus(activeFx + " applied · " + w + "×" + h);
+  }
+
+  function luma(r,g,b){ return 0.2126*r + 0.7152*g + 0.0722*b; }
+  function applyContrast(v, c){ return Math.min(255, Math.max(0, (v - 128) * c + 128)); }
+
+  // ── Effect: ASCII (drawn as blocky glyph density on 2D canvas grid) ──────
+  function renderAscii(frame, w, h){
+    var cell = PARAMS.ascii.cell.val;
+    var contrast = PARAMS.ascii.contrast.val;
+    var ramp = " .:-=+*#%@";
+    var out = ctx.createImageData(w, h);
+    // fill black background
+    for (var i = 0; i < out.data.length; i += 4) {
+      out.data[i]=15; out.data[i+1]=46; out.data[i+2]=39; out.data[i+3]=255;
+    }
+    ctx.putImageData(out, 0, 0);
+    ctx.fillStyle = "#0f2e27";
+    ctx.fillRect(0,0,w,h);
+    ctx.fillStyle = "#eaf76b";
+    ctx.font = Math.floor(cell*1.2) + "px monospace";
+    ctx.textBaseline = "top";
+    var data = frame.data;
+    for (var y = 0; y < h; y += cell) {
+      for (var x = 0; x < w; x += cell) {
+        var idx = (y * w + x) * 4;
+        var l = luma(data[idx], data[idx+1], data[idx+2]);
+        l = applyContrast(l, contrast);
+        var ch = ramp[Math.min(ramp.length-1, Math.floor((l/255) * (ramp.length-1)))];
+        ctx.fillText(ch, x, y);
+      }
+    }
+    return ctx.getImageData(0, 0, w, h);
+  }
+
+  // ── Effect: Halftone dots ─────────────────────────────────────────────────
+  function renderHalftone(frame, w, h){
+    var pitch = PARAMS.halftone.cell.val;
+    var contrast = PARAMS.halftone.contrast.val;
+    var data = frame.data;
+    ctx.fillStyle = "#f4f2ea";
+    ctx.fillRect(0,0,w,h);
+    ctx.fillStyle = "#0b0e0c";
+    for (var y = 0; y < h; y += pitch) {
+      for (var x = 0; x < w; x += pitch) {
+        var idx = (y * w + x) * 4;
+        var l = luma(data[idx], data[idx+1], data[idx+2]);
+        l = applyContrast(l, contrast);
+        var dark = 1 - (l/255);
+        var r = (pitch/2) * Math.sqrt(dark);
+        if (r > 0.4) {
+          ctx.beginPath();
+          ctx.arc(x + pitch/2, y + pitch/2, r, 0, Math.PI*2);
+          ctx.fill();
+        }
+      }
+    }
+    return ctx.getImageData(0, 0, w, h);
+  }
+
+  // ── Effect: Ordered dithering ─────────────────────────────────────────────
+  var BAYER = [
+    [0,8,2,10],[12,4,14,6],[3,11,1,9],[15,7,13,5]
+  ];
+  function renderDither(frame, w, h){
+    var levels = Math.round(PARAMS.dither.levels.val);
+    var contrast = PARAMS.dither.contrast.val;
+    var out = ctx.createImageData(w, h);
+    var data = frame.data, od = out.data;
+    var step = 255 / (levels - 1);
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        var idx = (y * w + x) * 4;
+        var threshold = (BAYER[y%4][x%4] / 16 - 0.5) * step;
+        for (var c = 0; c < 3; c++) {
+          var v = applyContrast(data[idx+c], contrast) + threshold;
+          v = Math.round(v / step) * step;
+          od[idx+c] = Math.min(255, Math.max(0, v));
+        }
+        od[idx+3] = 255;
+      }
+    }
+    return out;
+  }
+
+  // ── Effect: Pixel sort (per-row threshold sort, glitch-classic) ──────────
+  function renderPixelSort(frame, w, h){
+    var threshold = PARAMS.pixelsort.threshold.val;
+    var amount = PARAMS.pixelsort.amount.val / 100;
+    var out = new ImageData(new Uint8ClampedArray(frame.data), w, h);
+    var data = out.data;
+    var rowsToSort = Math.round(h * amount);
+    var startRow = Math.floor((h - rowsToSort) / 2);
+    for (var y = startRow; y < startRow + rowsToSort && y < h; y++) {
+      var row = [];
+      for (var x = 0; x < w; x++) {
+        var idx = (y * w + x) * 4;
+        row.push([data[idx], data[idx+1], data[idx+2], data[idx+3]]);
+      }
+      // Sort contiguous runs where luma exceeds threshold
+      var i = 0;
+      while (i < w) {
+        var l = luma(row[i][0], row[i][1], row[i][2]);
+        if (l > threshold) {
+          var j = i;
+          while (j < w && luma(row[j][0], row[j][1], row[j][2]) > threshold) j++;
+          var slice = row.slice(i, j);
+          slice.sort(function(a,b){ return luma(a[0],a[1],a[2]) - luma(b[0],b[1],b[2]); });
+          for (var k = 0; k < slice.length; k++) row[i+k] = slice[k];
+          i = j;
+        } else {
+          i++;
+        }
+      }
+      for (var x2 = 0; x2 < w; x2++) {
+        var idx2 = (y * w + x2) * 4;
+        data[idx2]=row[x2][0]; data[idx2+1]=row[x2][1]; data[idx2+2]=row[x2][2]; data[idx2+3]=255;
+      }
+    }
+    return out;
+  }
+
+  // ── Effect: Dots (grayscale dot grid, brand-lime on deep green) ──────────
+  function renderDots(frame, w, h){
+    var cell = PARAMS.dots.cell.val;
+    var sizeMul = PARAMS.dots.sizeMul.val;
+    var contrast = PARAMS.dots.contrast.val;
+    var data = frame.data;
+    ctx.fillStyle = "#0f2e27";
+    ctx.fillRect(0,0,w,h);
+    for (var y = 0; y < h; y += cell) {
+      for (var x = 0; x < w; x += cell) {
+        var idx = (y * w + x) * 4;
+        var l = applyContrast(luma(data[idx], data[idx+1], data[idx+2]), contrast);
+        var t = l / 255;
+        ctx.fillStyle = "rgba(234,247,107," + (0.15 + t*0.85) + ")";
+        var r = (cell/2) * sizeMul * (0.3 + t*0.7);
+        ctx.beginPath();
+        ctx.arc(x + cell/2, y + cell/2, r, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+    return ctx.getImageData(0, 0, w, h);
+  }
+
+  // ── Effect: Contour (posterized luma bands with edge lines) ──────────────
+  function renderContour(frame, w, h){
+    var levels = Math.round(PARAMS.contour.levels.val);
+    var lineWidth = PARAMS.contour.lineWidth.val;
+    var data = frame.data;
+    var bandOf = new Int16Array(w*h);
+    for (var p = 0; p < w*h; p++) {
+      var i4 = p*4;
+      var l = luma(data[i4], data[i4+1], data[i4+2]);
+      bandOf[p] = Math.floor((l/255) * levels);
+    }
+    var out = ctx.createImageData(w, h);
+    var od = out.data;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        var p2 = y*w+x, i5 = p2*4;
+        var b = bandOf[p2];
+        var isEdge = false;
+        if (x+1<w && bandOf[p2+1] !== b) isEdge = true;
+        if (y+1<h && bandOf[p2+w] !== b) isEdge = true;
+        if (isEdge && lineWidth > 0) {
+          od[i5]=234; od[i5+1]=247; od[i5+2]=107;
+        } else {
+          var shade = Math.round((b/(levels-1||1)) * 255 * 0.15) + 15;
+          od[i5]=15; od[i5+1]=46+shade*0.3; od[i5+2]=39;
+        }
+        od[i5+3]=255;
+      }
+    }
+    return out;
+  }
+
+  // ── Effect: Blockify (nearest-neighbour pixelation) ───────────────────────
+  function renderBlockify(frame, w, h){
+    var cell = Math.round(PARAMS.blockify.cell.val);
+    var data = frame.data;
+    var out = ctx.createImageData(w, h);
+    var od = out.data;
+    for (var by = 0; by < h; by += cell) {
+      for (var bx = 0; bx < w; bx += cell) {
+        var rs=0,gs=0,bs=0,count=0;
+        for (var y = by; y < Math.min(h, by+cell); y++) {
+          for (var x = bx; x < Math.min(w, bx+cell); x++) {
+            var idx = (y*w+x)*4;
+            rs+=data[idx]; gs+=data[idx+1]; bs+=data[idx+2]; count++;
+          }
+        }
+        var ar = rs/count, ag = gs/count, ab = bs/count;
+        for (var y2 = by; y2 < Math.min(h, by+cell); y2++) {
+          for (var x2 = bx; x2 < Math.min(w, bx+cell); x2++) {
+            var idx2 = (y2*w+x2)*4;
+            od[idx2]=ar; od[idx2+1]=ag; od[idx2+2]=ab; od[idx2+3]=255;
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  // ── Effect: Threshold (pure black/white cutoff) ───────────────────────────
+  function renderThreshold(frame, w, h){
+    var level = PARAMS.threshold.level.val;
+    var data = frame.data;
+    var out = ctx.createImageData(w, h);
+    var od = out.data;
+    for (var p = 0; p < w*h; p++) {
+      var i4 = p*4;
+      var l = luma(data[i4], data[i4+1], data[i4+2]);
+      if (l > level) { od[i4]=234; od[i4+1]=247; od[i4+2]=107; }
+      else           { od[i4]=15;  od[i4+1]=46;  od[i4+2]=39;  }
+      od[i4+3]=255;
+    }
+    return out;
+  }
+
+  // ── Effect: Edge Detection (Sobel operator) ───────────────────────────────
+  function renderEdges(frame, w, h){
+    var strength = PARAMS.edges.strength.val;
+    var invert = PARAMS.edges.invert.val > 0.5;
+    var data = frame.data;
+    var gray = new Float32Array(w*h);
+    for (var p = 0; p < w*h; p++) {
+      var i4 = p*4;
+      gray[p] = luma(data[i4], data[i4+1], data[i4+2]);
+    }
+    var gx = [-1,0,1,-2,0,2,-1,0,1], gy = [-1,-2,-1,0,0,0,1,2,1];
+    var out = ctx.createImageData(w, h);
+    var od = out.data;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        var sx=0, sy=0, k=0;
+        for (var dy=-1; dy<=1; dy++){
+          for (var dx=-1; dx<=1; dx++){
+            var yy=Math.min(h-1,Math.max(0,y+dy)), xx=Math.min(w-1,Math.max(0,x+dx));
+            var v = gray[yy*w+xx];
+            sx += v*gx[k]; sy += v*gy[k]; k++;
+          }
+        }
+        var mag = Math.min(255, Math.sqrt(sx*sx+sy*sy) * strength);
+        if (invert) mag = 255 - mag;
+        var idx = (y*w+x)*4;
+        od[idx]=15+mag*0.86; od[idx+1]=46+mag*0.79; od[idx+2]=39+mag*0.27; od[idx+3]=255;
+      }
+    }
+    return out;
+  }
+
+  // ── Effect: Crosshatch (engraving-style directional lines) ───────────────
+  function renderCrosshatch(frame, w, h){
+    var cell = PARAMS.crosshatch.cell.val;
+    var density = Math.round(PARAMS.crosshatch.density.val);
+    var data = frame.data;
+    ctx.fillStyle = "#f4f2ea";
+    ctx.fillRect(0,0,w,h);
+    ctx.strokeStyle = "#0f2e27";
+    ctx.lineWidth = 1;
+    for (var y = 0; y < h; y += cell) {
+      for (var x = 0; x < w; x += cell) {
+        var idx = (y*w+x)*4;
+        var l = luma(data[idx], data[idx+1], data[idx+2]) / 255;
+        var lines = Math.round((1-l) * density);
+        for (var n = 0; n < lines; n++) {
+          ctx.beginPath();
+          ctx.moveTo(x, y + (n+1)*(cell/(density+1)));
+          ctx.lineTo(x+cell, y + (n+1)*(cell/(density+1)) - cell*0.3);
+          ctx.stroke();
+          if (n >= 2) {
+            ctx.beginPath();
+            ctx.moveTo(x, y + cell - (n-1)*(cell/(density+1)));
+            ctx.lineTo(x+cell, y + cell - (n-1)*(cell/(density+1)) + cell*0.3);
+            ctx.stroke();
+          }
+        }
+      }
+    }
+    return ctx.getImageData(0, 0, w, h);
+  }
+
+  // ── Effect: Wave Lines (horizontal lines displaced by luma) ───────────────
+  function renderWaveLines(frame, w, h){
+    var spacing = PARAMS.wavelines.spacing.val;
+    var amplitude = PARAMS.wavelines.amplitude.val;
+    var data = frame.data;
+    ctx.fillStyle = "#0f2e27";
+    ctx.fillRect(0,0,w,h);
+    ctx.strokeStyle = "#eaf76b";
+    ctx.lineWidth = 1.2;
+    for (var y = 0; y < h; y += spacing) {
+      ctx.beginPath();
+      for (var x = 0; x < w; x++) {
+        var idx = (y*w+x)*4;
+        var l = luma(data[idx], data[idx+1], data[idx+2]) / 255;
+        var yy = y + Math.sin(x*0.08) * amplitude * l;
+        if (x === 0) ctx.moveTo(x, yy); else ctx.lineTo(x, yy);
+      }
+      ctx.stroke();
+    }
+    return ctx.getImageData(0, 0, w, h);
+  }
+
+  // ── Effect: Noise Field (luma-modulated grain) ────────────────────────────
+  function renderNoiseField(frame, w, h){
+    var scale = Math.round(PARAMS.noisefield.scale.val);
+    var intensity = PARAMS.noisefield.intensity.val;
+    var data = frame.data;
+    var out = ctx.createImageData(w, h);
+    var od = out.data;
+    for (var by = 0; by < h; by += scale) {
+      var n = (Math.random()-0.5) * 255 * intensity;
+      for (var bx = 0; bx < w; bx += scale) {
+        var n2 = (Math.random()-0.5) * 255 * intensity;
+        for (var y = by; y < Math.min(h, by+scale); y++) {
+          for (var x = bx; x < Math.min(w, bx+scale); x++) {
+            var idx = (y*w+x)*4;
+            od[idx]   = Math.min(255,Math.max(0, data[idx]+n2));
+            od[idx+1] = Math.min(255,Math.max(0, data[idx+1]+n2));
+            od[idx+2] = Math.min(255,Math.max(0, data[idx+2]+n2));
+            od[idx+3] = 255;
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  // ── Effect: Voronoi (cell-average mosaic with edge lines, like Grainrad) ──
+  function renderVoronoi(frame, w, h){
+    var cellSize = PARAMS.voronoi.cell.val;
+    var edgeWidth = PARAMS.voronoi.edgeWidth.val;
+    var randomize = PARAMS.voronoi.randomize.val;
+    var data = frame.data;
+
+    var cols = Math.ceil(w/cellSize)+1, rows = Math.ceil(h/cellSize)+1;
+    var sites = [];
+    for (var ry = 0; ry < rows; ry++){
+      for (var rx = 0; rx < cols; rx++){
+        var jx = (Math.random()-0.5) * cellSize * randomize;
+        var jy = (Math.random()-0.5) * cellSize * randomize;
+        sites.push({ x: rx*cellSize + cellSize/2 + jx, y: ry*cellSize + cellSize/2 + jy, cols: rx, row: ry });
+      }
+    }
+    // simple grid-bucket nearest site lookup (cheap approximation, cell-local jitter only)
+    var out = ctx.createImageData(w, h);
+    var od = out.data;
+    var siteColor = {};
+    function colorAt(px, py, siteIdx){
+      var key = siteIdx;
+      if (siteColor[key]) return siteColor[key];
+      var sx = Math.round(sites[siteIdx].x), sy = Math.round(sites[siteIdx].y);
+      sx = Math.min(w-1, Math.max(0, sx)); sy = Math.min(h-1, Math.max(0, sy));
+      var idx = (sy*w+sx)*4;
+      var c = [data[idx], data[idx+1], data[idx+2]];
+      siteColor[key] = c;
+      return c;
+    }
+    for (var y = 0; y < h; y++) {
+      var rowIdx = Math.floor(y/cellSize);
+      for (var x = 0; x < w; x++) {
+        var colIdx = Math.floor(x/cellSize);
+        var best = -1, bestD = Infinity, secondD = Infinity;
+        for (var dry = -1; dry <= 1; dry++){
+          for (var drx = -1; drx <= 1; drx++){
+            var cc = colIdx+drx, cr = rowIdx+dry;
+            if (cc<0||cc>=cols||cr<0||cr>=rows) continue;
+            var sidx = cr*cols+cc;
+            var s = sites[sidx];
+            var dx = s.x-x, dy = s.y-y;
+            var d = dx*dx+dy*dy;
+            if (d < bestD) { secondD = bestD; bestD = d; best = sidx; }
+            else if (d < secondD) { secondD = d; }
+          }
+        }
+        var idx = (y*w+x)*4;
+        var edge = (Math.sqrt(secondD) - Math.sqrt(bestD)) < edgeWidth*3;
+        if (edgeWidth > 0 && edge) {
+          od[idx]=15; od[idx+1]=46; od[idx+2]=39;
+        } else {
+          var c = colorAt(x,y,best);
+          od[idx]=c[0]; od[idx+1]=c[1]; od[idx+2]=c[2];
+        }
+        od[idx+3]=255;
+      }
+    }
+    return out;
+  }
+
+  // ── Effect: VHS / scanlines + chroma shift ────────────────────────────────
+  function renderVHS(frame, w, h){
+    var intensity = PARAMS.vhs.intensity.val;
+    var scan = PARAMS.vhs.scanline.val;
+    var out = ctx.createImageData(w, h);
+    var data = frame.data, od = out.data;
+    for (var y = 0; y < h; y++) {
+      var shift = Math.round(Math.sin(y * 0.3) * intensity * 0.3 + (Math.random()-0.5)*intensity*0.4);
+      for (var x = 0; x < w; x++) {
+        var idx = (y * w + x) * 4;
+        var rx = Math.min(w-1, Math.max(0, x + shift));
+        var bx = Math.min(w-1, Math.max(0, x - shift));
+        var rIdx = (y*w+rx)*4, bIdx = (y*w+bx)*4;
+        od[idx]   = data[rIdx];
+        od[idx+1] = data[idx+1];
+        od[idx+2] = data[bIdx+2];
+        var lineDark = (y % 2 === 0) ? (1 - scan) : 1;
+        od[idx] *= lineDark; od[idx+1] *= lineDark; od[idx+2] *= lineDark;
+        od[idx+3] = 255;
+      }
+    }
+    return out;
+  }
+
+  // ── Effect: Matrix rain overlay ────────────────────────────────────────────
+  var matrixCols = null;
+  function renderMatrix(frame, w, h){
+    var density = PARAMS.matrix.density.val;
+    var opacity = PARAMS.matrix.opacity.val;
+    ctx.putImageData(frame, 0, 0);
+    // darken base
+    ctx.fillStyle = "rgba(15,46,39," + Math.min(0.85, opacity) + ")";
+    ctx.fillRect(0,0,w,h);
+
+    var glyphs = "01アイウエオカキクケコサシスセソ";
+    ctx.font = density + "px monospace";
+    ctx.fillStyle = "rgba(234,247,107," + opacity + ")";
+    var cols = Math.floor(w / density);
+    if (!matrixCols || matrixCols.length !== cols) {
+      matrixCols = [];
+      for (var c = 0; c < cols; c++) matrixCols.push(Math.floor(Math.random() * (h/density)));
+    }
+    for (var c2 = 0; c2 < cols; c2++) {
+      var x = c2 * density;
+      var dropLen = 6 + Math.floor(Math.random()*10);
+      for (var r = 0; r < dropLen; r++) {
+        var y = (matrixCols[c2] - r) * density;
+        if (y < 0 || y > h) continue;
+        var ch = glyphs[Math.floor(Math.random()*glyphs.length)];
+        ctx.globalAlpha = Math.max(0, 1 - r/dropLen);
+        ctx.fillText(ch, x, y);
+      }
+      matrixCols[c2] = (matrixCols[c2] + 1) % Math.ceil(h/density + dropLen);
+    }
+    ctx.globalAlpha = 1;
+    return ctx.getImageData(0, 0, w, h);
+  }
+
+  // ── Send result back to the bot ───────────────────────────────────────────
+  sendBtn.addEventListener("click", function(){
+    if (!srcImage) return;
+    var dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+    if (tg && tg.sendData) {
+      // Telegram limits sendData payload to 4096 bytes, so send a compact
+      // reference payload; production wiring should upload the image to
+      // your backend first and send the resulting file id/url here instead.
+      var payload = JSON.stringify({ effect: activeFx, params: PARAMS[activeFx] });
+      if (payload.length <= 4000) {
+        tg.sendData(payload);
+        setStatus("sent settings to bot — generating full-res on server");
+      } else {
+        setStatus("settings too large to send — simplify and retry");
+      }
+    } else {
+      // Fallback outside Telegram: trigger a download so the flow is still testable.
+      var a = document.createElement("a");
+      a.href = dataUrl;
+      a.download = activeFx + "-result.jpg";
+      a.click();
+      setStatus("not running inside Telegram — downloaded preview instead");
+    }
+  });
+
+  buildControls();
+})();
+</script>
+</body>
+</html>
